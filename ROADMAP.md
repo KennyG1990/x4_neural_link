@@ -722,13 +722,27 @@ else — no prose, no panel, no contracts, no writes back to the game.
   `storage` optional-degrade (send what MD can read; rollup only needs `needs[]` + `products[]` to derive shortages).
 - **Anti-cheat:** READ-ONLY observation. NO `add_wares`/`remove_wares`. Pure capture of what factions already own.
 - **Build steps + per-step verify:**
-  1. **Research the MD read primitives FIRST** (research-gated — the real unknown): where does `SyncEconomy`'s
-     `needs=7` come from, and can the same path yield per-station `products`/`storage`? Ground against DeadAir
-     `deadairdynamicuniverse` "Fill" (reads/writes station cargo) + the Forge `md.xsd` before authoring. → verify:
-     a documented property path for each field (or a decision to ship `needs+products` only, `storage` deferred).
-  2. **Author MD+Lua:** extend `SyncEconomy` to build a per-station payload and POST it. CAP stations-per-tick and
-     round-robin factions (paranid alone = 165 stations — a full sweep must span several heartbeats, not one). →
-     verify: Forge `POST /api/agent/project/validate` → `ok:true` (schema-legal).
+  1. **✅ RESEARCH DONE (2026-06-26) — lower risk than feared; #54 is mostly a RESTRUCTURE of proven code, not new
+     FFI.** The capture is **Lua FFI, not MD** (no MD station-property gymnastics). `SyncEconomy` (aic_uix.lua:551)
+     ALREADY enumerates stations via `GetContainedStationsByOwner(fid,nil,true)` (omniscient) and reads outputs
+     `GetComponentData(st,"products")` + inputs `GetComponentData(st,"allresources")`. **All per-station fields are
+     proven reads already in the mod or canon:** sector `GetComponentData(st,"sector")` (used aic_uix.lua:490),
+     type `GetComponentData(st,"macro")` (used :435/:478), id `GetComponentData(st,"code")` (stable idcode → PK),
+     name `"name"`, ware label `GetWareData(w,"name")`. Canon recipe: StarForge `entity-model-and-grounded-reads`
+     + `Act_Of_Desperation.md:229` (`…→GetComponentData(station,"wares") outputs→GetProductionModuleData inputs→
+     GetSupplyBudget/GetTradeWareBudget money`). **DECISIVE:** `rollup_economy_from_stations` (memory.py:2250)
+     consumes ONLY `faction_id`+`needs[]`+`products[]` per station — shortage severity = fraction of a faction's
+     stations needing a ware. So **`storage` and `workforce` reads are NOT needed to fill shortages** (deferred,
+     not blocking); `GetSupplyBudget`/`GetTradeWareBudget` money is **#63's** primitive, not #54's.
+  2. **Author Lua (not MD):** restructure `SyncEconomy`'s inner loop to emit ONE per-station record
+     `{station_id:code, faction_id, sector_id, station_name, station_type:macro, products[], needs[]}` (all
+     pcall-guarded; fallback `station_id=tostring(st)`), collect into `stations[]`, and POST to
+     `POST /v1/economy/stations` `{save_id, stations:[…], rollup:true}` — which auto-rolls-up real shortages into
+     the `economy` table. REPLACES the current hollow `/api/economy` POST (`shortages:{}`). **CAP stations-per-tick
+     + round-robin factions** across heartbeats — reuse the canon "throttled incremental indexer" cursor pattern
+     (paranid=165; a full per-station sweep must amortize over ticks, never one POST). PK `(save_id,station_id)` =
+     upsert, so re-capture doesn't grow rows. → verify: Forge `validate` → `ok:true` (Lua-only change, low schema
+     risk). NOTE: this is a UI/Lua file — Forge validate covers MD/schema; the Lua correctness gate is in-game.
   3. **Deploy faithful** (verbatim `fs/write`/disk, per the lifted-mandate method) + in-game reload + bridge restart.
 - **3-GATE VERIFICATION (all three, per the hard rule):**
   1. **Forge/ecosystem:** `validate` ok + `debug-watcher/brief` cue `erroringCount 0`, `activeErrors 0`.
@@ -739,7 +753,102 @@ else — no prose, no panel, no contracts, no writes back to the game.
 - **Risks / fallbacks:** (a) MD may not cheaply expose `products`/`storage` per station → fallback to `needs[]`
   (already proven readable) + `products[]`, defer `storage`. (b) full-universe enumeration is expensive → the
   per-tick cap + round-robin bounds it. (c) `station_type` may need a small classification map.
-- **Status: SPEC'd — not started.** Step 1 (research) is the gate; do it before any authoring.
+- **References (Ken, 2026-06-26):** DeadAir source at `F:\DEV_ENV\projects\Mods\X4Mods\deadair_scripts` and
+  `…\deadairdynamicwars` — ground the station read recipe (and the deferred storage/workforce/budget reads) against
+  these before authoring; `deadairdynamicwars` is also the #57-58 diplomacy-eligibility reference.
+- **DeadAir cross-check (2026-06-26, Ken's refs):** `deadair_scripts/md/factionlogic_economy.xml` is a
+  build-station patch (not a trade read) → confirms the Lua-FFI layer is correct for #54. The DEFERRED storage read
+  IS available and DeadAir's "Fill" (`deadairdynamicuniverse.xml:~3905`) shows the exact path + a BETTER severity
+  formula: `$station.cargo.{ware}.count` / `.target` / `.cargo.list` → severity = `1 − count/target` (how far below
+  desired stock). MD-side; the Lua-FFI equivalent is the future storage-precision pass. NOT needed for #54 (rollup
+  fills shortages from needs/products ratio) — logged as the documented upgrade path.
+- **Status: ✅ DONE — 3-gate verified in-game (2026-06-26 reload).**
+  - **Gate 1 (Forge/ecosystem):** `validate` ok, 0 errors (MD untouched); watcher `modRuntime.errorCount 0`,
+    `cueLiveness.erroringCount 0`, brief text "No recent X4 errors or warnings… for x4_ai_influence". (The
+    watcher's `states.runtimeErrors:true`/`activeIssueCount 9` is a FALSE POSITIVE — the mod's `log()` uses
+    `DebugError`, so every benign `[AICHAT][UIX]` marker is `[=ERROR=]`-prefixed; the 8 evidence lines were all
+    `relations_sync`/`sectors_sync` markers, not errors. Authoritative classifiers all 0.)
+  - **Gate 2 (dashboard DB):** live `economy_rollup_selftest` **6/6** (incl. the new `market_status_derived_in_
+    rollup`); `economy_stations` went 0 → 60 rows; argon `shortages` NON-EMPTY + real (foodrations 0.917,
+    medicalsupplies 0.917, energycells 0.883), `market_status` importer.
+  - **Gate 3 (in-game):** new marker `[AICHAT][UIX] economy argon stations 0..60/150 sent=60` firing — the
+    per-station round-robin is live. Big counts confirm the cap was right (argon 150, split 125, xenon 130).
+  - **Note:** full coverage builds incrementally — the cursor captures one faction + a 60-station slice per
+    heartbeat (1/12 factions rolled at verify time), converging over ~15-20 heartbeats. By design, not partial.
+  - **▶ Unblocks #55 (meaning prose over real shortages), #56 (Economy Truth panel), #60 (economy-delivery
+    contract pointing at a real shortage).**
+
+#### ▶ SPEC #55 (SCOPED 2026-06-26) — economy meaning-layer prose (UPGRADE, not greenfield)
+`build_faction_briefing` ALREADY phrases economy (memory.py ~1225-1241), but with #54's now-REAL data it has 3
+defects: (a) prints RAW ware ids (`foodrations` not "Food Rations"); (b) always says "critically short" ignoring
+the real severity float (0.917 vs 0.30); (c) leaks a raw "dependency X/100" number. Per Ken's rule (English, deny
+the LLM raw numbers — same discipline as `_humanize_math`/`_qualify_prose`), upgrade the prose. **Bridge-only.**
+- **Build:** (1) `_ware_label(ware_id)` — cached map from canon lore `list_lore(CANON_SAVE,"ware")` (#34 catalog),
+  fallback raw id. (2) `_shortage_phrase(sev)` bands: ≥0.7 "critically short on", 0.4-0.7 "running low on", <0.4
+  "a little tight on". (3) Rewrite the economy block: display names for key_needs+shortages, group shortages by
+  band, replace "dependency X/100" with English ("heavily reliant on the Commander for supply"). Keep ≤2-3 lines.
+- **Verify (3-gate, applicable):** (1) Forge validate still ok (no MD touched). (2) Bridge selftest — briefing
+  economy line uses display names (no raw `foodrations`), has a severity band phrase, NO `/100` in the econ line;
+  run against argon's live data. (3) In-game — dashboard "Injected briefing" panel / NPC chat shows natural econ
+  prose ("a net importer, critically short on Food Rations & Medical Supplies, running low on Energy Cells").
+- **Risk:** some ware ids may miss the lore catalog (khaak/xenon) → fallback to raw id (rare, acceptable).
+- **Status: ◐ BUILT + logic-verified (2026-06-26); live verification PENDING a BRIDGE RESTART (no mod reload —
+  pure Python). The mod-reload already done for #54 does NOT pick up this memory.py change.**
+  - **Built:** `_ware_label` (canon-lore id→name, cached), `_shortage_phrase` (≥0.7 critically / 0.4-0.7 running
+    low / <0.4 a little tight), `_and_join` (Oxford-comma list); economy block in `build_faction_briefing`
+    rewritten to use them + English dependency (no raw `/100`). `economy_rollup_selftest` extended with 5 prose
+    checks (now 11 checks).
+  - **Verification:** (1) Forge = N/A (bridge-only Python, no MD/Lua). (2) Bridge logic — standalone replica 8/9
+    on the rollup data + argon live data; the 1 "fail" was a wrong test-string (3 wares all ≥0.7 → ONE grouped
+    "critically short on A, B, and C" phrase, which is the CORRECT output). Real rendered prose for argon:
+    *"a net importer; you rely on importing Food Rations, Medical Supplies, and Energy Cells. … critically short
+    on Food Rations, Medical Supplies, and Energy Cells."* — no raw ids, no raw numbers.
+  - **✅ VERIFIED LIVE (2026-06-26):** the bridge HOT-RELOADS .py — no restart was needed. Live
+    `economy_rollup_selftest` **11/11** incl. all 5 `prose_*` checks. Found+fixed a real bug on the way: the lore
+    display name is in the `title` column, not `name` — `_ware_label` now reads `title`, so wares resolve
+    (energycells→"Energy Cells", 4/4 probed). Briefing prose renders with display names + English bands, no raw
+    numbers. **#55 DONE.**
+
+#### ▶ SPEC #56 (DONE 2026-06-26) — dashboard "Economy Truth" panel made auditable
+The "Economy — meaning" panel already rendered the aggregate, but with raw ware ids and no grounding audit. #56:
+- **Bridge** `economy_list` now attaches per-faction `station_count` (from the #54 `economy_stations` capture),
+  a `ware_names` id→display-name map (#55 `_ware_label`), and `economy_meta {stations_captured, factions_covered}`.
+- **Dashboard** (`index.html` + `app.js`): new "Stations" column, ware **display names** in Key needs/Shortages,
+  and a header caption of the sweep totals.
+- **✅ VERIFIED LIVE:** rendered panel shows display names ("Energy Cells, Hull Parts, Food Rations…"), real
+  per-faction station counts (argon **153**, antigone 95, alliance 3), and caption **"1251 stations captured ·
+  12 factions"** — the #54 round-robin has fully converged across all 12 factions. Forge = N/A (dashboard+bridge).
+- **NOTE (workflow):** the bridge appears to **hot-reload .py on change** — #54/#55/#56 bridge edits all went live
+  without a manual restart (only the mod's Lua needed Ken's in-game reload). Treat bridge edits as live-on-save.
+  - **Step 1 (research) ✅** — primitives proven, storage/workforce cleanly deferred, money→#63.
+  - **Step 2 (build) ✅ authored:**
+    - **Lua** `SyncEconomy` (aic_uix.lua) REWRITTEN: round-robin ONE faction + a 60-station slice per call
+      (cursors `_econFac`/`_econOff`; a big faction captures over several heartbeats, then advances — bounds the
+      UI-thread cost). Emits per-station `{station_id:idcode|tostring, faction_id, sector_id, station_name,
+      station_type:macro, products[], needs[]}` (all pcall-guarded) → `POST /v1/economy/stations` (auto-rollup).
+      **Removed the hollow `/api/economy` POST** (`shortages:{}`) — the bridge now owns ALL derivation.
+    - **Bridge** `rollup_economy_from_stations` now also derives **`market_status`** (exporter if product variety >
+      need variety, importer if unmet needs, else neutral) — moved off the Lua, which only ever saw a per-tick
+      slice and couldn't judge faction-wide. `upsert_economy` is a partial-merge, so this co-exists cleanly.
+  - **Verification so far:** (1) **Forge validate `ok`, 0 errors** (MD untouched — Lua/bridge only). (2) **Bridge
+    rollup replica 6/6** — energycells 0.67 / hullparts 0.33 shortages, production_health 0.33, key_needs ranked,
+    `market_status` importer (selftest) + exporter (variety case); `economy_rollup_selftest` extended with the
+    market_status assertion (now 6 checks). No Lua runtime in-sandbox → block hand-traced (all blocks balance);
+    in-game is the real Lua gate.
+  - **Gate 3 (in-game) PENDING:** reload (UI Lua, already on disk) + bridge restart (memory.py/router.py) → watch
+    debuglog `economy <fac> stations <off>..<last>/<total> sent=N`, then `/api/economy` `shortages` NON-empty +
+    `economy_stations` rows>0 + `economy_rollup_selftest` 6/6 live + Economy panel shows real shortages.
+
+#### ▶ SPEC #57 SEED (extracted 2026-06-26 from Ken's `deadairdynamicwars` ref) — faction war/peace eligibility
+The dashboard has NO eligibility data (gap audit). DeadAir `md/dynamicwardiplomacy.xml` is the pattern to port:
+- **Eligibility filter = `$Faction.isactive` AND NOT in an `$ExcludedFactions` list** (the exclusion list is the
+  core artifact — factions that must never be dragged into dynamic war/peace, e.g. story/locked/uncombatant).
+- **Relation scale is the UI value `±25`** (`$F1.relation.{…}.uivalue`); changes are bounded `le 25` / `ge -25`
+  and step ±5; cost-gated by `player.money`. So a legal relation move = within ±25 and both factions active+eligible.
+- **Also check** `dynamicwarfixrelations.xml` (relation repair/normalization) + `dynamicwar.xml` (who-fights-who
+  selection) for the full eligibility/validator set when #57 is built.
+- **#58 will encode this as a bridge validator** (`is_war_eligible(a,b)` = both active, neither excluded, target
+  reachable) + selftest, which then UNBLOCKS #65 (gate ForceWar through the same validator). Not built yet — seed only.
 
 ### ▶ SPEC 3.3 — WAR-PHASE ACTUATION (Ken: "build A then go for B", 2026-06-26) — IN PROGRESS
 Closes Codex's open gap above. Two depths, A first as the substrate for B:

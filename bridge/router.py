@@ -1346,6 +1346,16 @@ class NeuralRouter:
             ok("hullparts_lesser_shortage", round(float(sh.get("hullparts", 0)), 2) == 0.33, sh)
             ok("production_health_from_short_ratio", round(float(econ.get("production_health", 1)), 2) == 0.33, econ.get("production_health"))
             ok("key_needs_ranked", (econ.get("key_needs") or [])[:1] == ["energycells"], econ.get("key_needs"))
+            # #54: market_status is derived in the rollup now (prod variety 2 == need variety 2 → not exporter;
+            # unmet needs present → importer).
+            ok("market_status_derived_in_rollup", econ.get("market_status") == "importer", econ.get("market_status"))
+            # #55: meaning-layer prose — display names + ENGLISH severity bands, no raw numbers in the economy line.
+            brief = self.memory.build_faction_briefing(s, "argon")
+            ok("prose_critical_band_helper", self.memory._shortage_phrase(0.9) == "critically short on")
+            ok("prose_uses_severity_bands", ("running low on" in brief) and ("a little tight on" in brief), brief[-220:])
+            ok("prose_no_raw_per100_in_brief", "/100" not in brief)
+            ok("prose_ware_label_or_fallback", ("Energy Cells" in brief) or ("energycells" in brief), brief[-220:])
+            ok("prose_market_role_english", "net importer" in brief)
         except Exception as e:
             ok("no_exception", False, str(e))
         passed = sum(1 for c in checks if c["pass"])
@@ -2154,8 +2164,25 @@ class NeuralRouter:
         return {"ok": True, "agreement": ag}
 
     def economy_list(self, save_id: str) -> dict[str, Any]:
-        return {"ok": True, "economy": self.memory.list_economy(save_id),
-                "player_market": self.memory.list_player_market(save_id)}
+        econ = self.memory.list_economy(save_id)
+        # #56 "Economy Truth": audit the aggregate against the real per-station capture (#54) — attach each
+        # faction's captured-station count, the ware display-name map (#55), and sweep totals.
+        stations = self.memory.list_economy_stations(save_id)
+        counts: dict[str, int] = {}
+        for s in stations:
+            f = s.get("faction_id")
+            if f:
+                counts[f] = counts.get(f, 0) + 1
+        names: dict[str, str] = {}
+        for e in econ:
+            e["station_count"] = counts.get(e.get("faction_id"), 0)
+            for w in (e.get("key_needs") or []):
+                names.setdefault(str(w), self.memory._ware_label(str(w)))
+            for w in (e.get("shortages") or {}):
+                names.setdefault(str(w), self.memory._ware_label(str(w)))
+        return {"ok": True, "economy": econ, "player_market": self.memory.list_player_market(save_id),
+                "ware_names": names,
+                "economy_meta": {"stations_captured": len(stations), "factions_covered": len(counts)}}
 
     def economy_upsert(self, payload: dict[str, Any]) -> dict[str, Any]:
         fid = str(payload.get("faction_id", ""))

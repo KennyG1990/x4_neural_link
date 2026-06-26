@@ -370,9 +370,17 @@ function renderIncidents(resp) {
 
 function renderEconomy(resp) {
   const rows = (resp && resp.economy) || [];
+  // #56: ware display names (#55 catalog) + per-faction captured-station count (audit the rollup against #54).
+  const names = (resp && resp.ware_names) || {};
+  const wl = (w) => names[w] || w;
+  const lblNeeds = (arr) => (arr || []).map(wl).join(", ");
+  const lblShort = (sh) => Object.entries(sh || {}).map(([w, v]) => `${wl(w)}:${Math.round((+v || 0) * 100)}%`).join(", ");
   document.getElementById("economyBody").innerHTML = rows.map((e) => `
-    <tr>${td(e.faction_id)}${td(pct(e.dependency_on_player))}${td(pct(e.production_health), (+e.production_health < 0.5 ? "bad" : ""))}${td(jlist(e.key_needs))}${td(jshort(e.shortages), "warn")}${td(e.market_status, e.market_status === "obstacle" ? "bad" : (e.market_status === "partner" ? "ok" : ""))}</tr>
-  `).join("") || `<tr><td colspan="6" class="dim">No economy rows.</td></tr>`;
+    <tr>${td(e.faction_id)}${td(e.station_count != null ? e.station_count : "–", (+e.station_count > 0 ? "ok" : "dim"))}${td(pct(e.dependency_on_player))}${td(pct(e.production_health), (+e.production_health < 0.5 ? "bad" : ""))}${td(lblNeeds(e.key_needs))}${td(lblShort(e.shortages), "warn")}${td(e.market_status, e.market_status === "obstacle" ? "bad" : (e.market_status === "partner" ? "ok" : ""))}</tr>
+  `).join("") || `<tr><td colspan="7" class="dim">No economy rows.</td></tr>`;
+  const meta = (resp && resp.economy_meta) || {};
+  const cap = document.getElementById("economyMeta");
+  if (cap) cap.textContent = (meta.stations_captured || 0) + " stations captured · " + (meta.factions_covered || 0) + " factions";
 }
 
 function renderConflicts(resp) {

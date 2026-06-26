@@ -1143,6 +1143,49 @@ class MemoryStore:
             lines.extend(f"- {r['text']}" for r in sig)
         return "\n".join(lines).strip()
 
+    # --- #55 economy meaning-layer helpers: raw ware ids -> display names, severity -> English bands ----
+    def _ware_label(self, ware_id: str) -> str:
+        """Raw ware id ('foodrations') -> display name ('Food Rations') from the canon lore catalog (#34),
+        cached. Fallback: the raw id (rare misses, e.g. some khaak/xenon wares)."""
+        wid = str(ware_id or "").strip()
+        if not wid:
+            return ""
+        cache = getattr(self, "_ware_label_cache", None)
+        if cache is None:
+            cache = {}
+            try:
+                for row in self.list_lore(self.CANON_SAVE, "ware"):
+                    k = str(row.get("key") or "").strip()
+                    # lore display name is in `title` (not `name`); fall back to name/label if ever present.
+                    nm = str(row.get("title") or row.get("name") or "").strip()
+                    if k and nm:
+                        cache[k] = nm
+            except Exception:
+                pass
+            self._ware_label_cache = cache
+        return cache.get(wid) or wid
+
+    @staticmethod
+    def _shortage_phrase(sev: float) -> str:
+        """Shortage severity (0..1) -> English band (deny the LLM the raw number)."""
+        s = float(sev or 0)
+        if s >= 0.7:
+            return "critically short on"
+        if s >= 0.4:
+            return "running low on"
+        return "a little tight on"
+
+    @staticmethod
+    def _and_join(items: list) -> str:
+        xs = [str(i) for i in items if i]
+        if not xs:
+            return ""
+        if len(xs) == 1:
+            return xs[0]
+        if len(xs) == 2:
+            return xs[0] + " and " + xs[1]
+        return ", ".join(xs[:-1]) + ", and " + xs[-1]
+
     def build_faction_briefing(self, save_id: str, faction_id: str, max_events: int = 4) -> str:
         """SPEC 1e — faction-level grounded briefing from JUST save_id + faction_id (no NPC record needed):
         the faction's mood/goal/representative, its standing toward the player and other factions, active
@@ -1222,23 +1265,32 @@ class MemoryStore:
                    "recent_losses", "logistics_stress") if float(st.get(k, 0) or 0) >= 0.5]
             if hot:
                 lines.append("Pressing concerns right now: " + ", ".join(hot) + ".")
-        # 1i-B: economy — what you import/export + supply leverage, so you can reason about trade, embargoes,
-        # and supply deals (not just war). Key imports are real (station read); player-leverage where known.
+        # 1i-B / #55: economy — meaning-layer prose. Display NAMES (not raw ware ids) + severity in ENGLISH
+        # bands (deny the LLM raw numbers), so the NPC reasons about trade, embargoes and supply deals naturally.
+        # Key imports/shortages are real (the #54 per-station station read → rollup).
         econ = self.get_economy(save_id, faction_id) or {}
         kn = econ.get("key_needs")
         if isinstance(kn, list) and kn:
             ms = str(econ.get("market_status") or "neutral")
             role = {"importer": "a net importer", "exporter": "a net exporter"}.get(ms, "largely self-reliant")
-            lines.append(f"Economy: your faction is {role}; you depend on importing "
-                         + ", ".join(str(w) for w in kn[:6]) + ".")
+            lines.append(f"Economy: your faction is {role}; you rely on importing "
+                         + self._and_join([self._ware_label(w) for w in kn[:6]]) + ".")
             dep = float(econ.get("dependency_on_player", 0) or 0)
-            if dep >= 0.4:
-                lines.append(f"The Commander (the player) is a major supplier of what you need "
-                             f"(dependency {round(dep*100)}/100) — antagonising them risks your supply lines.")
+            if dep >= 0.7:
+                lines.append("The Commander (the player) is your single biggest supplier of what you need — "
+                             "antagonising them would choke your supply lines.")
+            elif dep >= 0.4:
+                lines.append("The Commander (the player) is a major supplier of what you need — "
+                             "antagonising them risks your supply lines.")
             sh = econ.get("shortages")
             if isinstance(sh, dict) and sh:
-                worst = [w for w, _ in sorted(sh.items(), key=lambda kv: -float(kv[1] or 0))[:3]]
-                lines.append("You are critically short on: " + ", ".join(worst) + ".")
+                # group the worst shortages by ENGLISH severity band (critically short / running low / tight).
+                bands: dict[str, list[str]] = {}
+                for w, sev in sorted(sh.items(), key=lambda kv: -float(kv[1] or 0))[:4]:
+                    bands.setdefault(self._shortage_phrase(float(sev or 0)), []).append(self._ware_label(w))
+                phrases = [f"{band} {self._and_join(names)}" for band, names in bands.items()]
+                if phrases:
+                    lines.append("You are " + "; ".join(phrases) + ".")
         confs = [c for c in self.list_conflicts(save_id, status="active")
                  if faction_id in (c["faction_a"], c["faction_b"])]
         for c in confs[:2]:
@@ -2277,8 +2329,13 @@ class MemoryStore:
             key_needs = [w for w, _ in need_counts.most_common(6)]
             # production_health: 1 when no station is short, lower as more stations report unmet needs
             production_health = round(max(0.0, 1.0 - (short_stations / total)), 3) if total else 1.0
+            # market_status: derived here (the rollup sees ALL of a faction's stations) — exporter if it produces
+            # more ware variety than it needs, importer if it has unmet needs, else neutral. (#54: moved off the
+            # Lua, which only ever saw a per-tick slice and couldn't judge faction-wide.)
+            market_status = ("exporter" if len(prod_counts) > len(need_counts)
+                             else ("importer" if need_counts else "neutral"))
             self.upsert_economy(save_id, fid, shortages=shortages, key_needs=key_needs,
-                                production_health=production_health)
+                                production_health=production_health, market_status=market_status)
             updated += 1
         return {"ok": True, "save_id": save_id, "stations": len(stations), "factions_rolled_up": updated}
 
