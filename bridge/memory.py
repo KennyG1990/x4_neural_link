@@ -2668,12 +2668,15 @@ class MemoryStore:
                 continue
             key = tuple(sorted((a, v)))
             agg = pairs.setdefault(key, {"faction_a": key[0], "faction_b": key[1], "events": 0, "magnitude": 0.0,
-                                         "sectors": set(), "losses": {}, "first": None, "last": None, "first_ev": None})
+                                         "sectors": set(), "losses": {}, "orders": set(),
+                                         "first": None, "last": None, "first_ev": None})
             agg["events"] += 1
             mag = float(e.get("magnitude") or 0)
             agg["magnitude"] += mag
             if e.get("sector"):
                 agg["sectors"].add(e["sector"])
+            if e.get("linked_order_id"):  # #67: which raid order caused this loss (proof of attribution)
+                agg["orders"].add(e["linked_order_id"])
             agg["losses"][v] = agg["losses"].get(v, 0.0) + mag
             ts = float(e.get("ts") or 0)
             if agg["first"] is None or ts < agg["first"]:
@@ -2689,6 +2692,7 @@ class MemoryStore:
                         "intensity": round(self._clamp01(agg["magnitude"] / norm), 3),
                         "events": agg["events"], "sectors": sorted(agg["sectors"]),
                         "losses": {k: round(v, 1) for k, v in agg["losses"].items()},
+                        "orders": sorted(o for o in agg["orders"] if o),
                         "cause": cause, "first_at": agg["first"], "last_at": agg["last"], "source": "events"})
         out.sort(key=lambda c: -c["intensity"])
         return out

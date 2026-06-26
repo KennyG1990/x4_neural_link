@@ -650,7 +650,15 @@ on fire, the Lua POSTs a real `hostile_event{attacker,victim,sector,magnitude}` 
 then proves itself with a REAL located kill attributed to its order. **Build = MD event cues + Lua POST to
 `/v1/hostile_events`; validate in-game** (slow loop: order→travel→fight→kill→located row). Bridge ledger + ingest
 already done (#62).
-- **◐ BUILT + Forge-validated + bridge-verified (2026-06-26); in-game capture PENDING reload + real combat.**
+- **✅ DONE + verified in-game (2026-06-26): real combat around ordered ships is captured → located conflicts.**
+  - **3-gate verification:** (1) Forge/ecosystem — `debug-watcher/brief` (Codex's new recency-aware API):
+    `cueLiveness.erroringCount 0` of 32 cues, `modRuntime.errorCount 0`, `activeErrors 0` (734 lifetime issues but
+    0 ACTIVE — the `sinceDeploy` boundary working), 23 marker lines seen → cues firing clean. (2) Dashboard DB —
+    `derive_conflicts_from_events(game_…)` returns 3 located conflicts (alliance/khaak 5 losses, holyorder/paranid 1,
+    antigone/holyorder 1). (3) In-game fingerprint proves genuine engine capture (not test data): sectors are RAW
+    HEX component ids (`0xc0a4fcd` — live `$obj.sector`, vs selftest's English names), every `magnitude==1` (the
+    cue's hardcoded `ship_destroyed`, vs selftest's 15/5), stored under the live `game_…` save (not the
+    `__hostile_ledger_selftest__` prefix), losses attributed to victims. Arithmetic checks: 5×1/40 = intensity 0.125.
   - **MD** `ai_influence_combat.xml` (NEW): `State` creates a `$Watched` group on load; `On_killed`
     (`event_object_killed_object group=$Watched`) + `On_destroyed` (`event_object_destroyed group=$Watched`, param=
     killer) raise `AIChat.hostile_event` with `attacker/victim/sector` (DeadAir group-event pattern). Schema-valid.
@@ -664,8 +672,28 @@ already done (#62).
     in conditions. DeadAir's proven pattern (`InfPatrolDestroyedListener`) creates the group with a BARE
     `groupname="$Watched"` and the nested listener references it BARE `group="$Watched"` (child inherits parent's
     namespace). Fixed to match. Re-Forge-validated (schema-valid). Needs another reload.
-  - **Remaining:** reload (MD+Lua) then a watched/ordered ship must actually kill or die → debuglog `hostile_event
-    POST …` + a located `hostile_events` row. Slow loop (order→travel→fight→kill). Then #67 links the order_id.
+  - **Runtime fix #3 confirmed live:** after the DeadAir bare-`$Watched` fix, the watcher reads the 3 combat cues
+    CLEAN (erroringCount 0). The null-group race is fully resolved.
+  - **▶ NEXT (#67):** the loss is captured but NOT yet linked to the raid order that caused it. #67 carries the
+    `order_id`/raid context into the `hostile_event` POST so a specific raid proves itself with its own located kill.
+
+### ▶ EVENT LEDGER #3 (task #67) — order→loss attribution: ◐ built + gates 1&2 passed; in-game PENDING (2026-06-26)
+Closes the loop: a captured loss now names the SPECIFIC raid order that caused it, not just the faction pair.
+- **MD** `ai_influence_contract.xml` order branch: after `add_to_group`, mint a unique id
+  `'ord:'+kind+':'+fid+':'+tgt+':'+$oship.idcode` and tag the ship with a **component-scoped MD var**
+  `$oship.$AIINF_order` (rides on the ship object). `debug_text [AIINF] order_tag <id>`.
+- **MD** `ai_influence_combat.xml` both cues: read the tag off the watched ship (`event.object`) — `$attacker` in
+  `On_killed`, `$victim` in `On_destroyed` — and append `|order=<id>` to the `AIChat.hostile_event` param.
+- **Lua** `ReportHostile`: the `key=value` parser already yields `ctx.order`; forward it as `linked_order_id`.
+- **Bridge** `derive_conflicts_from_events`: collect per-conflict `orders` (dedup set → sorted list) so the
+  attribution is observable. `add_hostile_event` already persists `linked_order_id` (#62 column).
+- **Verification:** (1) Forge `project/validate` → **0 errors** (schema-legal: component-scoped var + `order=`
+  concat). (2) Bridge logic (standalone replica of the derivation, live process not yet restarted): **5/5** —
+  `loss_linked_to_raid_order`, `unlinked_event_carries_no_order`, `single_dedup_order_not_two`,
+  `losses_still_attributed`, `intensity_still_rolling`. Selftest `hostile_ledger_selftest` extended with the same
+  two assertions. (3) **In-game PENDING** — needs: Ken reload (MD+Lua, already on disk at the live ext dir) +
+  bridge restart (picks up memory.py/router.py) → issue a raid → the tagged ship kills/dies → a located
+  `hostile_events` row carrying `linked_order_id`, surfaced in the conflict's `orders[]`.
 
 ### ▶ ECONOMY UPDATE READ PIPELINE — foundation built (Ken's "Economy Update" spec + DeadAir Eco, 2026-06-26)
 Turns the AI from "roleplay over remembered events" into "roleplay over the actual X4 economy" (spec's words).
@@ -681,6 +709,37 @@ Build-order step 1-3 (bridge side) DONE + tested:
   needs=7`) — extend `SyncEconomy` to enumerate each station via `find_station_by_true_owner` (omniscient) and POST
   per-station products/storage to `/v1/economy/stations`. Then: meaning-layer prose, economy-backed mission offers,
   narrator econ events, role-filtered NPC economy knowledge, dashboard "Economy Truth" panel (spec §4-10).
+
+#### ▶ SPEC #54 (SCOPED 2026-06-26) — in-game per-station economy capture → fill the hollow economy table
+**Why now (dashboard gap audit):** `/api/economy` has 12 faction rows but they're hollow — `shortages:{}` empty on
+every faction, `key_needs` is a generic all-ware list, not real demand. The `economy_stations` table (#46) receives
+nothing. #54 turns on the live feed; it UNBLOCKS #55 (prose), #56 (panel), and #60 (economy-delivery contract).
+**Scope (one bounded unit — capture only):** on the economy heartbeat, enumerate each faction's stations and POST
+per-station rows to the existing `POST /v1/economy/stations` (ingest+rollup already built & 5/5 tested). NOTHING
+else — no prose, no panel, no contracts, no writes back to the game.
+- **Payload per station** (matches `economy_stations` columns): `station_id, faction_id, sector_id, station_name,
+  station_type, workforce_current, workforce_capacity, products[], needs[], storage{ware:amt}`. `products`/`needs`/
+  `storage` optional-degrade (send what MD can read; rollup only needs `needs[]` + `products[]` to derive shortages).
+- **Anti-cheat:** READ-ONLY observation. NO `add_wares`/`remove_wares`. Pure capture of what factions already own.
+- **Build steps + per-step verify:**
+  1. **Research the MD read primitives FIRST** (research-gated — the real unknown): where does `SyncEconomy`'s
+     `needs=7` come from, and can the same path yield per-station `products`/`storage`? Ground against DeadAir
+     `deadairdynamicuniverse` "Fill" (reads/writes station cargo) + the Forge `md.xsd` before authoring. → verify:
+     a documented property path for each field (or a decision to ship `needs+products` only, `storage` deferred).
+  2. **Author MD+Lua:** extend `SyncEconomy` to build a per-station payload and POST it. CAP stations-per-tick and
+     round-robin factions (paranid alone = 165 stations — a full sweep must span several heartbeats, not one). →
+     verify: Forge `POST /api/agent/project/validate` → `ok:true` (schema-legal).
+  3. **Deploy faithful** (verbatim `fs/write`/disk, per the lifted-mandate method) + in-game reload + bridge restart.
+- **3-GATE VERIFICATION (all three, per the hard rule):**
+  1. **Forge/ecosystem:** `validate` ok + `debug-watcher/brief` cue `erroringCount 0`, `activeErrors 0`.
+  2. **Dashboard DB:** `/api/economy` `shortages` is NON-empty and faction-specific (not `{}`); `economy_stations`
+     row count > 0 for the live save; `economy_rollup_selftest` still 5/5.
+  3. **In-game:** debuglog shows the per-station POST marker + `[AICHAT][UIX] economy <faction> stations=N`; the
+     "Economy — meaning" panel renders real per-faction shortages.
+- **Risks / fallbacks:** (a) MD may not cheaply expose `products`/`storage` per station → fallback to `needs[]`
+  (already proven readable) + `products[]`, defer `storage`. (b) full-universe enumeration is expensive → the
+  per-tick cap + round-robin bounds it. (c) `station_type` may need a small classification map.
+- **Status: SPEC'd — not started.** Step 1 (research) is the gate; do it before any authoring.
 
 ### ▶ SPEC 3.3 — WAR-PHASE ACTUATION (Ken: "build A then go for B", 2026-06-26) — IN PROGRESS
 Closes Codex's open gap above. Two depths, A first as the substrate for B:

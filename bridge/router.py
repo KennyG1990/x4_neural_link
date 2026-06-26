@@ -1381,8 +1381,8 @@ class NeuralRouter:
         ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
         try:
             for e in [
-                {"attacker_faction": "argon", "victim_faction": "teladi", "sector": "Grand Exchange", "event_kind": "ship_destroyed", "magnitude": 15, "ts": now - 100},
-                {"attacker_faction": "argon", "victim_faction": "teladi", "sector": "Grand Exchange", "event_kind": "ship_destroyed", "magnitude": 15, "ts": now - 50},
+                {"attacker_faction": "argon", "victim_faction": "teladi", "sector": "Grand Exchange", "event_kind": "ship_destroyed", "magnitude": 15, "ts": now - 100, "linked_order_id": "ord:raid:argon>teladi:ABC-001"},
+                {"attacker_faction": "argon", "victim_faction": "teladi", "sector": "Grand Exchange", "event_kind": "ship_destroyed", "magnitude": 15, "ts": now - 50, "linked_order_id": "ord:raid:argon>teladi:ABC-001"},
                 {"attacker_faction": "argon", "victim_faction": "teladi", "sector": "Hatikvah", "event_kind": "cargo_lost", "magnitude": 5, "ts": now - 10},
                 {"attacker_faction": "khaak", "victim_faction": "argon", "sector": "Tharka", "event_kind": "ship_attacked", "magnitude": 5, "ts": now - 5},
             ]:
@@ -1396,6 +1396,9 @@ class NeuralRouter:
             ok("conflict_is_LOCATED", at and "Grand Exchange" in at["sectors"] and "Hatikvah" in at["sectors"], at and at["sectors"])
             ok("losses_attributed_to_victim", at and at["losses"].get("teladi", 0) == 35.0, at and at["losses"])
             ok("cause_is_first_event_not_relations", at and "struck" in at["cause"].lower() and "Grand Exchange" in at["cause"] and "relations at war" not in at["cause"], at and at["cause"])
+            # #67: the loss links back to the SPECIFIC raid order that caused it (attribution proof).
+            ok("loss_linked_to_raid_order", at and "ord:raid:argon>teladi:ABC-001" in (at.get("orders") or []), at and at.get("orders"))
+            ok("unlinked_event_carries_no_order", ak and (ak.get("orders") or []) == [], ak and ak.get("orders"))
             ok("no_event_no_conflict", not any({c["faction_a"], c["faction_b"]} == {"split", "boron"} for c in confs))
         except Exception as e:
             ok("no_exception", False, str(e))
