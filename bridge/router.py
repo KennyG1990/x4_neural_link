@@ -941,11 +941,14 @@ class NeuralRouter:
                         eff = self._actuate_war_phase(save_id, fid, target, action)
                         if eff:
                             phase_effects.append(eff)
-                            # SPEC 3.3-B: a relation-meaningful phase ALSO dispatches a REAL in-game relation move
-                            # through the proven On_action cue (ceasefire raises a war relation; mobilise lowers it).
-                            disp = eff.get("dispatch")
-                            if disp and len(actions) < self.ACTUATION_BUDGET:
-                                actions.append(disp)
+                            # SPEC 3.3-B: a phase can dispatch one or MORE real in-game actions through On_action
+                            # (relation move, economy add/remove, military order). raid emits an order + economy.
+                            disps = list(eff.get("dispatches") or [])
+                            if eff.get("dispatch"):
+                                disps.append(eff["dispatch"])
+                            for disp in disps:
+                                if len(actions) < self.ACTUATION_BUDGET:
+                                    actions.append(disp)
                     elif len(actions) < self.ACTUATION_BUDGET:
                         act = self._decision_action(save_id, fid, dec)
                         if act:
@@ -1029,14 +1032,17 @@ class NeuralRouter:
             if not hasattr(self, "_pending_news"):
                 self._pending_news = {}
             self._pending_news.setdefault(save_id, []).append(item)
-        disp = (eff or {}).get("dispatch")
+        disps = list((eff or {}).get("dispatches") or [])
+        if (eff or {}).get("dispatch"):
+            disps.append(eff["dispatch"])
         rel = payload.get("relation")
         if rel is not None:
-            disp = {"type": "adjust_relation", "faction": fid, "target": target, "relation": float(rel)}
-        if disp:
+            disps = [{"type": "adjust_relation", "faction": fid, "target": target, "relation": float(rel)}]
+        if disps:
             if not hasattr(self, "_pending_actions"):
                 self._pending_actions = {}
-            self._pending_actions.setdefault(save_id, []).append(disp)
+            self._pending_actions.setdefault(save_id, []).extend(disps)
+        disp = disps[0] if disps else None
         return {"ok": True, "faction_id": fid, "target": target, "phase": phase,
                 "effects": (eff or {}).get("effects"), "dispatch": disp, "news": item}
 
@@ -1275,47 +1281,50 @@ class NeuralRouter:
             if phase == "raid_supply_line" and target:
                 self.memory.record_loss(save_id, target, self.RAID_LOSS, kind="raid")
                 self._econ_delta(save_id, target, self.ECON_REPARATIONS)
-                # No spawned raiders (Ken: the mod never invents assets) — the raid's REAL in-game effect is
-                # SUPPLY DISRUPTION: remove wares from one of the target's own stations.
+                # ANTI-CHEAT (Ken): words≠resources. The raid is a REAL Attack ORDER — the faction's own ships
+                # attack the target; the economic damage is EARNED from the actual fight (vanilla combat destroys
+                # cargo), NOT a scripted ware skim. No magic remove_wares.
                 eff = {"war_losses": {target: self.RAID_LOSS}, "production_health": {target: self.ECON_REPARATIONS},
-                       "dispatch": {"type": "economy", "faction": target, "ware": "energycells", "amount": 6000, "op": "remove"}}
+                       "dispatch": {"type": "order", "faction": fid, "target": target, "kind": "raid"}}
             elif phase == "offer_privateer_contract" and target:
                 self.memory.record_loss(save_id, target, self.PRIVATEER_LOSS, kind="privateer")
-                eff = {"war_losses": {target: self.PRIVATEER_LOSS},
-                       "dispatch": {"type": "economy", "faction": target, "ware": "energycells", "amount": 3000, "op": "remove"}}
+                # anti-cheat: no magic ware skim — privateering becomes a real raid order / player contract later.
+                eff = {"war_losses": {target: self.PRIVATEER_LOSS}}
             elif phase == "mobilize_fleet" and target:
                 ni = self._conflict_intensity_delta(save_id, fid, target, self.INTENSITY_STEP)
+                # SPEC 3.3-B mil (Codex #4): mobilize is now a REAL order — patrol the faction's OWN existing
+                # ships toward the front — not the old relation proxy. (Intensity substrate bump stays.)
                 eff = {"conflict_intensity": {f"{fid}|{target}": ni},
-                       "dispatch": {"type": "adjust_relation", "faction": fid, "target": target, "relation": self.REL_MOBILIZE}}
+                       "dispatch": {"type": "order", "faction": fid, "target": target, "kind": "patrol"}}
             elif phase == "seek_ceasefire" and target:
                 ni = self._conflict_intensity_delta(save_id, fid, target, self.CEASEFIRE_COOL)
                 eff = {"conflict_intensity": {f"{fid}|{target}": ni},
                        "dispatch": {"type": "adjust_relation", "faction": fid, "target": target, "relation": self.REL_CEASEFIRE}}
             elif phase == "request_supplies":
                 self._econ_delta(save_id, fid, self.ECON_SUPPLY_GAIN)
-                # SPEC 3.3-B: LASTING in-game economy change — add wares to one of the faction's stations
-                # (DeadAir "Fill" pattern: add/remove cargo at trade stations). Energy cells = universal demand.
-                eff = {"production_health": {fid: self.ECON_SUPPLY_GAIN},
-                       "dispatch": {"type": "economy", "faction": fid, "ware": "energycells", "amount": 8000, "op": "add"}}
+                # anti-cheat (Ken): no magic free supplies — a request becomes a player CONTRACT (#60), earned by
+                # real delivery. Intent-only here (substrate + news).
+                eff = {"production_health": {fid: self.ECON_SUPPLY_GAIN}}
             elif phase == "demand_reparations" and target:
                 self._econ_delta(save_id, target, self.ECON_REPARATIONS)
-                eff = {"production_health": {target: self.ECON_REPARATIONS},
-                       "dispatch": {"type": "economy", "faction": target, "ware": "energycells", "amount": 5000, "op": "remove"}}
+                # anti-cheat: a demand is words — no transfer unless the target actually pays (agreement/contract).
+                eff = {"production_health": {target: self.ECON_REPARATIONS}}
             elif phase == "fortify_sector":
                 self._econ_delta(save_id, fid, self.ECON_FORTIFY_COST)
-                # Fortifying = stockpiling defensive supplies at the faction's OWN station (no spawning) — a real
-                # add_wares of hull parts (repair/defense ware).
-                eff = {"production_health": {fid: self.ECON_FORTIFY_COST},
-                       "dispatch": {"type": "economy", "faction": fid, "ware": "hullparts", "amount": 4000, "op": "add"}}
+                # anti-cheat: no magic stockpile — fortifying becomes a defensive patrol order later.
+                eff = {"production_health": {fid: self.ECON_FORTIFY_COST}}
             # war_exhaustion_warning: a signal, not a state change — no substrate write (honest).
         except Exception:
             return None
         if not eff:
             return None
         dispatch = eff.pop("dispatch", None)
+        dispatches = eff.pop("dispatches", None)
         out = {"type": "war_phase_state", "faction": fid, "target": target, "phase": phase, "effects": eff}
         if dispatch:
             out["dispatch"] = dispatch
+        if dispatches:
+            out["dispatches"] = dispatches
         return out
 
     # Economy Update read pipeline: ingest omniscient station snapshots + roll up to faction facts.

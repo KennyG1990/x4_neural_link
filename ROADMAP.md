@@ -529,6 +529,51 @@ ships, `match primarypurpose="purpose.fight"`, checkoperational, masstraffic=fal
 artifact; the new military-order elements pass md.xsd). Branch is inert until the bridge dispatches `type:'order'`
 (task #52/#53). Ship path: faithful Forge fs/write deploy (Ken's call); graph-compile faithfulness deferred to #61.
 
+### ✅ ORDER-PRIMITIVE #3 (task #51) — a real existing ship took a real order IN-GAME (2026-06-26)
+The native-execution bridge under all war ops + contracts, PROVEN. New bridge `POST /v1/order/prove` queues
+`{type:'order', faction, target, kind}`; Lua forwards `kind`; On_action's order branch runs. After Ken's reload,
+`order_prove(argon vs khaak, kind=patrol)` → debuglog:
+`md.ai_influence_contract.On_action: [AIINF] order patrol argon vs khaak ship=ARG Police Quasar Vanguard`.
+The line fires AFTER `create_order`, inside the `$oships.count gt 0 and $ofront` guard — so `find_ship_by_true_owner`
+matched Argon's own combat ships, the Kha'ak front resolved, and a real `MoveGeneric` patrol order was issued to a
+ship Argon ACTUALLY OWNS. No spawning, no errors. **Unlocks #52 (mobilize→orders) + #53 (raid→orders).**
+- Note: `purpose.fight` matched a POLICE ship; #52/#53 may want a tighter military filter + a ship-slice cap
+  (the documented "don't yank active defenders" gotcha). Ship path: faithful Forge deploy (live extension dir).
+
+### ✅ WAR-PHASE ORDER: mobilize_fleet → REAL patrol order (task #52, in-game proven 2026-06-26)
+Replaced mobilize_fleet's relation PROXY with a real order dispatch `{type:'order', kind:'patrol'}` (intensity
+substrate stays). Bridge-only change (order branch already live from #51 — no reload). Proven:
+`[AIINF] order patrol split vs khaak ship=ZYA Colonial Police Dragon` — a real Split-owned ship took a real
+MoveGeneric patrol order toward the front. Codex #4 satisfied for mobilize: real military op, not logbook text.
+(Still matches police via purpose.fight — tighter mil filter is a later polish.)
+
+### ✅ WAR-PHASE ORDER: raid_supply_line → REAL raid order + supply disruption (task #53, in-game proven 2026-06-26)
+Multi-dispatch support added (`_actuate_war_phase` can return `dispatches:[…]`; influence_step + warphase_prove
+queue all; fixed the return to surface `dispatches` not just `dispatch`). raid now emits TWO real effects:
+- `[AIINF] order raid argon vs khaak ship=ARG Recon Fighter Discoverer Vanguard` — a real Argon ship got an
+  `Attack` order vs the Kha'ak (create_order id='Attack').
+- `[AIINF] economy remove 6000 energycells @ khaak` — supply disruption at a Kha'ak station.
+Both over real owned assets, no spawning. **Codex #4 military third now real for BOTH mobilize + raid — the gap
+Ken flagged ("B not complete") is CLOSED in-game.** Remaining war phases are economy/relation (done). Future
+polish: tighter military ship filter (purpose.fight still catches police/recon), ship-slice cap, sector-aware
+raid targeting.
+
+### ✅ ANTI-CHEAT: words≠resources — removed ALL magic ware-writes from war phases (Ken, 2026-06-26)
+Ken's principle: a faction's DECISION/intent must never mint or skim in-game resources — otherwise the player can
+social-engineer the AIs into handing over (or destroying) wares they never earned/lost = a roundabout cheat menu.
+This condemned EVERY decision-triggered `add_wares`/`remove_wares` I'd built (request_supplies/fortify = free
+resources; demand_reparations/raid/privateer = unearned skim). Removed all of them. What stays legitimate:
+- **Orders** (real ships, real action): `mobilize_fleet` → patrol order; `raid_supply_line` → real `Attack` order —
+  the economic damage is now EARNED from vanilla combat (destroyed cargo), not a scripted number.
+- **Relations** (disposition, not a resource): `seek_ceasefire` etc.
+- **News + bridge substrate** (the AI's internal reasoning model — not extractable by the player).
+**VERIFIED:** raid prove → dispatch is `{type:order}` ONLY (no economy remove); request_supplies/demand_reparations
+→ no dispatch. The legit path for resource transfer = player CONTRACTS (#60), earned by REAL delivery.
+- **◐ deeper coherence (flagged, not yet done):** the bridge substrate (record_loss/econ_delta) still writes
+  internal beliefs from DECISIONS, not real outcomes — same incoherence one layer down (not a player-exploitable
+  cheat, but the AI "believes" a raid hurt the enemy before combat resolves). Real losses already come from the
+  fleet census; the substrate should track real outcomes, not decisions. Decide whether to purify it too.
+
 ### ▶ ECONOMY UPDATE READ PIPELINE — foundation built (Ken's "Economy Update" spec + DeadAir Eco, 2026-06-26)
 Turns the AI from "roleplay over remembered events" into "roleplay over the actual X4 economy" (spec's words).
 Build-order step 1-3 (bridge side) DONE + tested:
