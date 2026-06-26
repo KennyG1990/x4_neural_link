@@ -569,10 +569,17 @@ resources; demand_reparations/raid/privateer = unearned skim). Removed all of th
 - **News + bridge substrate** (the AI's internal reasoning model — not extractable by the player).
 **VERIFIED:** raid prove → dispatch is `{type:order}` ONLY (no economy remove); request_supplies/demand_reparations
 → no dispatch. The legit path for resource transfer = player CONTRACTS (#60), earned by REAL delivery.
-- **◐ deeper coherence (flagged, not yet done):** the bridge substrate (record_loss/econ_delta) still writes
-  internal beliefs from DECISIONS, not real outcomes — same incoherence one layer down (not a player-exploitable
-  cheat, but the AI "believes" a raid hurt the enemy before combat resolves). Real losses already come from the
-  fleet census; the substrate should track real outcomes, not decisions. Decide whether to purify it too.
+- **✅ DB-causality cheat FIXED (Codex audit, 2026-06-26):** removed ALL decision-time substrate fabrication from
+  `_actuate_war_phase` — no more `record_loss`/`_econ_delta`/`_conflict_intensity_delta` written off a mere
+  decision. War phases now emit ONLY real orders (mobilize/raid) + relations (ceasefire) + news; losses/economy/
+  intensity come only from REAL events (census now, the #62 event ledger next). `warphase_actuate_selftest`
+  rewritten + 10/10: raid emits an order, fabricates NO loss/economy; supplies/reparations/privateer/fortify =
+  no actuation; no conflict conjured.
+- **✅ MD economy branch GUARDED (task #64):** the dormant `type=='economy'` add/remove_wares branch now requires
+  `$act.$earned=='true'` (set only by the future earned-economy/contract path #63) — a raw decision dispatch can
+  never reactivate it. Forge schema-valid.
+- **◐ remaining anti-cheat:** #65 — gate/remove the chat-driven `ForceWar_handler` (words→relation mutation)
+  behind the diplomacy validators (#58).
 
 ### ▶ ECONOMY UPDATE READ PIPELINE — foundation built (Ken's "Economy Update" spec + DeadAir Eco, 2026-06-26)
 Turns the AI from "roleplay over remembered events" into "roleplay over the actual X4 economy" (spec's words).
