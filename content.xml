@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<content id="x4_neural_link"
+         name="X4 Neural Link"
+         description="Standalone localhost bridge between X4 Foundations mods and the Player2 AI runtime."
+         author="Moshine"
+         version="001"
+         date="2026-06-18"
+         save="false">
+  <text language="44" name="Neural Link Text" file="t/0001-l044.xml" />
+  <dependency id="djfhe_http" name="HTTP Client Library" optional="false" />
+</content>

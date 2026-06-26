@@ -1,0 +1,12 @@
+{
+  "player2_base_url": "http://127.0.0.1:4315",
+  "bridge_host": "127.0.0.1",
+  "bridge_port": 8713,
+  "provider": "player2",
+  "game_client_id": "x4_neural_link",
+  "player2_timeout_seconds": 90,
+  "health_paths": {
+    "player2": "/v1/health",
+    "bridge": "/health"
+  }
+}

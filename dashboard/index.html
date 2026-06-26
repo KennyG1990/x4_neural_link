@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>X4 Neural Link Monitor</title>
+  <link rel="stylesheet" href="/dashboard/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>X4 Neural Link</h1>
+      <p id="subtitle">Bridge telemetry monitor</p>
+    </div>
+    <div class="actions">
+      <button id="probeBtn" type="button">Run Player2 probes</button>
+      <button id="refreshBtn" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="band">
+      <div class="metric">
+        <span class="label">Bridge</span>
+        <strong id="bridgeState">...</strong>
+      </div>
+      <div class="metric">
+        <span class="label">Player2</span>
+        <strong id="player2State">...</strong>
+      </div>
+      <div class="metric">
+        <span class="label">Requests</span>
+        <strong id="requestTotal">0</strong>
+      </div>
+      <div class="metric">
+        <span class="label">Degraded</span>
+        <strong id="degradedTotal">0</strong>
+      </div>
+      <div class="metric">
+        <span class="label">Errors</span>
+        <strong id="errorTotal">0</strong>
+      </div>
+      <div class="metric">
+        <span class="label">DB Rows</span>
+        <strong id="dbRows">0</strong>
+      </div>
+      <div class="metric">
+        <span class="label">NPCs</span>
+        <strong id="npcTotal">0</strong>
+      </div>
+      <div class="metric">
+        <span class="label">Memories</span>
+        <strong id="factTotal">0</strong>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHead">
+        <h2>NPC Memory</h2>
+        <span>
+          <button id="memSelftestBtn" type="button">Run memory self-test</button>
+          <button id="memResetAllBtn" type="button">Reset all</button>
+        </span>
+      </div>
+      <div id="memoryCounts" class="chips"></div>
+      <div id="savesStrip" class="saves"></div>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <div class="panelHead">
+          <h2>NPCs</h2>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr><th>Name</th><th>Faction</th><th>Role</th><th>Save / Game</th><th>Turns</th><th>Facts</th><th>Core</th><th>Active NPC id</th></tr>
+            </thead>
+            <tbody id="npcsBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="npcDetailTitle">Memories — select an NPC</h2>
+        </div>
+        <div id="npcSummary" class="npcSummary"></div>
+        <div id="npcPersona" class="npcPersona"></div>
+        <div id="npcFacts" class="facts"></div>
+        <div id="npcTurnsHead" class="turnsHead" style="display:none">Recent conversation</div>
+        <div id="npcTurns" class="turns"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHead">
+        <h2>Event Queue — green-light batching</h2>
+        <span>
+          <button id="evtSimBtn" type="button">Simulate 500 NPCs</button>
+          <button id="evtFlushBtn" type="button">Flush now</button>
+          <button id="evtClearBtn" type="button">Clear</button>
+        </span>
+      </div>
+      <div id="eventCounts" class="chips"></div>
+      <div class="tableWrap">
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Reason</th><th>Batch</th><th>Coalesced</th><th>Latency</th><th>OK</th><th>LLM Resolution</th></tr>
+          </thead>
+          <tbody id="flushBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHead">
+        <h2>Player2 Pipeline — end-to-end (real prompts → Player2 → replies)</h2>
+        <span>
+          <button id="p2s1" type="button">1 call</button>
+          <button id="p2s10" type="button">10 seq</button>
+          <button id="p2s20" type="button">20 ×5</button>
+          <button id="p2s100" type="button">100 seq</button>
+          <button id="p2sClear" type="button">Clear</button>
+        </span>
+      </div>
+      <div id="p2Progress" class="dim">idle — run a stage to fire real prompts at Player2.</div>
+      <div id="p2Counts" class="chips"></div>
+      <div class="grid">
+        <div class="panel">
+          <div class="panelHead"><h2>Sample replies</h2></div>
+          <div class="tableWrap">
+            <table>
+              <thead><tr><th>#</th><th>Latency</th><th>Reply</th></tr></thead>
+              <tbody id="p2RepliesBody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panelHead"><h2>Failures</h2></div>
+          <div class="tableWrap">
+            <table>
+              <thead><tr><th>#</th><th>Latency</th><th>Class</th><th>Error</th></tr></thead>
+              <tbody id="p2FailBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHead">
+        <h2>Grounded NPC — immersion proof (Captain Voss, full context injected)</h2>
+        <button id="groundedBtn" type="button">Run grounded conversation</button>
+      </div>
+      <div id="groundedStatus" class="dim">idle — runs one richly-remembered NPC through a 5-turn conversation with the full situation briefing injected.</div>
+      <div class="grid">
+        <div class="panel">
+          <div class="panelHead"><h2>Injected briefing (what the NPC actually knows)</h2></div>
+          <pre id="groundedBriefing" style="white-space:pre-wrap">—</pre>
+        </div>
+        <div class="panel">
+          <div class="panelHead"><h2>Conversation</h2></div>
+          <div id="groundedTranscript" class="turns"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <div class="panelHead">
+          <h2>Factions</h2>
+          <button id="seedUniverseBtn" type="button">Seed demo</button>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead><tr><th>ID</th><th>Name</th><th>Goal</th><th>Mood</th><th>Aggr</th><th>Econ</th><th>Risk</th><th>Dipl</th></tr></thead>
+            <tbody id="factionsBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="relTitle">Relationships</h2>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead><tr><th>Subject</th><th>→ Object</th><th>Trust</th><th>Fear</th><th>Resent</th><th>Debt</th><th>Standing</th></tr></thead>
+            <tbody id="relationshipsBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== Influence Log: every relationship change THIS MOD caused in-game ===== -->
+    <section class="panel">
+      <div class="panelHead">
+        <h2 id="influenceLogTitle">Influence Log — mod-caused changes</h2>
+      </div>
+      <div class="tableWrap">
+        <table>
+          <thead><tr><th>Time</th><th>Subject</th><th>→ Object</th><th>Was</th><th>Now</th><th>Standing</th><th>Source</th></tr></thead>
+          <tbody id="influenceLogBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===== Influence-engine substrate (the durable DB, displayed for debugging) ===== -->
+    <section class="grid">
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="strategicTitle">Strategic Pressures</h2>
+          <span>
+            <button id="reviewBtn" type="button" title="Run one deterministic influence cycle for every faction (derive→score→decide→apply)">Run review cycle</button>
+            <button id="stressBtn" type="button" title="Background find-the-wall stress run">Stress 10k</button>
+          </span>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead><tr><th>Faction</th><th>Mil</th><th>Econ</th><th>Logi</th><th>Losses</th><th>Terr</th><th>Piracy</th><th>Align</th></tr></thead>
+            <tbody id="strategicBody"></tbody>
+          </table>
+        </div>
+        <div id="stressStatus" class="dim"></div>
+      </div>
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="incidentsTitle">Incidents — pending actions</h2>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead><tr><th>Action</th><th>Faction → Target</th><th>Conf</th><th>Prio</th><th>Status</th><th>Narrative</th></tr></thead>
+            <tbody id="incidentsBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="economyTitle">Economy — meaning</h2>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead><tr><th>Faction</th><th>Dep.</th><th>Prod.</th><th>Key needs</th><th>Shortages</th><th>Market</th></tr></thead>
+            <tbody id="economyBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="conflictsTitle">Conflicts &amp; Losses</h2>
+        </div>
+        <div id="lossesChips" class="chips"></div>
+        <div class="tableWrap">
+          <table>
+            <thead><tr><th>A vs B</th><th>Status</th><th>Intensity</th><th>Cause</th></tr></thead>
+            <tbody id="conflictsBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="sectorsTitle">Sectors / Territory</h2>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead><tr><th>ID</th><th>Name</th><th>Owner</th><th>Contested by</th><th>Value</th><th>Player assets</th></tr></thead>
+            <tbody id="sectorsBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="fleetsTitle">Fleet Strength</h2>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead><tr><th>Faction</th><th>Ships</th><th>Fight</th><th>Trade</th><th>Mine</th><th>Build</th><th>Capitals</th></tr></thead>
+            <tbody id="fleetsBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="agreementsTitle">Agreements / Deals</h2>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead><tr><th>Parties</th><th>Type</th><th>Status</th><th>Terms</th></tr></thead>
+            <tbody id="agreementsBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHead">
+        <h2 id="conversationsTitle">Conversations — live chat transcript</h2>
+      </div>
+      <div class="tableWrap">
+        <table>
+          <thead><tr><th>Time</th><th>Player</th><th>From</th><th>Player prompt</th><th>LLM reply</th><th>Latency</th></tr></thead>
+          <tbody id="conversationsBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHead">
+        <h2 id="worldEventsTitle">World Events — durable history</h2>
+      </div>
+      <div class="tableWrap">
+        <table>
+          <thead><tr><th>Type</th><th>Imp</th><th>Summary</th><th>Primary</th><th>Secondary</th><th>Sector</th></tr></thead>
+          <tbody id="worldEventsBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <div class="panelHead">
+          <h2>Recent Requests</h2>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr><th>Updated</th><th>ID</th><th>Source</th><th>Channel</th><th>Status</th><th>Latency</th><th>Error</th></tr>
+            </thead>
+            <tbody id="requestsBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panelHead">
+          <h2>Player2 Probes</h2>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Name</th><th>Path</th><th>OK</th><th>Latency</th><th>Error</th></tr>
+            </thead>
+            <tbody id="probesBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <div class="panelHead">
+          <h2>Event Stream</h2>
+        </div>
+        <div id="eventsList" class="events"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panelHead">
+          <h2>Detail</h2>
+        </div>
+        <pre id="detailJson">{}</pre>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHead">
+        <h2>Player2 Capability Matrix</h2>
+      </div>
+      <div id="capabilityCounts" class="chips"></div>
+      <div class="tableWrap">
+        <table>
+          <thead>
+            <tr><th>Class</th><th>Risk</th><th>Spec</th><th>Method</th><th>Path</th><th>Reason</th></tr>
+          </thead>
+          <tbody id="capabilityBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHead">
+        <h2>Player2 API Catalogue</h2>
+      </div>
+      <div class="tableWrap">
+        <table>
+          <thead>
+            <tr><th>Spec</th><th>Method</th><th>Path</th><th>Operation</th><th>Class</th><th>Summary</th></tr>
+          </thead>
+          <tbody id="catalogBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panelHead">
+        <h2>State</h2>
+      </div>
+      <pre id="stateJson">{}</pre>
+    </section>
+  </main>
+
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>
