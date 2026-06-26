@@ -628,6 +628,45 @@ hostile actions. Bridge built (headless, deterministic):
   order_id → events so a raid PROVES ITSELF (the #53 consequence). Live integration (dashboard/news/deriver read
   event-grounded conflicts, retire relation-derived `add_conflict(...'relations at war')`) follows #66's real feed.
 
+### ✅ PLAYER2 CONCURRENCY (task #68) — bounded semaphore replaces the strict chat-lock (2026-06-26)
+The bridge serialized ALL Player2 generation behind one `threading.Lock()` (news/narrator/reactions/chat one-at-a-
+time). Premise was wrong ("single LOCAL model") — the model is HOSTED (a 120B can't run on the user's GPU), so the
+backend serves parallel requests natively; our lock was the sole bottleneck (the server already spawns one thread
+per `/v1/request`). Swapped `_chat_lock` → `threading.BoundedSemaphore(chat_concurrency)`, default **3**,
+config-tunable (`player2_chat_concurrency`); all `with self._chat_lock:` sites unchanged.
+- **VALIDATED LIVE (`/v1/request`→`/v1/response/{id}`):** cap=2 → 4 concurrent done at 6/6/8/8s (vs ~6/12/18/24
+  serial); cap=3 → 6 concurrent done at 4/6/8/10/10/10s, **0 errors** (~3.6x vs ~36s serial). Hosted backend
+  handles it cleanly; no 429s/failures. Matches the workload (a tick's ~2 news + narrator now parallelize; chat no
+  longer blocks background generation). Reversible to 1 via config if Player2's ceiling is ever hit.
+
+### ▶ EVENT LEDGER #2 (task #66) — GROUNDED + design locked (2026-06-26); MD build next
+X4 exposes CONFIRMED combat events: `event_object_killed_object` (attacker+victim), `event_object_destroyed`
+(+`.killer`), `event_object_attacked`/`_object`, `event_object_hull_damaged`; props `killer`/`attacker`/
+`damagesource`. **Constraint:** these register per-OBJECT, not galaxy-wide — can't cheaply watch every death
+(why even DeadAir news only reports major events). **Design (unifies #66+#67, avoids the presence-delta heuristic
+that would re-introduce movement≠kill ambiguity):** capture confirmed combat AROUND OUR ORDERED SHIPS — when
+`On_action` issues a raid/patrol order to ship S, register `event_object_killed_object`/`destroyed` on S (+target);
+on fire, the Lua POSTs a real `hostile_event{attacker,victim,sector,magnitude}` LINKED to the `order_id`. The raid
+then proves itself with a REAL located kill attributed to its order. **Build = MD event cues + Lua POST to
+`/v1/hostile_events`; validate in-game** (slow loop: order→travel→fight→kill→located row). Bridge ledger + ingest
+already done (#62).
+- **◐ BUILT + Forge-validated + bridge-verified (2026-06-26); in-game capture PENDING reload + real combat.**
+  - **MD** `ai_influence_combat.xml` (NEW): `State` creates a `$Watched` group on load; `On_killed`
+    (`event_object_killed_object group=$Watched`) + `On_destroyed` (`event_object_destroyed group=$Watched`, param=
+    killer) raise `AIChat.hostile_event` with `attacker/victim/sector` (DeadAir group-event pattern). Schema-valid.
+  - **MD** `On_action` order branch adds each ordered ship to `$Watched` (`add_to_group`). Schema-valid.
+  - **Lua** `ReportHostile` (registered `AIChat.hostile_event`) → POST `/v1/hostile_events`.
+  - **Bridge** ingest resolves display-name owners → canon ids (in-game `$obj.owner` renders as a name). VERIFIED:
+    ingest "Argon Federation"/"Teladi Company" → derived conflict `argon` vs `teladi`, sector "Grand Exchange".
+  - **Runtime fix #1 (1st reload):** nested the event cues inside `State` (was a race). Still errored.
+  - **Runtime fix #2 (2nd reload, watcher caught State/On_killed/On_destroyed ✗) — grounded in DeadAir + schema
+    (Ken):** the group still resolved null because I used the FULL md-path on `create_group` and `parent.$Watched`
+    in conditions. DeadAir's proven pattern (`InfPatrolDestroyedListener`) creates the group with a BARE
+    `groupname="$Watched"` and the nested listener references it BARE `group="$Watched"` (child inherits parent's
+    namespace). Fixed to match. Re-Forge-validated (schema-valid). Needs another reload.
+  - **Remaining:** reload (MD+Lua) then a watched/ordered ship must actually kill or die → debuglog `hostile_event
+    POST …` + a located `hostile_events` row. Slow loop (order→travel→fight→kill). Then #67 links the order_id.
+
 ### ▶ ECONOMY UPDATE READ PIPELINE — foundation built (Ken's "Economy Update" spec + DeadAir Eco, 2026-06-26)
 Turns the AI from "roleplay over remembered events" into "roleplay over the actual X4 economy" (spec's words).
 Build-order step 1-3 (bridge side) DONE + tested:

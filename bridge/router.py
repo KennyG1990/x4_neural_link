@@ -72,6 +72,8 @@ class NeuralRouter:
             game_client_id=str(config.get("game_client_id", "x4_neural_link")),
             timeout_seconds=int(config.get("player2_timeout_seconds", 30)),
             memory_store=self.memory,
+            # #68: bounded concurrency to the HOSTED Player2 model (validated ~3.6x throughput, 0 errors at 3).
+            chat_concurrency=int(config.get("player2_chat_concurrency", 3)),
         )
         # SPEC 2b: Narrator layer — turns recorded world_events into grounded history articles (cause-gated).
         self._narrator = Narrator(self.memory)
@@ -1357,6 +1359,12 @@ class NeuralRouter:
         for e in events:
             if isinstance(e, dict):
                 try:
+                    # In-game cues pass faction OWNERS as display names ("Argon Federation"); resolve to canon ids
+                    # so the ledger joins with the rest of the world model. resolve_faction_id is id+name tolerant.
+                    e = dict(e)
+                    for k in ("attacker_faction", "victim_faction"):
+                        if e.get(k):
+                            e[k] = self.memory.resolve_faction_id(str(e[k])) or e[k]
                     self.memory.add_hostile_event(save_id, e)
                     n += 1
                 except Exception:

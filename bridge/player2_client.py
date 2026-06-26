@@ -25,7 +25,8 @@ except ImportError:
 class Player2Client:
     """Small stdlib-only Player2 client for Neural Link."""
 
-    def __init__(self, base_url: str, game_client_id: str, timeout_seconds: int = 30, memory_store: Any = None):
+    def __init__(self, base_url: str, game_client_id: str, timeout_seconds: int = 30, memory_store: Any = None,
+                 chat_concurrency: int = 3):
         self.base_url = base_url.rstrip("/")
         self.game_client_id = game_client_id
         self.timeout_seconds = timeout_seconds
@@ -38,11 +39,14 @@ class Player2Client:
         self._rolerag = RoleRAG(memory_store) if memory_store is not None else None
         # SPEC 2a: per-NPC PersonaCard + authority model — situated roleplay within an authority boundary.
         self._persona = PersonaCardBuilder(memory_store) if memory_store is not None else None
-        # Player2 runs a single local chat model. Firing concurrent chat completions
-        # at it makes them contend and serialize badly — each call balloons past the
-        # request timeout and ALL of them fail. Gate chat calls so concurrent X4
-        # requests queue cleanly and each gets a fast, uncontended turn.
-        self._chat_lock = threading.Lock()
+        # CONCURRENCY GATE (#68, 2026-06-26). Player2 is a client/gateway to a HOSTED model (NOT local — a 120B
+        # can't run on the user's GPU), so a hosted backend serves parallel requests natively. We previously
+        # serialized ALL chat with a single Lock(); that throttled news/narrator/reactions/chat to one-at-a-time.
+        # Now a BOUNDED semaphore (cap configurable, default 2): the per-request threads (server spawns one per
+        # /v1/request) can hit Player2 up to `chat_concurrency` at once. Bounded, not unlimited — Player2's API
+        # may have a max-concurrent/rate ceiling; validate live and tune (revert to 1 if it 429s/destabilises).
+        self._chat_concurrency = max(1, int(chat_concurrency))
+        self._chat_lock = threading.BoundedSemaphore(self._chat_concurrency)
         # NPC API state: a cache of spawned NPCs keyed by persona, plus a resolved
         # default voice id. The NPC API (/v1/npc/...) is the supported path for game
         # characters and, unlike raw /v1/chat/completions, returns clean message +
