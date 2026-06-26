@@ -1349,6 +1349,51 @@ class NeuralRouter:
         passed = sum(1 for c in checks if c["pass"])
         return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
 
+    # Event ledger (#62): ingest observed hostile events + derive event-grounded conflicts.
+    def hostile_events_ingest(self, payload: dict[str, Any]) -> dict[str, Any]:
+        save_id = str(payload.get("save_id") or "unindexed")
+        events = payload.get("events") or []
+        n = 0
+        for e in events:
+            if isinstance(e, dict):
+                try:
+                    self.memory.add_hostile_event(save_id, e)
+                    n += 1
+                except Exception:
+                    pass
+        return {"ok": True, "ingested": n, "conflicts": self.memory.derive_conflicts_from_events(save_id)}
+
+    def hostile_ledger_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic: synthetic REAL hostile events -> conflicts grounded in location/loss/intensity/cause,
+        NOT relation thresholds. Fresh per-run save_id so no accumulation."""
+        import time as _t
+        s = "__hostile_ledger_selftest__" + str(int(_t.time() * 1000))
+        now = _t.time()
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            for e in [
+                {"attacker_faction": "argon", "victim_faction": "teladi", "sector": "Grand Exchange", "event_kind": "ship_destroyed", "magnitude": 15, "ts": now - 100},
+                {"attacker_faction": "argon", "victim_faction": "teladi", "sector": "Grand Exchange", "event_kind": "ship_destroyed", "magnitude": 15, "ts": now - 50},
+                {"attacker_faction": "argon", "victim_faction": "teladi", "sector": "Hatikvah", "event_kind": "cargo_lost", "magnitude": 5, "ts": now - 10},
+                {"attacker_faction": "khaak", "victim_faction": "argon", "sector": "Tharka", "event_kind": "ship_attacked", "magnitude": 5, "ts": now - 5},
+            ]:
+                self.memory.add_hostile_event(s, e)
+            confs = self.memory.derive_conflicts_from_events(s)
+            at = next((c for c in confs if {c["faction_a"], c["faction_b"]} == {"argon", "teladi"}), None)
+            ak = next((c for c in confs if {c["faction_a"], c["faction_b"]} == {"argon", "khaak"}), None)
+            ok("conflict_derived_from_events", at is not None and ak is not None)
+            ok("intensity_rolling_not_flat", at and ak and 0 < at["intensity"] < 1.0 and at["intensity"] != ak["intensity"], {"at": at and at["intensity"], "ak": ak and ak["intensity"]})
+            ok("intensity_scales_with_real_magnitude", at and ak and at["intensity"] > ak["intensity"], {"at": at and at["intensity"], "ak": ak and ak["intensity"]})
+            ok("conflict_is_LOCATED", at and "Grand Exchange" in at["sectors"] and "Hatikvah" in at["sectors"], at and at["sectors"])
+            ok("losses_attributed_to_victim", at and at["losses"].get("teladi", 0) == 35.0, at and at["losses"])
+            ok("cause_is_first_event_not_relations", at and "struck" in at["cause"].lower() and "Grand Exchange" in at["cause"] and "relations at war" not in at["cause"], at and at["cause"])
+            ok("no_event_no_conflict", not any({c["faction_a"], c["faction_b"]} == {"split", "boron"} for c in confs))
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
+
     def warphase_actuate_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """ANTI-CHEAT proof (Codex/Ken): war-phase DECISIONS emit real ORDERS/RELATIONS but fabricate NO DB
         consequences — no loss, no economy, no intensity written at decision time. Consequences come only from

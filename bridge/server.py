@@ -428,6 +428,8 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
             "/v1/order/prove": self.router.order_prove,
             "/v1/economy/stations": self.router.economy_stations_ingest,
             "/v1/economy/rollup_selftest": self.router.economy_rollup_selftest,
+            "/v1/hostile_events": self.router.hostile_events_ingest,
+            "/v1/hostile_ledger_selftest": self.router.hostile_ledger_selftest,
             "/v1/wares_harvest": self.router.wares_harvest,
             "/v1/ensure_canon": self.router.ensure_canon,
         }

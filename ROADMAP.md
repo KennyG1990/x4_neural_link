@@ -8,8 +8,12 @@ mood, emergent on the heartbeat) · **MEMORY ENGINE substrate ✅** (the game's 
 classified world-event memories [SPEC 1c-B] + each faction's named representative/'rememberer' [SPEC 1c-C] +
 clean name-keyed sectors [SPEC 0b]) · **ACTUATION ✅** (autonomous decisions flip REAL X4 relations [1d-W2]) ·
 **PLAYER-FACING VOICE ✅ verified in-game** (factions transmit prominent grounded communiqués to the player —
-[SPEC 1j], blueprint §5.6) · **Phase:** widen the action vocabulary (embargoes that choke trade, tribute,
-contracts) + drive the natural comms triggers autonomously + balance/tuning. · **Updated:** 2026-06-26
+[SPEC 1j], blueprint §5.6) · **REAL MILITARY ORDERS ✅ in-game** (war phases order a faction's OWN ships to
+patrol/raid — no spawning; #49–#53) · **ANTI-CHEAT ✅ ~95%** (words≠resources: no decision-triggered ware/money/
+loss writes; `warphase_actuate_selftest` 10/10) · **EVENT-GROUNDED CONFLICT LEDGER ✅ keystone bridge** (#62:
+`hostile_events`→derived located conflicts; 7/7) · **Phase:** feed the conflict ledger from REAL in-game combat
+(#66) → raids prove themselves (#67); live economy read (#54-56); diplomacy validators (#57-58); player contracts
+(#59-60). · **Updated:** 2026-06-26
 
 This session (2026-06-25): war-losses (fleet-delta), Tier-3 deriver, contested-sector reader (territorial +
 piracy), SPEC 0b (sector dedup), SPEC 1c-B (logbook→memory), SPEC 1c-C (faction reps). All verified in-game;
@@ -44,6 +48,34 @@ sectors fix were also confirmed IN-GAME (logbook/debuglog). SPEC 1l + 2a are bri
 / logbook surface uses unchanged, previously-proven plumbing, but the on-screen render wasn't re-driven this
 session (low risk, not zero). **NEXT SESSION START HERE → SPEC 2b (Narrator), then 2c (NPC↔NPC relationships) —
 both fully scoped under "★★★ SPEC 2" below.**
+
+### ✅ SESSION 2026-06-26 (CONTINUED) — what else shipped (detail in the dated sections below)
+Continuing from item 7, in order (all bridge-verified; in-game-proven items noted):
+8. **SPEC 2b — Narrator layer** ✅ (world-history articles, cause-gated, evidence-led, spam-guarded).
+9. **SPEC 3 — event priority hierarchy** ✅ (gates+tiers, 9/9; suppresses no-op spam — verified live) + **3.2
+   war-state phases** ✅ (dead escalate → varied war moves).
+10. **SPEC 1k-fix — local assignment facts > refusal guard** ✅ (Codex "Vigilant" bug: NPC's own ship/sector are
+    hard local facts the RoleRAG guard can't reject; verified live).
+11. **KEYSTONE delivery fix** ✅ in-game — influence_step was too slow (LLM) for the mod's HTTP timeout, so
+    news/articles/actions never arrived. Decoupled generation (background daemon) from delivery (fast
+    `GET /v1/influence_drain`). This unblocked ALL surfacing.
+12. **IMMERSION** ✅ — `_humanize_math` (convert war-scores/intensity %s → English in player text, pooled variety)
+    + `_qualify_prose` (deny the news-desk LLM raw numbers in its grounding so it phrases in its own voice).
+13. **SPEC 3.3 order primitive (#49–#53)** ✅ PROVEN IN-GAME — real ship orders over OWNED ships (no spawning):
+    DeadAir `find_ship_by_true_owner` + `create_order`; mobilize_fleet → real patrol order, raid_supply_line →
+    real Attack order (debuglog: `[AIINF] order patrol/raid … ship=<real ship>`).
+14. **Economy read pipeline foundation (#46)** ✅ (raw `economy_stations` + rollup → faction shortages; 5/5).
+15. **ANTI-CHEAT arc (#44/#64) — Ken's "words≠resources"** ✅ verified — removed ALL decision-triggered ware/
+    money writes (no `type:economy` emitters bridge-wide) AND the DB-causality fabrication (`record_loss`/
+    `_econ_delta`/intensity off a decision); war phases now emit ONLY real orders+relations; `warphase_actuate_
+    selftest` 10/10; guarded the dormant MD economy branch (`$act.$earned=='true'`). Anti-cheat ~95% closed.
+16. **EVENT-GROUNDED CONFLICT LEDGER keystone (#62)** ✅ 7/7 — `hostile_events` table + `derive_conflicts_from_
+    events` (intensity rolling from real magnitude, cause=first real event, located sectors, attributed losses) —
+    replaces relation-derived "intensity 100 / relations at war".
+**Open task map (granular, closeable):** keystone chain #62✅→#66 (in-game hostile-event capture)→#67 (order_id
+linkage; raid proves itself); economy read #54-56; diplomacy validators #57-58; player contracts #59-60 + earned
+economy #63; anti-cheat #65 (ForceWar gating); Forge-ship faithfulness #61. **NEXT: #66** (in-game combat-event
+capture feeds the #62 ledger with truth).
 
 ### ◐ 2026-06-26 — `aic_uix.lua` SyncSectors cdata bug (surfaced by the Forge watcher) — fix deployed, in-game verify pending
 The corrected Forge debug-log watcher (now error-driven + mod-marker aware) immediately earned its keep: it
@@ -580,6 +612,21 @@ resources; demand_reparations/raid/privateer = unearned skim). Removed all of th
   never reactivate it. Forge schema-valid.
 - **◐ remaining anti-cheat:** #65 — gate/remove the chat-driven `ForceWar_handler` (words→relation mutation)
   behind the diplomacy validators (#58).
+
+### ✅ EVENT-GROUNDED CONFLICT LEDGER #1 (keystone, task #62) — bridge built + 7/7 (2026-06-26)
+Codex/Ken keystone: stop treating relation hostility as proof of combat; derive everything from REAL located
+hostile actions. Bridge built (headless, deterministic):
+- **`hostile_events` table** (attacker, victim, sector, object_id/name, event_kind, magnitude, source, ts,
+  linked_order_id) — the source of truth for who-hit-whom-WHERE. `add_hostile_event` / `list_hostile_events`.
+- **`derive_conflicts_from_events`** — the keystone derivation: conflicts grouped by faction-pair from recent
+  events, with **intensity = rolling score from real magnitude** (not flat 1.0), **cause = the first triggering
+  event** (not "relations at war"), **sectors** + **per-victim located losses** straight from the events.
+- **Endpoint** `POST /v1/hostile_events` (ingest + return derived conflicts), `POST /v1/hostile_ledger_selftest`.
+- **VERIFIED 7/7:** intensity rolling + scales with magnitude (0.875 vs 0.125), located (Grand Exchange/Hatikvah),
+  losses attributed (teladi 35), cause = real event not "relations at war", no events → no conflict.
+- **NEXT:** #66 in-game capture (MD/Lua detect real combat → POST hostile_events) — the real source; then #67 link
+  order_id → events so a raid PROVES ITSELF (the #53 consequence). Live integration (dashboard/news/deriver read
+  event-grounded conflicts, retire relation-derived `add_conflict(...'relations at war')`) follows #66's real feed.
 
 ### ▶ ECONOMY UPDATE READ PIPELINE — foundation built (Ken's "Economy Update" spec + DeadAir Eco, 2026-06-26)
 Turns the AI from "roleplay over remembered events" into "roleplay over the actual X4 economy" (spec's words).

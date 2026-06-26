@@ -395,6 +395,26 @@ class MemoryStore:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_losses_faction ON war_losses(save_id, faction_id, ts)")
+            # ---- Event-grounded conflict ledger (#62, Ken/Codex): REAL hostile actions at LOCATIONS ----------
+            # The source of truth for who-hit-whom-where. conflicts/war_losses/intensity/cause are DERIVED from
+            # these — never from relation thresholds or decisions. Captured only from observed in-game events.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS hostile_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    save_id TEXT NOT NULL,
+                    attacker_faction TEXT,
+                    victim_faction TEXT,
+                    sector TEXT,
+                    object_id TEXT,                     -- the destroyed/attacked object
+                    object_name TEXT,
+                    event_kind TEXT,                    -- ship_destroyed|ship_attacked|station_damaged|cargo_lost
+                    magnitude REAL DEFAULT 1,           -- scale (ship size/value, or 1/ship)
+                    source TEXT DEFAULT 'game',         -- game|census|prove
+                    linked_order_id TEXT,               -- the order that caused it, if any (#67)
+                    ts REAL NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_hostile_save ON hostile_events(save_id, ts)")
             # ---- Durable world-events log (typed persistent history) -----------
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS world_events (
@@ -2609,6 +2629,68 @@ class MemoryStore:
             total = float(r["s"] or 0)
             out[r["faction_id"]] = {"loss_total": total, "events": r["c"],
                                     "recent_losses": self._clamp01(total / normalize_by) if normalize_by else 0.0}
+        return out
+
+    # --- Event-grounded conflict ledger (#62): real hostile actions -> derived conflicts/losses ----------
+    def add_hostile_event(self, save_id: str, ev: dict) -> None:
+        """Record ONE observed hostile action (no fabrication — callers pass real in-game events only)."""
+        with self._lock, self._connect() as conn:
+            conn.execute("""INSERT INTO hostile_events (save_id, attacker_faction, victim_faction, sector,
+                object_id, object_name, event_kind, magnitude, source, linked_order_id, ts)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (save_id, str(ev.get("attacker_faction") or ""), str(ev.get("victim_faction") or ""),
+                 str(ev.get("sector") or ""), str(ev.get("object_id") or ""), str(ev.get("object_name") or ""),
+                 str(ev.get("event_kind") or "ship_destroyed"), float(ev.get("magnitude") or 1),
+                 str(ev.get("source") or "game"), str(ev.get("linked_order_id") or ""),
+                 float(ev.get("ts") or time.time())))
+            conn.commit()
+
+    def list_hostile_events(self, save_id: str, window_s: Optional[float] = None, limit: int = 500) -> list[dict]:
+        q, params = "SELECT * FROM hostile_events WHERE save_id=?", [save_id]
+        if window_s:
+            q += " AND ts>=?"; params.append(time.time() - window_s)
+        q += " ORDER BY ts DESC LIMIT ?"; params.append(limit)
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(q, params).fetchall()]
+
+    def derive_conflicts_from_events(self, save_id: str, window_s: float = 3600.0, norm: float = 40.0) -> list[dict]:
+        """The keystone derivation: turn REAL hostile events into conflicts grounded in who-hit-whom-WHERE.
+        intensity = rolling score from recent event magnitude (NOT flat 1.0); cause = the FIRST triggering event
+        (NOT 'relations at war'); sectors + per-victim located losses come from the events themselves."""
+        def _nm(fid):
+            f = self.get_faction(save_id, fid) or self.get_faction(self.CANON_SAVE, fid)
+            return (f.get("name") if f else None) or fid
+        evs = self.list_hostile_events(save_id, window_s=window_s, limit=2000)
+        pairs: dict = {}
+        for e in evs:
+            a, v = e.get("attacker_faction"), e.get("victim_faction")
+            if not a or not v or a == v:
+                continue
+            key = tuple(sorted((a, v)))
+            agg = pairs.setdefault(key, {"faction_a": key[0], "faction_b": key[1], "events": 0, "magnitude": 0.0,
+                                         "sectors": set(), "losses": {}, "first": None, "last": None, "first_ev": None})
+            agg["events"] += 1
+            mag = float(e.get("magnitude") or 0)
+            agg["magnitude"] += mag
+            if e.get("sector"):
+                agg["sectors"].add(e["sector"])
+            agg["losses"][v] = agg["losses"].get(v, 0.0) + mag
+            ts = float(e.get("ts") or 0)
+            if agg["first"] is None or ts < agg["first"]:
+                agg["first"], agg["first_ev"] = ts, e
+            if agg["last"] is None or ts > agg["last"]:
+                agg["last"] = ts
+        out = []
+        for agg in pairs.values():
+            fe = agg["first_ev"] or {}
+            sect = fe.get("sector") or ""
+            cause = f"{_nm(fe.get('attacker_faction'))} struck {_nm(fe.get('victim_faction'))}" + (f" in {sect}" if sect else "")
+            out.append({"faction_a": agg["faction_a"], "faction_b": agg["faction_b"],
+                        "intensity": round(self._clamp01(agg["magnitude"] / norm), 3),
+                        "events": agg["events"], "sectors": sorted(agg["sectors"]),
+                        "losses": {k: round(v, 1) for k, v in agg["losses"].items()},
+                        "cause": cause, "first_at": agg["first"], "last_at": agg["last"], "source": "events"})
+        out.sort(key=lambda c: -c["intensity"])
         return out
 
     # --- Durable world-events log ---------------------------------------------
