@@ -1278,42 +1278,19 @@ class NeuralRouter:
         dashboard/verification, or None for a phase with no state effect (e.g. war_exhaustion_warning — a signal)."""
         eff: dict[str, Any] = {}
         try:
+            # ANTI-CHEAT (Codex/Ken, 2026-06-26): war-phase DECISIONS fabricate NO DB consequences — no losses, no
+            # economy, no intensity. The DB must never "believe" damage happened before real combat. All
+            # consequences come ONLY from REAL events: the fleet census (war_losses from actual ship deltas) and
+            # the event-grounded conflict ledger (#62). Phases emit real ORDERS / RELATIONS (+ news); the rest are
+            # intent-only (news) until earned via orders/contracts (#62/#63).
             if phase == "raid_supply_line" and target:
-                self.memory.record_loss(save_id, target, self.RAID_LOSS, kind="raid")
-                self._econ_delta(save_id, target, self.ECON_REPARATIONS)
-                # ANTI-CHEAT (Ken): words≠resources. The raid is a REAL Attack ORDER — the faction's own ships
-                # attack the target; the economic damage is EARNED from the actual fight (vanilla combat destroys
-                # cargo), NOT a scripted ware skim. No magic remove_wares.
-                eff = {"war_losses": {target: self.RAID_LOSS}, "production_health": {target: self.ECON_REPARATIONS},
-                       "dispatch": {"type": "order", "faction": fid, "target": target, "kind": "raid"}}
-            elif phase == "offer_privateer_contract" and target:
-                self.memory.record_loss(save_id, target, self.PRIVATEER_LOSS, kind="privateer")
-                # anti-cheat: no magic ware skim — privateering becomes a real raid order / player contract later.
-                eff = {"war_losses": {target: self.PRIVATEER_LOSS}}
+                eff = {"dispatch": {"type": "order", "faction": fid, "target": target, "kind": "raid"}}
             elif phase == "mobilize_fleet" and target:
-                ni = self._conflict_intensity_delta(save_id, fid, target, self.INTENSITY_STEP)
-                # SPEC 3.3-B mil (Codex #4): mobilize is now a REAL order — patrol the faction's OWN existing
-                # ships toward the front — not the old relation proxy. (Intensity substrate bump stays.)
-                eff = {"conflict_intensity": {f"{fid}|{target}": ni},
-                       "dispatch": {"type": "order", "faction": fid, "target": target, "kind": "patrol"}}
+                eff = {"dispatch": {"type": "order", "faction": fid, "target": target, "kind": "patrol"}}
             elif phase == "seek_ceasefire" and target:
-                ni = self._conflict_intensity_delta(save_id, fid, target, self.CEASEFIRE_COOL)
-                eff = {"conflict_intensity": {f"{fid}|{target}": ni},
-                       "dispatch": {"type": "adjust_relation", "faction": fid, "target": target, "relation": self.REL_CEASEFIRE}}
-            elif phase == "request_supplies":
-                self._econ_delta(save_id, fid, self.ECON_SUPPLY_GAIN)
-                # anti-cheat (Ken): no magic free supplies — a request becomes a player CONTRACT (#60), earned by
-                # real delivery. Intent-only here (substrate + news).
-                eff = {"production_health": {fid: self.ECON_SUPPLY_GAIN}}
-            elif phase == "demand_reparations" and target:
-                self._econ_delta(save_id, target, self.ECON_REPARATIONS)
-                # anti-cheat: a demand is words — no transfer unless the target actually pays (agreement/contract).
-                eff = {"production_health": {target: self.ECON_REPARATIONS}}
-            elif phase == "fortify_sector":
-                self._econ_delta(save_id, fid, self.ECON_FORTIFY_COST)
-                # anti-cheat: no magic stockpile — fortifying becomes a defensive patrol order later.
-                eff = {"production_health": {fid: self.ECON_FORTIFY_COST}}
-            # war_exhaustion_warning: a signal, not a state change — no substrate write (honest).
+                eff = {"dispatch": {"type": "adjust_relation", "faction": fid, "target": target, "relation": self.REL_CEASEFIRE}}
+            # offer_privateer_contract / request_supplies / demand_reparations / fortify_sector /
+            # war_exhaustion_warning: intent-only (news) — real versions are earned orders/economy/contracts.
         except Exception:
             return None
         if not eff:
@@ -1373,42 +1350,38 @@ class NeuralRouter:
         return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
 
     def warphase_actuate_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Deterministic proof (no LLM): on a scratch save, seed a conflict + economy, run each phase actuator,
-        and assert the substrate moved as designed + the deriver reflects it."""
+        """ANTI-CHEAT proof (Codex/Ken): war-phase DECISIONS emit real ORDERS/RELATIONS but fabricate NO DB
+        consequences — no loss, no economy, no intensity written at decision time. Consequences come only from
+        real events (census + the #62 event ledger)."""
         s = "__warphase_selftest__"
         a, b = "argon", "khaak"
         checks: list[dict] = []
         ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
         try:
-            self.memory.add_conflict(s, a, b, status="active", intensity=0.5, cause="selftest")
-            self.memory.upsert_economy(s, b, production_health=1.0)
-            self.memory.upsert_economy(s, a, production_health=0.5)
+            loss0 = (self.memory.get_loss_summary(s, b) or {}).get("loss_total", 0)
+            econ0 = (self.memory.get_economy(s, b) or {}).get("production_health", 1.0)
+            conf0 = len([cf for cf in self.memory.list_conflicts(s, "active") if {a, b} == {cf["faction_a"], cf["faction_b"]}])
 
-            l0 = (self.memory.get_loss_summary(s, b) or {}).get("loss_total", 0)
-            self._actuate_war_phase(s, a, b, "raid_supply_line")
-            l1 = (self.memory.get_loss_summary(s, b) or {}).get("loss_total", 0)
-            ok("raid_records_loss", l1 - l0 == self.RAID_LOSS, {"before": l0, "after": l1})
-            ok("raid_dents_target_econ", round((self.memory.get_economy(s, b) or {}).get("production_health", 1), 3) == round(1.0 + self.ECON_REPARATIONS, 3))
+            r = self._actuate_war_phase(s, a, b, "raid_supply_line")
+            ok("raid_emits_order", bool(r) and (r.get("dispatch") or {}).get("type") == "order" and (r.get("dispatch") or {}).get("kind") == "raid", r)
+            loss1 = (self.memory.get_loss_summary(s, b) or {}).get("loss_total", 0)
+            ok("raid_fabricates_NO_loss", loss1 == loss0, {"before": loss0, "after": loss1})
+            ok("raid_fabricates_NO_economy", (self.memory.get_economy(s, b) or {}).get("production_health", 1.0) == econ0)
 
-            i0 = next((float(c["intensity"]) for c in self.memory.list_conflicts(s, "active") if {a, b} == {c["faction_a"], c["faction_b"]}), None)
-            self._actuate_war_phase(s, a, b, "mobilize_fleet")
-            i1 = next((float(c["intensity"]) for c in self.memory.list_conflicts(s, "active") if {a, b} == {c["faction_a"], c["faction_b"]}), None)
-            ok("mobilize_raises_intensity", i1 is not None and i0 is not None and round(i1 - i0, 3) == self.INTENSITY_STEP, {"before": i0, "after": i1})
+            m = self._actuate_war_phase(s, a, b, "mobilize_fleet")
+            ok("mobilize_emits_patrol_order", bool(m) and (m.get("dispatch") or {}).get("kind") == "patrol", m)
 
-            self._actuate_war_phase(s, a, b, "seek_ceasefire")
-            i2 = next((float(c["intensity"]) for c in self.memory.list_conflicts(s, "active") if {a, b} == {c["faction_a"], c["faction_b"]}), None)
-            ok("ceasefire_cools_intensity", i2 is not None and round(i2 - i1, 3) == self.CEASEFIRE_COOL, {"before": i1, "after": i2})
+            c = self._actuate_war_phase(s, a, b, "seek_ceasefire")
+            ok("ceasefire_emits_relation", bool(c) and (c.get("dispatch") or {}).get("type") == "adjust_relation", c)
 
-            e0 = (self.memory.get_economy(s, a) or {}).get("production_health", 0)
-            self._actuate_war_phase(s, a, b, "request_supplies")
-            e1 = (self.memory.get_economy(s, a) or {}).get("production_health", 0)
-            ok("supplies_lift_own_econ", round(e1 - e0, 3) == self.ECON_SUPPLY_GAIN, {"before": e0, "after": e1})
+            ok("supplies_no_actuation", self._actuate_war_phase(s, a, b, "request_supplies") is None)
+            ok("reparations_no_actuation", self._actuate_war_phase(s, a, b, "demand_reparations") is None)
+            ok("privateer_no_actuation", self._actuate_war_phase(s, a, b, "offer_privateer_contract") is None)
+            ok("fortify_no_actuation", self._actuate_war_phase(s, a, b, "fortify_sector") is None)
 
-            ok("exhaustion_is_signal_only", self._actuate_war_phase(s, a, b, "war_exhaustion_warning") is None)
-
-            # deriver reflects the substrate: target now carries military pressure from the recorded losses
-            st = self.memory.derive_pressures(s, b)
-            ok("deriver_sees_target_losses", float(st.get("recent_losses", 0) or 0) > 0, {"recent_losses": st.get("recent_losses")})
+            # no NEW conflict conjured by a decision (no decision-time intensity/conflict write)
+            conf1 = len([cf for cf in self.memory.list_conflicts(s, "active") if {a, b} == {cf["faction_a"], cf["faction_b"]}])
+            ok("no_conflict_conjured", conf1 == conf0, {"before": conf0, "after": conf1})
         except Exception as e:
             ok("no_exception", False, str(e))
         passed = sum(1 for c in checks if c["pass"])
