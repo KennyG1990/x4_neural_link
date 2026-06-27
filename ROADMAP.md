@@ -13,7 +13,8 @@ patrol/raid — no spawning; #49–#53) · **ANTI-CHEAT ✅ ~95%** (words≠reso
 loss writes; `warphase_actuate_selftest` 10/10) · **EVENT-GROUNDED CONFLICT LEDGER ✅ keystone bridge** (#62:
 `hostile_events`→derived located conflicts; 7/7) · **Phase:** feed the conflict ledger from REAL in-game combat
 (#66) → raids prove themselves (#67); live economy read (#54-56); diplomacy validators (#57-58); player contracts
-(#59-60). · **Updated:** 2026-06-26
+(#59-60). · **NEXT (2026-06-27): audit remediation A1–A7** (see "★ AUDIT REMEDIATION" below — panels/reaper/
+roles/facts/docs/joules; spec'd, not started). · **Updated:** 2026-06-27
 
 This session (2026-06-25): war-losses (fleet-delta), Tier-3 deriver, contested-sector reader (territorial +
 piracy), SPEC 0b (sector dedup), SPEC 1c-B (logbook→memory), SPEC 1c-C (faction reps). All verified in-game;
@@ -76,6 +77,117 @@ Continuing from item 7, in order (all bridge-verified; in-game-proven items note
 linkage; raid proves itself); economy read #54-56; diplomacy validators #57-58; player contracts #59-60 + earned
 economy #63; anti-cheat #65 (ForceWar gating); Forge-ship faithfulness #61. **NEXT: #66** (in-game combat-event
 capture feeds the #62 ledger with truth).
+
+### ★ AUDIT REMEDIATION (2026-06-27) — scoped, NOT started (from `gap-audit-2026-06-27.md`)
+Gap audit (analysis-only) diffed built+surfaced vs Blueprint/Gameplay/Codex-advice-1&2. **Headline: the
+architecture matches the spec — RoleRAG scope-gate, PersonaCard authority, Narrator, priority gates, war-phase
+actions, earned-economy anti-cheat are all built + green (14/14 new-feature selftests pass).** The real gaps are
+**visibility + memory depth**, not foundations. Items below are spec'd; each closes with the workflow's named
+validation (Forge diag where relevant · `:8713` selftest/endpoint + dashboard render · in-game where applicable).
+
+- **A1 — Dashboard panels for the endpoint-only feature families [IG-1, HIGH, buildable-now].** player-role
+  (`/v1/player/role`), social graph + romance (`/v1/social/list`), rumors (`/v1/rumor/list`), faction budget
+  (`/v1/economy/budget_status`), memory-audit candidates (`/v1/memory/audit`), offers/contracts
+  (`/v1/offers/*`), war-phase actuation, gameplay-tick. (Persona already surfaced via `renderPersonaCard` — skip.)
+  All tracked via endpoints, ZERO panels → the dashboard (blueprint's proof surface) is blind to everything built
+  since the economy panel. **Validate:** each panel renders live rows (Chrome) against its `/api/*|/v1/*` source.
+- **A2 — Selftest-save reaper + `dry_run` for stateful selftests [IG-3, MED, cheap].** `__rumor_selftest__`,
+  `__social_brief_selftest__`, `cctest`, `octest` persist in the live DB and inflate counts (85 NPCs shown vs 23
+  in the real `game_301276512`). Unique save-ids stop collision but nothing reaps them. Add a reaper (prefix
+  `__…selftest__`) + `dry_run` so stateful selftests don't write live rows. **Validate:** `/api/memory/saves`
+  shows only real saves post-reap; selftests still green.
+- **A3 — Surface classified persona role + fix NPC↔entity binding on the dashboard NPC list [IG-4, MED].**
+  Roles render "—" and ids "(unbound)" though `persona.classify_archetype` exists and blueprint §13 has
+  `bound_entity_id`/`npc_id`. **Root cause GROUNDED (2026-06-27):** real embodied NPCs (e.g. Rina Bekker/marine,
+  Rylan Dehaan/service crew, save tag `/ chat`) are unbound NOT because the game lacks ids — the NPC component is
+  already delivered to Lua at conversation start (`aic_uix.lua` `AIChat.npc_skills` ~L596-606 does
+  `ConvertStringToLuaID(tostring(component))` to read skills) — but the component is **discarded**; the chat/memory
+  request keys the NPC by NAME (`npc_name`/`target_name`, L144/158), not the component id. (The two id concepts:
+  `bound_entity_id` = in-game component; `npc_id` = Player2 spawn handle, which is what the column currently
+  renders.) **Fix (3 steps):** (1) Lua — capture the component's stable 64-bit id at conversation start, include it
+  in suggest/index/chat payloads; (2) bridge — persist as `bound_entity_id`, key NPC memory by it (name = display
+  only), backfill unambiguous name-keyed rows; (3) dashboard — render the bound id. **Caveats:** person `idcode`
+  may be empty (use the component id); **MUST verify the id survives save/reload** before trusting it as the
+  persistent memory key; handle despawn/death via the existing `npc/delete` path (`router.py` ~L232). Leave the
+  synthetic `High Command`/`Galaxy News Desk` rows unbound BY DESIGN (abstract faction voices; ideally tag them
+  "abstract" so only real NPCs are expected to bind). **Enables:** A4 (facts stick to a real person), #39 (real
+  NPC↔NPC edges), M5 (targeted hail), M9 (succession). **Validate:** NPC sheet shows real roles + bound ids; the
+  same NPC is recognized across two separate conversations after a reload (Chrome + in-game).
+- **A4 — Fact-promotion tuning [IG-2, HIGH, bridge-now / full fix partly gated].** Active save = 1516 turns → 11
+  facts (~0.7%); G4 moved it off zero but the gap persists (Codex's central criticism). Tune `promote_durable_*`
+  thresholds + expose the memory-audit candidate view (pairs with A1). **Validate:** facts/turns ratio rises on
+  the live save; `memory_audit_selftest` green. **Gated piece:** richer promotion of in-game promises depends on
+  conversational capture (not this task).
+- **A5 — Bake "surface it" into the per-feature definition-of-done [PG-1, process].** Add to the bridge-feature
+  recipe (StarForge canon `bridge-feature-pattern.md` step 5): every new feature ships a dashboard panel OR is
+  logged ◐ "endpoint-only, deferred" with a reason. This is why IG-1 silently accumulated. **Validate:** canon
+  note updated; applied to A1.
+- **A6 — Reconcile contradictory build-method instructions [PG-3, cheap doc].** `F:\DEV_ENV\CLAUDE.md` reversed
+  the rule (2026-06-24, agent API allowed) but the Forge-side `X4-Foundations-Mod-Studio\CLAUDE.md` still says
+  "build the mod ONLY through the Forge UI." Two checked-in files contradict on the core method → misleads a fresh
+  agent. Pick one, mirror it. **Validate:** both files agree.
+- **A7 — Joule budget + kill switch [PG-4, MED, buildable-now].** Blueprint §19 + §1.5 require per-session joule
+  budgeting + a kill switch (save-safety + cost); not implemented, not previously on the roadmap. **Validate:**
+  budget enforced + a config kill switch halts LLM calls; selftest.
+- **Gated (sequence behind in-game capture / not for this pass):** rumor auto-origination + multi-hop [IG-7];
+  memorials / death & succession [IG-8, blueprint §5.9, needs capital-ship-death capture]; #67 (raid→located loss)
+  already tracked.
+
+**Priority order:** A1 (panels) → A2 (reaper) → A3 (roles/binding) → A4 (facts) → A6 (doc, trivial) →
+A5 (process) → A7 (joules). A2/A3/A6 are cheap; A1 is the highest visibility ROI.
+
+### ★ IMMERSION & INTERACTIVITY (2026-06-27) — scoped, NOT started (from `immersion-interactivity-proposal-2026-06-27.md`)
+Ideation pass diffed built scope vs Blueprint §5 + the Bannerlord technical-research doc. **Core insight: the
+backend is deep but the PLAYER can't see most of it** — today = chat UI + flat logbook + notifications; the docs
+envision a news feed, NPCs reaching out, voice, tone-consequences, a readable memory, succession. **Fastest gains
+are SURFACING existing backend, not new plumbing.** Effort: S=bridge-only · M=bridge+Forge MD/Lua+validate ·
+L=heavy in-game UI/gated. Each closes with named validation (`:8713` selftest/endpoint · in-game logbook/chat).
+
+**Tier 1 — best buildable-now wins:**
+- **M1 — In-game News Feed ("Galactic Affairs") [M, observed, doc A].** Render the narrator articles already
+  generated (#38: title·participants·body·consequence·quote) as a dedicated logbook bulletin stream instead of
+  one-liners. Biggest "alive" jump; SURFACES #38, not new logic. **Validate:** in-game logbook shows formatted
+  bulletins; debuglog clean.
+- **(= A1) Dashboard panels for the 9 endpoint-only families** — already scoped in AUDIT REMEDIATION (IG-1). Same
+  task; serves both the audit and immersion. Don't double-build.
+- **M2 — Tone → relation feedback [M, observed, doc D].** Expose the per-turn persona-reaction (#17) as a visible
+  standing delta ("Nerra's regard ↑ slightly") and nudge the relation within guard-rails (#21). The core
+  Bannerlord interaction hook — words have consequences. **Validate:** chat turn shows delta; relation moves
+  within bounds (dashboard + in-game notification).
+- **M3 — Per-NPC quirks + one-time backstory [S, observed, doc I].** Add a deterministic-seeded speech-quirk
+  layer + a once-generated, persisted backstory fact to the PersonaCard (#37) so a Teladi trader ≠ an Argon
+  marine. Hits the "every NPC has lore RP" bar. **Validate:** two NPCs of different archetype/faction produce
+  distinct voice; persona selftest green.
+- **M4 — Relationship-arc + ambient-rumor beats [S, inferred].** Emit a one-line beat when a social edge (#39)
+  crosses a narrative threshold (rivals→comrades, courting→partners) and occasionally surface a low-stakes rumor
+  (#76) as sector-tied ambient comms. Makes the social/rumor graphs FELT. Must ride the priority gates (#40) to
+  avoid spam. **Validate:** beats fire on real transitions, throttled; comms queue not flooded.
+
+**Tier 2 — plan-next (heavier or one confirmation away):**
+- **M5 — NPC-initiated → openable chat [M, observed, doc B].** Upgrade the comms queue (#27–#30) from
+  "text in logbook" to "a faction is hailing you" → opening it drops into a live chat with that NPC pre-seeded
+  with why. The world reaches OUT (blueprint §5.6/§5.7). **Confirm first:** chat UI can open targeting a specific
+  NPC. **Validate:** in-game hail → open → contextual chat.
+- **M6 — Player2 voice/TTS [M, observed-with-caveat, doc C].** Route NPC lines through Player2 TTS; play on
+  desktop audio + a TTS on/off toggle. **Honest caveat:** audio is desktop-companion, NOT in-engine X4 audio
+  (true in-world voice is L/gated). **Validate:** spoken line plays; toggle works.
+- **M7 — Memory Book [M, observed, doc E].** Readable per-NPC view of durable facts/promises/grudges/shared
+  history. Continuity becomes VISIBLE. **Soft dependency:** pairs with A4 (facts gap) — a thin book undersells;
+  do A4 first or together. Dashboard-first is S, in-game panel is M. **Validate:** book renders an NPC's real
+  facts (Chrome / in-game).
+
+**Tier 3 — gated (sequence behind in-game capture / UI work, NOT this pass):**
+- **M8 — Negotiation accept→real-effect [observed, doc H].** NPC offer → player-acceptable proposal → real
+  visible effect (relation/order/agreement). Rides the **#67** in-game-proof gate (bridge side ready: #59/#60/#73).
+- **M9 — Death & succession [observed, blueprint §5.9].** Capital-ship/leader death → obituary + successor →
+  world remembers. = audit IG-8; **gated** on in-game capital-ship-death capture (extends #62/#66).
+- **M10 — In-game "state of the galaxy" consult window [L, inferred].** Pull-up posture/wars/standing summary.
+  Data exists (dashboard); **gated** on a custom X4 UI surface (historically painful — logbook versions get ~80%
+  of payoff cheaper).
+
+**Priority order:** M1 (news feed) + A1 (panels) → M2 (tone) → M3 (quirks) → M4 (beats) → then M5/M6/M7. Most
+Tier-1 wins are EXPOSURE of existing backend (the point). The facts gap (A4/IG-2) is a soft dependency under
+anything "they remember" (esp. M7).
 
 ### ◐ 2026-06-26 — `aic_uix.lua` SyncSectors cdata bug (surfaced by the Forge watcher) — fix deployed, in-game verify pending
 The corrected Forge debug-log watcher (now error-driven + mod-marker aware) immediately earned its keep: it
