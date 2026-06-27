@@ -997,6 +997,45 @@ owned infrastructure already captured (#54): `capacity = station_count × PER_ST
     MUST call `validate_earned_transfer(commit=True)` BEFORE any `type:'economy' earned:'true'` dispatch — the
     `earned` marker is server-set by this validator, never LLM-settable (closes the #64 dormant-branch loop).
 
+#### ▶ G4 BACKFILL (✅ DONE 2026-06-26) — promote durable-fact candidates to facts
+The G4 audit surfaced under-promotion (live NPC: 25 candidates, 0 facts); this actually PROMOTES them.
+- **Built:** `memory.promote_durable_facts(npc_key)` — scans recent turns, promotes non-routine, not-yet-stored
+  ones to durable facts via `add_fact` (dedup, skip routine). Routed `POST /v1/memory/{promote_facts,
+  promote_selftest}`.
+- **Validate (CITED):** live `memory/promote_selftest` **5/5** (promotes refusal+oath, routine skipped, dedup on
+  re-run); live on real NPC → 11 facts promoted; `audit_selftest` 5/5 + `/api/memory/selftest` 15/15. Forge = N/A.
+- **SECOND-LAYER PASS caught a real latent bug (in G4's audit too):** the facts `verbatim` column is a 0/1 FLAG,
+  not text — `f.get("verbatim") or f.get("text")` returned `"1"` as the dedup key for core facts → broke dedup
+  (re-promote failed; only 7 of 11 promotions cleared candidates). Fixed BOTH `promote_durable_facts` and
+  `memory_audit_summary` to key on `text`; re-validated green. (Added to the bridge-feature-pattern canon gotchas.)
+
+#### ▶ RUMOR PROPAGATION (✅ DONE 2026-06-26) — events spread along the #39 social graph (design-doc §4)
+**RECONCILE:** greenfield (no rumor/gossip); builds on #39 edges (affection/trust/attraction = share; rivalry/
+fear = suppress) + world_events. Followed the new `bridge-feature-pattern` canon — fast.
+- **Built:** `rumors` table (PK save_id+npc_key+rumor_id dedups per NPC). `propagate_rumor(save_id, origin, text)`
+  spreads to the warmest top-`reach` ties, confidence from tie strength. `list_rumors`, `rumor_brief` ("Word
+  reaching you — … (unconfirmed)") wired into `build_situation_briefing`. Routed `POST /v1/rumor/{propagate,list,
+  selftest}`.
+- **Validate (CITED):** live `rumor/selftest` **5/5** (spreads to warm tie, NOT to hostile tie, recipient knows
+  it, brief surfaces it, dedup on re-spread); `social/briefing_selftest` **3/3** + `/api/memory/selftest` **15/15**
+  (the new briefing line didn't break anything). Forge = N/A.
+- **SECOND-LAYER PASS — ◐ follow-ons:** multi-hop spread w/ decay (currently single-hop); auto-originate rumors
+  from world_events + wire into the heartbeat (make it FIRE during play); rumors influencing faction decisions.
+
+#### ▶ HEARTBEAT WIRING (✅ DONE 2026-06-26) — the G-generators now FIRE during play
+The G-generators (G1 patrol, G5 agreements) were on-demand endpoints; nothing in the autonomous loop called them.
+- **RECONCILE:** `influence_step` is the heartbeat slice (daemon → influence_step → `_drain` → mod `influence_drain`);
+  offers already reach the player via the separate `player_comms` drain. So a throttled side-effect call is the
+  low-coupling fix (no news-list format risk). Player-role (G2) needs no periodic gen — it's read live in the briefing.
+- **Built:** `gameplay_generation_tick(save_id, dry_run)` — throttled per save (200s): `generate_agreements`
+  (G5, persist + announce via player_comms) + alternate one patrol/supply offer (G1/#60). Called (guarded) at the
+  end of `influence_step`. `dry_run` skips enqueue so the selftest never pollutes the live comms queue. Routed
+  `POST /v1/gameplay/{tick,tick_selftest}`.
+- **Validate (CITED):** live `gameplay/tick_selftest` **3/3** (ran / generated agreements / throttled on re-run);
+  dry-run on the real save → ran=true, 0 new agreements (the G5 ceasefires already exist → dedup proven). The
+  influence_step call is guarded (can't break the loop). Live enqueue uses the player_comms pattern already
+  validated by #60/G1. Forge = N/A.
+
 ### ▶ GAMEPLAY CHANGES DOC — reconciled build plan (Ken's uploaded doc, 2026-06-26)
 **RECONCILE (most of the doc is ALREADY built):** war-state phases ✅(#41/43/44), event priority hierarchy
 ✅(#40), local-assignment-facts ✅(#42), live economy→shortages ✅(#54-56), economy contracts ✅(#60),
@@ -1035,6 +1074,55 @@ table+CRUD ✅(exist, but unpopulated). **Genuinely MISSING (build order per the
     only. ◐ Follow-on (extends the #59 catalog, not G1's scope): escort-convoy / scan-activity / deploy-
     satellites/lasertowers / evacuate templates (bounty already ≈ "destroy raiders").
 
+#### ▶ SPEC G5 (✅ DONE 2026-06-26) — agreements generator (the missing middle between talk & war)
+**RECONCILE:** the `agreements` table + CRUD (`add_agreement`/`list_agreements`/`set_agreement_status`) exist but
+the lane was EMPTY — nothing generated agreements from game state. WIRE a generator.
+- **Built:** `memory.generate_agreements(save_id)` — proposes CEASEFIRES for active wars + TRADE pacts for an
+  exporter↔importer(shortage) pair, EXCLUDING engine-permanent hostiles (khaak/xenon don't negotiate), dedup'd
+  against existing, `status='proposed'` (a feeler feeding the existing accept/reject lifecycle). Routed
+  `POST /v1/agreements/{generate,generate_selftest}`.
+- **Validate (CITED):** live `agreements/generate_selftest` **4/4** (ceasefire-for-war, trade-for-exporter/
+  importer, excluded-never-negotiate, dedup-on-rerun); live `/v1/agreements/generate` → **3 real ceasefire
+  proposals** from active wars (antigone↔teladi, antigone↔ministry, argon↔ministry). The hollow lane is now
+  populated. Forge = N/A.
+- **SECOND-LAYER PASS — ◐ follow-on:** the remaining doc types (non-aggression pact / transit rights / patrol
+  cooperation / player-brokered supply) extend the same generator.
+- **EXTENSION (✅ DONE 2026-06-26):** added `patrol_cooperation` (two non-excluded factions sharing a COMMON
+  enemy in active conflicts) + `non_aggression` (neutral non-excluded pairs, not at war/allied). Live
+  `agreements/generate_selftest` **6/6**; live generate on the real save produced `patrol_cooperation` proposals
+  (factions jointly fighting khaak/xenon). Remaining ◐: transit_rights, player-brokered supply (ties to G1/#60).
+
+#### ▶ SPEC G4 (✅ DONE 2026-06-26) — memory-AUDIT summary mode + stronger fact promotion
+**RECONCILE:** the fact pipeline exists (`classify_text`→`category_tier`→`heuristic_summarizer`, tiers core/
+significant/routine) — the doc's "860 turns, 4 facts" is UNDER-promotion. The categorizer was rich (oath/deal/
+insult/threat/betrayal) but **"refusal" (the doc's named "refuses aid") was missing**, and there was no audit
+mode distinct from the in-character recap.
+- **Built:** added a `refusal` category (regex placed EARLY so it beats deal/oath/economy) → SIGNIFICANT tier, so
+  refusals now promote. `memory_audit_summary(npc_key)` — a literal integrity view: durable facts stored PLUS
+  durable-fact CANDIDATES (recent non-routine turns not yet promoted), the "memory audit" mode vs the roleplay
+  recap. Routed `POST /v1/memory/{audit,audit_selftest}`.
+- **Validate (CITED):** live `memory/audit_selftest` **5/5** (refusal + promise promoted as candidates, smalltalk
+  excluded); existing `/api/memory/selftest` still **15/15** (refusal category didn't break condensation); LIVE
+  audit on real NPC "Finance High Command" → **0 durable facts, 19 promotion candidates** (exactly the doc's gap,
+  now surfaced). Fixed a JSON-serialization bug en route (a `set` in a check detail → `sorted(...)`). Forge = N/A.
+- **SECOND-LAYER PASS — ◐ follow-ons:** contradiction detection (NPC affirms X then denies X — needs assertion
+  tracking); backfill auto-promotion of the historical candidates the audit surfaces.
+
+#### ▶ SPEC G3 (✅ DONE 2026-06-26) — Kha'ak/Xenon differentiated behavior families
+**RECONCILE:** `scoring.generate_candidates` produced a UNIFORM option set (khaak/xenon got the same diplomacy/
+ceasefire/resource_request as normal factions). **Key design:** their aggression must be OPERATIONAL ("military"
+class = orders), not "hostility" relation moves — else it'd hit the #65 eligibility gate (which excludes them).
+- **Built:** `behavior_kind(fid)` (khaak→hive, xenon→machine, else normal); new actions `KHAAK_RAID`/
+  `XENON_INCURSION` (ACTION_CLASS "military"); `generate_candidates` branches — hive/machine emit ONLY their
+  operational family (raid/incursion on existing presence) + the dialogue baseline, NO diplomacy; normal factions
+  untouched. Scoring selftest +7.
+- **Validate (CITED):** live `/api/strategic/selftest` **29/29** — behavior_kind correct, khaak/xenon emit
+  raids/incursions not ceasefire/resource_request, khaak_raid is "military" class, normal faction provably
+  unchanged; nothing else broke. Forge = N/A.
+- **SECOND-LAYER PASS — ◐ follow-ons:** (a) MOD-SIDE execution of `khaak_raid`/`xenon_incursion` → real Attack
+  orders (#53 pattern) deferred (not touching the mod while Codex works the Forge); (b) news-verb prose for the
+  two new actions (minor polish).
+
 #### ▶ SPEC G2 (PLAN 2026-06-26) — player role classification (factions react to WHO the player is)
 **RECONCILE:** no `classify_player` exists (greenfield); all signals stored — `relationships` (faction→player
 trust/resentment/standing), `economy.dependency_on_player`, `player_market.supplying_enemies`, `agreements`
@@ -1055,6 +1143,17 @@ trust/resentment/standing), `economy.dependency_on_player`, `player_market.suppl
   - **SECOND-LAYER PASS caught + fixed a real bug:** the first live run listed khaak/xenon as "threats," inflating
     the role — but being at war with them is UNIVERSAL, not a player choice. Excluded the engine-permanent/non-
     combatant set (mirrors `diplomacy.EXCLUDED_FROM_WAR`); re-validated (threats now `[alliance, argon]`, 5/5).
+
+#### ▶ #39 SURFACING (✅ DONE 2026-06-26) — wire NPC social ties into the live situation briefing
+The #39 graph existed but wasn't in the prompt (Codex: "the gap is whether each prompt gets the right grounding").
+- **Built:** `build_situation_briefing` now appends `social_summary(save_id, npc_key)` (guarded) — an NPC speaks
+  aware of their closest personal ties.
+- **Validate (CITED):** live `social/briefing_selftest` **3/3** (no-ties→no-line; after a seeded
+  served_together event the briefing reads "Personal ties: crewmates with Quint Caren"); existing
+  `/api/memory/selftest` still **15/15** (additive change didn't break the briefing). Forge = N/A.
+- **SECOND-LAYER PASS — ◐ follow-on:** the per-EDGE brief (`social_edge_brief`, inject only the relevant tie when
+  NPC A references NPC B in a turn — Codex's targeted example) needs turn-content NPC detection; the always-on
+  top-ties summary is the robust core, shipped now.
 
 ### ▶ SPEC 2c / #39 — NPC↔NPC social relationship graph (✅ DONE bridge foundation, 2026-06-26)
 **Intent (Ken's uploaded docs — "Bannerlord Feature Translation §3" + "Codex_Feedback2 §relationships"):** a

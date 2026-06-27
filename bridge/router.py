@@ -986,8 +986,75 @@ class NeuralRouter:
                         _a[_k] = self._humanize_math(str(_a[_k]))
         except Exception:
             articles = []
+        # Wire the G-generators into the heartbeat (throttled, side-effect only — agreements + offers reach the
+        # player via player_comms / the dashboard, not this news list).
+        try:
+            self.gameplay_generation_tick(save_id)
+        except Exception:
+            pass
         return {"ok": True, "news": news, "actions": actions, "articles": articles,
                 "phase_effects": phase_effects, "reviewed": reviewed, "save_id": save_id}
+
+    GAMEPLAY_GEN_COOLDOWN_S = 200.0  # throttle so agreements/offers don't spam the player during play
+
+    def gameplay_generation_tick(self, save_id: str, dry_run: bool = False) -> dict[str, Any]:
+        """Wire the G-generators into the heartbeat so they FIRE during play (not just on-demand). Throttled per
+        save. Surfaces via the proven player_comms channel (no coupling to the influence-step news list):
+        proposes agreements (G5) + one patrol/supply offer (G1/#60). dry_run skips enqueue (for the selftest)."""
+        import time as _t
+        if not hasattr(self, "_gameplay_gen_last"):
+            self._gameplay_gen_last = {}
+        now = _t.time()
+        if now - self._gameplay_gen_last.get(save_id, 0) < self.GAMEPLAY_GEN_COOLDOWN_S:
+            return {"ran": False}
+        self._gameplay_gen_last[save_id] = now
+        out: dict[str, Any] = {"ran": True, "agreements": 0, "offer": None}
+        try:
+            ag = self.memory.generate_agreements(save_id, max_new=2)
+            ags = ag.get("agreements") or []
+            out["agreements"] = len(ags)
+            if not dry_run:
+                for a in ags:
+                    fa = self._fac_name(save_id, a.get("party_a"))
+                    fb = self._fac_name(save_id, a.get("party_b"))
+                    verb = {"ceasefire": "has put out a ceasefire feeler to",
+                            "trade": "is proposing a trade pact with"}.get(a.get("type"), "is opening talks with")
+                    self.player_comms.append({"title": f"{fa.upper()} DIPLOMATIC OVERTURE", "body": f"{fa} {verb} {fb}.",
+                                              "faction": a.get("party_a"), "faction_name": fa, "category": "diplomacy",
+                                              "kind": "agreement", "save_id": save_id, "ts": now})
+        except Exception:
+            pass
+        if not dry_run:
+            try:
+                alt = int(now) % 2 == 0
+                r = (self.sector_patrol_offer if alt else self.economy_supply_offer)({"save_id": save_id})
+                out["offer"] = ("patrol" if alt else "supply") if r.get("ok") else None
+            except Exception:
+                pass
+            while len(self.player_comms) > 200:
+                self.player_comms.popleft()
+        return out
+
+    def gameplay_tick(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True, **self.gameplay_generation_tick(str(payload.get("save_id") or "unindexed"),
+                                                             dry_run=bool(payload.get("dry_run")))}
+
+    def gameplay_tick_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        s = "__gameplay_tick_selftest__" + str(int(time.time() * 1000))
+        m = self.memory
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            m.add_conflict(s, "argon", "teladi", status="active", intensity=0.5, cause="t")
+            r1 = self.gameplay_generation_tick(s, dry_run=True)
+            ok("first_tick_ran", r1.get("ran") is True, r1)
+            ok("generated_agreements", r1.get("agreements", 0) >= 1, r1)
+            r2 = self.gameplay_generation_tick(s, dry_run=True)
+            ok("second_tick_throttled", r2.get("ran") is False, r2)
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
 
     def influence_prove(self, payload: dict[str, Any]) -> dict[str, Any]:
         """On-demand PROVING trigger: force a faction to decide RIGHT NOW (cooldown bypassed), apply it,
@@ -2185,6 +2252,102 @@ class NeuralRouter:
     def diplomacy_eligibility_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         return diplomacy_mod.run_selftest()
 
+    def agreements_generate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """G5: propose real agreement objects (ceasefire/trade) grounded in faction state — the missing middle."""
+        return self.memory.generate_agreements(str(payload.get("save_id") or "unindexed"))
+
+    def agreements_generate_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        m = self.memory
+        s = "__agreements_gen_selftest__" + str(int(time.time() * 1000))
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            m.add_conflict(s, "argon", "teladi", status="active", intensity=0.5, cause="test war")
+            m.upsert_economy(s, "split", market_status="exporter")
+            m.upsert_economy(s, "paranid", market_status="importer", shortages={"energycells": 0.8})
+            r = m.generate_agreements(s)
+            types = sorted({a.get("type") for a in r["agreements"]})
+            ok("ceasefire_for_active_war", "ceasefire" in types, types)
+            ok("trade_for_exporter_importer", "trade" in types, types)
+            m.add_conflict(s, "argon", "khaak", status="active", intensity=0.9, cause="khaak")
+            m.generate_agreements(s)
+            allag = m.list_agreements(s)
+            ok("excluded_never_negotiate", not any(
+                (a.get("party_a") in ("khaak", "xenon")) or (a.get("party_b") in ("khaak", "xenon")) for a in allag))
+            before = len([a for a in allag if a.get("type") == "ceasefire"])
+            m.generate_agreements(s)
+            after = len([a for a in m.list_agreements(s) if a.get("type") == "ceasefire"])
+            ok("dedup_no_duplicate_on_rerun", after == before, {"before": before, "after": after})
+            # extension: common-enemy patrol cooperation + neutral non-aggression
+            m.add_conflict(s, "argon", "xenon", status="active", intensity=0.7, cause="x")
+            m.add_conflict(s, "paranid", "xenon", status="active", intensity=0.7, cause="x")
+            m.generate_agreements(s)
+            alltypes = sorted({a.get("type") for a in m.list_agreements(s)})
+            ok("patrol_cooperation_for_common_enemy", "patrol_cooperation" in alltypes, alltypes)
+            ok("non_aggression_for_neutral_pair", "non_aggression" in alltypes, alltypes)
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
+
+    def memory_promote_facts(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """G4 backfill: promote an NPC's durable-fact candidates to durable facts."""
+        npc = str(payload.get("npc_key") or "")
+        if not npc:
+            return {"ok": False, "reason": "npc_key required"}
+        return {"ok": True, **self.memory.promote_durable_facts(npc)}
+
+    def memory_promote_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        m = self.memory
+        npc = "__promote_selftest__" + str(int(time.time() * 1000)) + "|g|Marine"
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            m.record_turn(npc, "assistant", "I refuse to give you any fuel.")
+            m.record_turn(npc, "assistant", "I promise to escort your convoy through Hatikvah.")
+            m.record_turn(npc, "assistant", "Nice weather on the docks today.")
+            r = m.promote_durable_facts(npc)
+            ok("promoted_durable_turns", r["promoted"] >= 2, r)
+            cats = sorted({f.get("category") for f in m.get_facts(npc)})
+            ok("refusal_now_a_fact", "refusal" in cats, cats)
+            ok("oath_now_a_fact", "oath" in cats, cats)
+            ok("routine_not_promoted", not any("weather" in str(f.get("text") or "").lower() for f in m.get_facts(npc)))
+            again = m.promote_durable_facts(npc)
+            ok("dedup_no_repromote", again["promoted"] == 0, again)
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
+
+    def memory_audit(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """G4: the MEMORY-AUDIT summary for an NPC (literal facts + promotion candidates), not the roleplay recap."""
+        npc = str(payload.get("npc_key") or "")
+        if not npc:
+            return {"ok": False, "reason": "npc_key required"}
+        return {"ok": True, **self.memory.memory_audit_summary(npc, int(payload.get("limit") or 40))}
+
+    def memory_audit_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        m = self.memory
+        npc = "__mem_audit_selftest__" + str(int(time.time() * 1000)) + "|game|TestMarine"
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            m.record_turn(npc, "user", "Will you supply fuel to my fleet?")
+            m.record_turn(npc, "assistant", "I refuse to give you any fuel.")
+            m.record_turn(npc, "assistant", "Nice weather on the docks today.")
+            m.record_turn(npc, "assistant", "I promise to escort your convoy through Hatikvah.")
+            audit = m.memory_audit_summary(npc)
+            cats = sorted({c["category"] for c in audit["promotion_candidates"]})
+            ok("audit_mode_flag", audit.get("mode") == "memory_audit")
+            ok("refusal_promoted_as_candidate", "refusal" in cats, cats)
+            ok("promise_promoted_as_candidate", "oath" in cats, cats)
+            ok("smalltalk_excluded", not any("weather" in c["text"].lower() for c in audit["promotion_candidates"]))
+            ok("has_multiple_candidates", audit["promotion_candidate_count"] >= 2)
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
+
     def player_role(self, payload: dict[str, Any]) -> dict[str, Any]:
         """G2: the player's classified role(s) from stored signals (factions react to who they are)."""
         return {"ok": True, **self.memory.classify_player_role(str(payload.get("save_id") or "unindexed"))}
@@ -2329,6 +2492,64 @@ class NeuralRouter:
             v_resp = self.memory.validate_earned_transfer(s, "argon", cap * 0.5)
             ok("cannot_respend_drained_budget", v_resp["earned"] is False and v_resp["remaining"] <= 0.01, v_resp)
             ok("no_capacity_no_spend", self.memory.validate_earned_transfer(s, "nobody", 1)["earned"] is False)
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
+
+    def rumor_propagate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Spread a rumor from an origin NPC along the social graph (warm ties hear it; rivals don't)."""
+        save_id = str(payload.get("save_id") or "unindexed")
+        return self.memory.propagate_rumor(save_id, str(payload.get("origin_npc") or ""),
+                                            str(payload.get("text") or ""), str(payload.get("category") or "rumor"))
+
+    def rumor_list(self, payload: dict[str, Any]) -> dict[str, Any]:
+        save_id = str(payload.get("save_id") or "unindexed")
+        npc = str(payload.get("npc_key") or "") or None
+        return {"ok": True, "rumors": self.memory.list_rumors(save_id, npc),
+                "brief": (self.memory.rumor_brief(save_id, npc) if npc else "")}
+
+    def rumor_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        m = self.memory
+        save = "__rumor_selftest__" + str(int(time.time() * 1000))
+        A, B, C = save + "|g|Origin", save + "|g|CloseFriend", save + "|g|Rival"
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            m.index_npcs(save, [{"npc_key": A, "name": "Origin", "faction_id": "argon"},
+                                {"npc_key": B, "name": "Close Friend", "faction_id": "argon"},
+                                {"npc_key": C, "name": "Rival", "faction_id": "argon"}], game_id="g")
+            m.apply_social_event(save, A, B, "saved_life", "pulled them from the wreck")   # warm tie
+            m.apply_social_event(save, A, C, "public_insult", "humiliated them on the bridge")  # hostile tie
+            r = m.propagate_rumor(save, A, "The Kha'ak are massing near Hatikvah")
+            recips = {x["npc_key"] for x in r["recipients"]}
+            ok("spread_to_warm_tie", B in recips, sorted(recips))
+            ok("not_to_hostile_tie", C not in recips, sorted(recips))
+            ok("recipient_knows_rumor", any("Kha'ak" in x.get("text", "") for x in m.list_rumors(save, B)))
+            ok("brief_surfaces_rumor", "Word reaching you" in m.rumor_brief(save, B))
+            before = len(m.list_rumors(save, B))
+            m.propagate_rumor(save, A, "The Kha'ak are massing near Hatikvah")
+            ok("dedup_no_duplicate", len(m.list_rumors(save, B)) == before, {"before": before, "after": len(m.list_rumors(save, B))})
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
+
+    def social_briefing_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """#39 surfacing: a seeded social tie appears in the NPC's situation briefing (so they speak aware of it)."""
+        m = self.memory
+        save = "__social_brief_selftest__" + str(int(time.time() * 1000))
+        nk_a, nk_b = save + "|g|Sela", save + "|g|Quint"
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            m.index_npcs(save, [{"npc_key": nk_a, "name": "Sela Tarren", "faction_id": "argon"},
+                                {"npc_key": nk_b, "name": "Quint Caren", "faction_id": "argon"}], game_id="g")
+            ok("no_ties_no_line", "Personal ties" not in m.build_situation_briefing(nk_a))
+            m.apply_social_event(save, nk_a, nk_b, "served_together", "the Kha'ak raid on the dock")
+            b1 = m.build_situation_briefing(nk_a)
+            ok("ties_surface_in_briefing", "Personal ties" in b1, b1[-160:])
+            ok("names_the_other_npc", "Quint Caren" in b1)
         except Exception as e:
             ok("no_exception", False, str(e))
         passed = sum(1 for c in checks if c["pass"])

@@ -57,13 +57,30 @@ RESOURCE_REQUEST = "resource_request"
 ESCALATE = "escalate_pressure"    # hostile pressure toward a resented faction
 CEASEFIRE = "ceasefire_feeler"    # sue for peace when bleeding
 
+# G3 (Gameplay Changes doc): Kha'ak/Xenon don't do diplomacy — they have distinct OPERATIONAL aggression
+# families. Classed "military" (real orders, like mobilize/patrol), NOT "hostility" — so they execute as orders
+# and never hit the #65 war-eligibility gate (which excludes khaak/xenon from RELATION moves).
+KHAAK_RAID = "khaak_raid"            # hive pressure / swarm / survival raiding
+XENON_INCURSION = "xenon_incursion"  # machine expansion / sector incursion / infrastructure threat
+
 ACTION_CLASS: dict[str, str] = {
     DIALOGUE: "dialogue",
     DEFENSIVE: "military",
     RESOURCE_REQUEST: "economic",
     ESCALATE: "hostility",
     CEASEFIRE: "peace",
+    KHAAK_RAID: "military",
+    XENON_INCURSION: "military",
 }
+
+# G3: which behavior family a faction draws from. khaak->hive, xenon->machine, everyone else->normal diplomacy.
+def behavior_kind(faction_id: str) -> str:
+    f = str(faction_id or "").strip().lower()
+    if f == "khaak":
+        return "hive"
+    if f == "xenon":
+        return "machine"
+    return "normal"
 
 # --- #AUTH: authority gating — who is ALLOWED to propose what -----------------
 # Minimum NPC authority tier required for each action class. "LLM proposes, system
@@ -177,6 +194,18 @@ def generate_candidates(
     gated by its pressures and relationships. The benign baseline is always present."""
     th = thresholds
     cands: list[tuple[str, str]] = [(DIALOGUE, "self")]
+
+    # G3: Kha'ak/Xenon draw from an OPERATIONAL aggression family, NOT diplomacy. They never sue for peace,
+    # request supplies, or do relation escalation — they raid/incurse on existing presence. (Targets are other
+    # factions/the player; the scorer + cooldowns still rank/throttle them.)
+    kind = behavior_kind(faction_id)
+    if kind in ("hive", "machine"):
+        op = KHAAK_RAID if kind == "hive" else XENON_INCURSION
+        for rel in relationships:
+            obj = str(rel.get("object") or "")
+            if obj and obj != faction_id:
+                cands.append((op, obj))
+        return cands
 
     mil = _clampf(state.get("military_pressure", 0.0), 0.0, 1.0)
     eco = _clampf(state.get("economic_pressure", 0.0), 0.0, 1.0)
@@ -423,6 +452,19 @@ def run_scoring_selftest() -> dict:
     check("stage3_ineligible_peace_with_xenon_rejected", (not ve_peace["ok"]) and ve_peace["status"] == "ineligible", str(ve_peace))
     ve_ok = validate_incident(ESCALATE, "split", "argon", legal_actions=legal_h, confidence=0.5)
     check("stage3_eligible_pair_passes", ve_ok["ok"], str(ve_ok))
+
+    # G3: Kha'ak/Xenon behavior families — distinct operational aggression, no diplomacy; normal factions untouched.
+    check("behavior_kind_khaak_hive", behavior_kind("khaak") == "hive")
+    check("behavior_kind_xenon_machine", behavior_kind("xenon") == "machine")
+    check("behavior_kind_argon_normal", behavior_kind("argon") == "normal")
+    _grels = [{"object": "argon", "resentment": 50, "standing": "hostile"}]
+    _kh = {a for a, _ in generate_candidates("khaak", {"military_pressure": 0.9}, _grels, DEFAULT_THRESHOLDS)}
+    check("khaak_raids_not_diplomacy", KHAAK_RAID in _kh and CEASEFIRE not in _kh and RESOURCE_REQUEST not in _kh, str(_kh))
+    check("khaak_raid_is_military_class", ACTION_CLASS.get(KHAAK_RAID) == "military")
+    _xe = {a for a, _ in generate_candidates("xenon", {"military_pressure": 0.9}, _grels, DEFAULT_THRESHOLDS)}
+    check("xenon_incursion_not_ceasefire", XENON_INCURSION in _xe and CEASEFIRE not in _xe, str(_xe))
+    _norm = {a for a, _ in generate_candidates("argon", {"economic_pressure": 0.9}, _grels, DEFAULT_THRESHOLDS)}
+    check("normal_faction_unchanged", KHAAK_RAID not in _norm and (RESOURCE_REQUEST in _norm or ESCALATE in _norm), str(_norm))
 
     ok = all(c["ok"] for c in checks)
     return {"ok": ok, "passed": sum(c["ok"] for c in checks), "total": len(checks), "checks": checks}

@@ -50,6 +50,7 @@ CORE_CATEGORIES = {
 }
 SIGNIFICANT_CATEGORIES = {
     "deal", "battle", "threat", "alliance", "gift", "insult", "rescue", "economy", "diplomacy",
+    "refusal",  # G4: a refusal (declined aid / rejected a contract) is durable — the doc's named gap
 }
 ROUTINE_CATEGORIES = {"smalltalk", "status", "greeting", "flavor", "query"}
 
@@ -78,6 +79,8 @@ _KEYWORD_CATEGORY: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\b(die[ds]?|died|death|killed|lost (?:the|his|her|their)|destroyed|perished|fell aboard|casualt)", re.I), "death"),
     (re.compile(r"\b(war|invasion|attack(?:ed|ing)?|offensive|frontline|hostilit|campaign)\b", re.I), "war"),
     (re.compile(r"\b(betray|broke (?:the|his|her|their|our) (?:promise|word|oath)|backstab|treacher)", re.I), "betrayal"),
+    # G4: refusal must beat 'deal'/'oath'/'economy' (a refusal often names the thing refused), so place it early.
+    (re.compile(r"\b(refus(?:e|ed|es|ing|al)|decline[ds]?|i\s+won'?t|we\s+won'?t|will\s+not|won'?t\s+(?:help|supply|give|aid)|deny|denied|no\s+(?:aid|deal|help))\b", re.I), "refusal"),
     (re.compile(r"\b(love|loyal(?:ty)?|devoted|cherish|bond|stood by|trust (?:you|us) deeply)", re.I), "love"),
     (re.compile(r"\b(promise|pledge|swear|oath|vow|i will|we will|agree to|contract|guarantee)", re.I), "oath"),
     (re.compile(r"\b(sector lost|station (?:destroyed|fell)|shipyard (?:gone|destroyed)|catastroph|disaster)", re.I), "catastrophe"),
@@ -374,6 +377,17 @@ class MemoryStore:
                     evidence_json TEXT DEFAULT '[]',           -- [{event, note, ts}] — WHY the relationship exists
                     last_updated REAL,
                     PRIMARY KEY (save_id, subject_npc, object_npc)
+                )
+            """)
+            # Rumor propagation (design-doc §4: events spread among NPCs). A rumor an NPC has HEARD (hearsay,
+            # not a durable fact) — spread along the social graph, weighted by tie strength. PK dedups per NPC.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS rumors (
+                    save_id TEXT, npc_key TEXT, rumor_id TEXT,
+                    text TEXT, category TEXT DEFAULT 'rumor',
+                    origin_npc TEXT, confidence REAL DEFAULT 0.5, hops INTEGER DEFAULT 1,
+                    ts REAL,
+                    PRIMARY KEY (save_id, npc_key, rumor_id)
                 )
             """)
             # ---- Territory / sectors -------------------------------------------
@@ -1400,6 +1414,20 @@ class MemoryStore:
                              f'(also known to you as: {", ".join(aliases)}).')
             else:
                 lines.append(f'You are speaking with the Commander, who goes by "{cur}".')
+        # #39: the NPC's personal social ties (who they know), so they speak aware of their relationships.
+        try:
+            _ties = self.social_summary(save_id, npc_key)
+            if _ties:
+                lines.append(_ties)
+        except Exception:
+            pass
+        # Rumor: what the NPC has HEARD through the grapevine (hearsay, unconfirmed) — so gossip surfaces in chat.
+        try:
+            _rum = self.rumor_brief(save_id, npc_key)
+            if _rum:
+                lines.append(_rum)
+        except Exception:
+            pass
         # SPEC 1e: the faction-level half is now shared with every faction-facing LLM call.
         fac_brief = self.build_faction_briefing(save_id, faction_id, max_events)
         if fac_brief:
@@ -2637,6 +2665,194 @@ class MemoryStore:
                 "friends": friends, "threats": threats, "per_faction": per_faction,
                 "high_dependency_factions": [f for f in high_dep if f], "supplies_enemies": bool(supplies_enemies),
                 "brokered_count": len(brokered)}
+
+    # --- G4 (Gameplay Changes doc): the MEMORY-AUDIT summary mode (distinct from the in-character recap) ---------
+    def memory_audit_summary(self, npc_key: str, limit: int = 40) -> dict:
+        """A literal memory-INTEGRITY view: the durable facts actually stored PLUS durable-fact CANDIDATES (recent
+        high-value turns — promise/deal/insult/threat/refusal — NOT yet promoted). Surfaces the 'talks a lot,
+        stores few facts' gap an in-character recap hides. Deterministic; no LLM."""
+        facts = self.get_facts(npc_key)
+        durable = [{"tier": f.get("tier"), "category": f.get("category"), "text": str(f.get("text") or "")[:200]}
+                   for f in facts if f.get("tier") in ("core", "significant")]
+        # `verbatim` is a 0/1 flag, not text — dedup/display on `text`.
+        stored = {str(f.get("text") or "")[:60] for f in facts}
+        candidates: list[dict] = []
+        for t in self.get_recent_turns(npc_key, limit):
+            txt = str(t.get("text") or t.get("content") or "").strip()
+            if not txt:
+                continue
+            cat = classify_text(txt)
+            if category_tier(cat) != "routine" and txt[:60] not in stored:
+                candidates.append({"category": cat, "tier": category_tier(cat), "role": t.get("role"),
+                                   "text": txt[:160]})
+        return {"npc_key": npc_key, "mode": "memory_audit",
+                "durable_fact_count": len(durable), "durable_facts": durable[:25],
+                "promotion_candidate_count": len(candidates), "promotion_candidates": candidates[:25],
+                "note": "Audit view (not roleplay): candidates are fact-worthy turns not yet promoted to durable memory."}
+
+    def promote_durable_facts(self, npc_key: str, max_promote: int = 12, limit: int = 60) -> dict:
+        """G4 backfill: PROMOTE the durable-fact candidates the audit surfaces — recent non-routine turns not yet
+        stored — to durable facts. Fixes the 'talks a lot, stores few facts' gap directly. Dedups against existing
+        facts; skips routine chatter. (Complements condensation, which runs on its own cadence.)"""
+        # NOTE: the facts `verbatim` column is an INTEGER FLAG (0/1), not the text — dedup on `text` only.
+        existing = {str(f.get("text") or "")[:60] for f in self.get_facts(npc_key)}
+        promoted: list[dict] = []
+        for t in self.get_recent_turns(npc_key, limit):
+            txt = str(t.get("content") or t.get("text") or "").strip()
+            if not txt or txt[:60] in existing:
+                continue
+            cat = classify_text(txt)
+            if category_tier(cat) == "routine":
+                continue
+            self.add_fact(npc_key, txt[:300], category=cat)
+            existing.add(txt[:60])
+            promoted.append({"category": cat, "tier": category_tier(cat), "text": txt[:120]})
+            if len(promoted) >= max_promote:
+                break
+        return {"npc_key": npc_key, "promoted": len(promoted), "facts": promoted}
+
+    # --- G5 (Gameplay Changes doc): generate AGREEMENT gameplay objects — the missing middle between talk & war --
+    def generate_agreements(self, save_id: str, max_new: int = 8) -> dict:
+        """Propose REAL agreements grounded in faction state: CEASEFIRES for active wars, TRADE pacts for an
+        exporter that can relieve an importer's shortage. Excludes engine-permanent hostiles (khaak/xenon — they
+        don't negotiate). De-duplicated against existing agreements. status='proposed' (a feeler, not auto-applied)."""
+        EXCLUDED = {"civilian", "criminal", "khaak", "player", "smuggler", "visitor", "xenon"}
+        existing: set = set()
+        for a in self.list_agreements(save_id):
+            pa, pb, ty = a.get("party_a"), a.get("party_b"), a.get("type")
+            existing.add((pa, pb, ty)); existing.add((pb, pa, ty))
+        made: list[dict] = []
+
+        def _pair_ok(a, b):
+            return a and b and a != b and a not in EXCLUDED and b not in EXCLUDED
+
+        conflicts = self.list_conflicts(save_id, status="active")
+        at_war = {frozenset((c.get("faction_a"), c.get("faction_b"))) for c in conflicts}
+        # 1) ceasefire feelers for active wars between negotiable factions
+        for c in conflicts:
+            if len(made) >= max_new:
+                break
+            a, b = c.get("faction_a"), c.get("faction_b")
+            if not _pair_ok(a, b) or (a, b, "ceasefire") in existing:
+                continue
+            made.append(self.add_agreement(save_id, a, b, type="ceasefire", status="proposed",
+                        terms={"reason": "active war — both sides taking losses",
+                               "intensity": round(float(c.get("intensity", 0) or 0), 2)}))
+            existing.add((a, b, "ceasefire"))
+        # 2) trade pacts: an exporter that can relieve an importer's real shortage (and not at war)
+        econ = {e.get("faction_id"): e for e in self.list_economy(save_id) if e.get("faction_id")}
+        exporters = [f for f, e in econ.items() if e.get("market_status") == "exporter"]
+        importers = [(f, e) for f, e in econ.items() if e.get("market_status") == "importer" and (e.get("shortages") or {})]
+        for a in exporters:
+            for b, eb in importers:
+                if len(made) >= max_new:
+                    break
+                if not _pair_ok(a, b) or frozenset((a, b)) in at_war or (a, b, "trade") in existing:
+                    continue
+                made.append(self.add_agreement(save_id, a, b, type="trade", status="proposed",
+                            terms={"reason": f"{a} exports what {b} imports", "ware": next(iter(eb.get("shortages") or {}), None)}))
+                existing.add((a, b, "trade"))
+            if len(made) >= max_new:
+                break
+        # 3) patrol cooperation: two non-excluded factions sharing a COMMON enemy in active conflicts.
+        enemy_of: dict = {}
+        for c in conflicts:
+            ca, cb = c.get("faction_a"), c.get("faction_b")
+            if ca and cb:
+                enemy_of.setdefault(ca, set()).add(cb)
+                enemy_of.setdefault(cb, set()).add(ca)
+        normal = [f for f in (e.get("faction_id") for e in econ.values() if isinstance(e, dict)) if f and f not in EXCLUDED]
+        normal = sorted(set(normal) | {f for f in enemy_of if f and f not in EXCLUDED})
+        for i in range(len(normal)):
+            for j in range(i + 1, len(normal)):
+                if len(made) >= max_new:
+                    break
+                a, b = normal[i], normal[j]
+                if not _pair_ok(a, b) or frozenset((a, b)) in at_war:
+                    continue
+                common = enemy_of.get(a, set()) & enemy_of.get(b, set())
+                common = {f for f in common if f not in (a, b)}
+                if common and (a, b, "patrol_cooperation") not in existing:
+                    foe = sorted(common)[0]
+                    made.append(self.add_agreement(save_id, a, b, type="patrol_cooperation", status="proposed",
+                                terms={"reason": f"both fighting {foe}", "common_enemy": foe}))
+                    existing.add((a, b, "patrol_cooperation"))
+            if len(made) >= max_new:
+                break
+        # 4) non-aggression pacts: neutral non-excluded pairs (not at war, not already bound by another pact).
+        for i in range(len(normal)):
+            for j in range(i + 1, len(normal)):
+                if len(made) >= max_new:
+                    break
+                a, b = normal[i], normal[j]
+                if not _pair_ok(a, b) or frozenset((a, b)) in at_war:
+                    continue
+                if any((a, b, ty) in existing for ty in ("non_aggression", "trade", "patrol_cooperation", "ceasefire")):
+                    continue
+                rel = self.get_relationship(save_id, a, b)
+                standing = str(rel.get("standing")) if rel else "neutral"
+                if standing in ("neutral", "wary"):
+                    made.append(self.add_agreement(save_id, a, b, type="non_aggression", status="proposed",
+                                terms={"reason": "neither at war nor allied — formalize the peace"}))
+                    existing.add((a, b, "non_aggression"))
+            if len(made) >= max_new:
+                break
+        return {"ok": True, "save_id": save_id, "generated": len(made), "agreements": made}
+
+    # --- Rumor propagation (design-doc §4): spread hearsay along the #39 social graph, weighted by tie strength --
+    def propagate_rumor(self, save_id: str, origin_npc: str, text: str, category: str = "rumor", reach: int = 5) -> dict:
+        """Spread a rumor from origin_npc to its WARMEST social ties (affection/trust/attraction share; rivalry/
+        fear suppress). Each of the top `reach` recipients stores it once (PK dedup) with a confidence from the
+        tie. Hearsay — NOT a durable fact."""
+        text = str(text or "").strip()
+        if not (save_id and origin_npc and text):
+            return {"ok": False, "reason": "save_id, origin_npc, text required"}
+        rid = (str(origin_npc) + "|" + text).strip().lower()[:120]
+        edges: list[tuple] = []
+        for e in self.list_social_relations(save_id, origin_npc):
+            other = e["object_npc"] if e["subject_npc"] == origin_npc else e["subject_npc"]
+            if not other or other == origin_npc:
+                continue
+            strength = (float(e.get("affection") or 0) + 0.5 * float(e.get("trust") or 0)
+                        + 0.3 * float(e.get("attraction") or 0)
+                        - 0.5 * float(e.get("rivalry") or 0) - 0.3 * float(e.get("fear") or 0))
+            if strength > 0.15:
+                edges.append((other, max(0.0, min(1.0, strength))))
+        edges.sort(key=lambda x: -x[1])
+        now = time.time()
+        recipients = []
+        for other, conf in edges[:reach]:
+            with self._lock, self._connect() as conn:
+                conn.execute("""
+                    INSERT INTO rumors (save_id, npc_key, rumor_id, text, category, origin_npc, confidence, hops, ts)
+                    VALUES (?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(save_id, npc_key, rumor_id) DO UPDATE SET
+                        confidence=MAX(rumors.confidence, excluded.confidence), ts=excluded.ts
+                """, (save_id, other, rid, text, category, origin_npc, round(conf, 3), 1, now))
+                conn.commit()
+            recipients.append({"npc_key": other, "confidence": round(conf, 3)})
+        return {"ok": True, "origin": origin_npc, "rumor_id": rid, "spread_to": len(recipients), "recipients": recipients}
+
+    def list_rumors(self, save_id: str, npc_key: Optional[str] = None, limit: int = 50) -> list[dict]:
+        with self._connect() as conn:
+            if npc_key:
+                rows = conn.execute("SELECT * FROM rumors WHERE save_id=? AND npc_key=? "
+                                    "ORDER BY confidence DESC, ts DESC LIMIT ?", (save_id, npc_key, limit)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM rumors WHERE save_id=? ORDER BY ts DESC LIMIT ?",
+                                    (save_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def rumor_brief(self, save_id: str, npc_key: str, top: int = 2) -> str:
+        """In-character surfacing of what an NPC has HEARD (scores -> English; flagged unconfirmed)."""
+        rs = self.list_rumors(save_id, npc_key, limit=top)
+        if not rs:
+            return ""
+        bits = []
+        for r in rs:
+            cue = "you half-believe" if float(r.get("confidence") or 0) >= 0.6 else "you've caught whispers that"
+            bits.append(f"{cue} {r.get('text')}")
+        return "Word reaching you — " + "; ".join(bits) + " (unconfirmed)."
 
     def upsert_player_market(self, save_id: str, ware: str, sector: str,
                              dominance_level: float = 0.0, supplying_enemies: bool = False,
