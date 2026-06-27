@@ -340,6 +340,42 @@ class MemoryStore:
                     PRIMARY KEY (save_id, ware, sector)
                 )
             """)
+            # ---- #63 earned-economy: faction budget SPEND ledger (capacity is derived from real owned
+            #      stations; this table persists what's already been drawn so a faction can't re-spend it) ----
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS faction_budget (
+                    save_id TEXT, faction_id TEXT,
+                    spent REAL DEFAULT 0,               -- cumulative credits already drawn (anti-re-spend)
+                    updated_at REAL,
+                    PRIMARY KEY (save_id, faction_id)
+                )
+            """)
+            # #39 migration: an earlier build of this table used src_npc/affinity/romantic. If that shape is
+            # present (no real data yet), DROP so the event-driven schema below recreates cleanly. Idempotent.
+            try:
+                _scols = [r[1] for r in conn.execute("PRAGMA table_info(social_relations)").fetchall()]
+                if _scols and "src_npc" in _scols:
+                    conn.execute("DROP TABLE IF EXISTS social_relations")
+            except Exception:
+                pass
+            # ---- #39 SPEC 2c: NPC<->NPC social graph — FIRST-CLASS, distinct from faction `relationships`
+            #      (faction = political; this = social/emotional; Codex: "don't overload one table for both").
+            #      Emotional SCORES + a narrative STATUS + EVIDENCE (why it exists). Changes come ONLY from social
+            #      EVENTS (saved_life, betrayal, served_together, …), never from faction projection or LLM whim. ----
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS social_relations (
+                    save_id TEXT, subject_npc TEXT, object_npc TEXT,
+                    status TEXT DEFAULT 'strangers',            -- narrative state (strangers..friends..partners..grieving)
+                    relationship_type TEXT DEFAULT 'neutral',   -- coarse category (friend/rival/mentor/romantic/professional/neutral)
+                    trust REAL DEFAULT 0, affection REAL DEFAULT 0, resentment REAL DEFAULT 0,
+                    fear REAL DEFAULT 0, loyalty REAL DEFAULT 0, rivalry REAL DEFAULT 0,
+                    debt REAL DEFAULT 0, attraction REAL DEFAULT 0,
+                    publicity REAL DEFAULT 0,                   -- 0..1 how public the tie is
+                    evidence_json TEXT DEFAULT '[]',           -- [{event, note, ts}] — WHY the relationship exists
+                    last_updated REAL,
+                    PRIMARY KEY (save_id, subject_npc, object_npc)
+                )
+            """)
             # ---- Territory / sectors -------------------------------------------
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sectors (
@@ -1235,6 +1271,13 @@ class MemoryStore:
                     f"Your faction's standing with the Commander (the player): {_ps} "
                     f"(trust {rel['trust']}, fear {rel['fear']}, resentment {rel['resentment']}, debt {rel['debt']})."
                 )
+        # G2: the player's galaxy-wide REPUTATION (role), so the faction reacts to WHO the player is.
+        try:
+            _pr = self.classify_player_role(save_id)
+            if _pr.get("primary_role") and _pr["primary_role"] != "unaligned newcomer":
+                lines.append(f"Across the galaxy the Commander is regarded as a {_pr['primary_role']}.")
+        except Exception:
+            pass
         # Live standing toward OTHER factions (ground truth for "are we at war with the Alliance?").
         others = []
         for r in self.list_relationships(save_id, subject=faction_id):
@@ -2338,6 +2381,262 @@ class MemoryStore:
                                 production_health=production_health, market_status=market_status)
             updated += 1
         return {"ok": True, "save_id": save_id, "stations": len(stations), "factions_rolled_up": updated}
+
+    # --- #63 earned-economy: spend capacity grounded in REAL owned stations, minus what's been drawn ----------
+    PER_STATION_CREDITS = 250_000  # a station's notional output backing the faction's deal-capacity
+
+    def budget_capacity(self, save_id: str, faction_id: str) -> float:
+        """Derived spend capacity, grounded in REAL owned infrastructure (#54 stations × production_health).
+        A faction can only back deals up to what it actually owns — words≠resources."""
+        n = len(self.list_economy_stations(save_id, faction_id))
+        health = float((self.get_economy(save_id, faction_id) or {}).get("production_health", 1.0) or 1.0)
+        return round(n * self.PER_STATION_CREDITS * max(0.05, health), 2)
+
+    def budget_spent(self, save_id: str, faction_id: str) -> float:
+        with self._connect() as conn:
+            row = conn.execute("SELECT spent FROM faction_budget WHERE save_id=? AND faction_id=?",
+                               (save_id, faction_id)).fetchone()
+        return float(row["spent"]) if row else 0.0
+
+    def record_budget_spend(self, save_id: str, faction_id: str, amount: float) -> float:
+        amount = max(0.0, float(amount or 0))
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute("""
+                INSERT INTO faction_budget (save_id, faction_id, spent, updated_at) VALUES (?,?,?,?)
+                ON CONFLICT(save_id, faction_id) DO UPDATE SET spent = spent + excluded.spent, updated_at=excluded.updated_at
+            """, (save_id, faction_id, amount, now))
+            conn.commit()
+        return self.budget_spent(save_id, faction_id)
+
+    def validate_earned_transfer(self, save_id: str, faction_id: str, cost: float, commit: bool = False) -> dict:
+        """THE anti-cheat gate (#63): an 'earned' transfer is legitimate ONLY if the faction can afford it from
+        its OWNED capacity (capacity − already-spent ≥ cost). If commit=True and affordable, debits the ledger so
+        the same budget can't be re-spent. The 'earned' marker is SERVER-set here — never LLM-settable."""
+        cap = self.budget_capacity(save_id, faction_id)
+        spent = self.budget_spent(save_id, faction_id)
+        cost = max(0.0, float(cost or 0))
+        earned = cost <= round(cap - spent, 2)
+        if earned and commit:
+            spent = self.record_budget_spend(save_id, faction_id, cost)
+        return {"earned": earned, "faction_id": faction_id, "cost": cost, "capacity": cap,
+                "spent": round(spent, 2), "remaining": round(cap - spent, 2),
+                "reason": "within owned capacity" if earned else "exceeds the faction's owned capacity"}
+
+    # --- #39 SPEC 2c: NPC<->NPC social graph — first-class + EVENT-DRIVEN (Bannerlord feature-translation §3 +
+    #     Codex feedback). Faction relations are political; THIS is social/emotional. Changes come ONLY from
+    #     social EVENTS, never faction projection or LLM whim. Emotional SCORES + narrative STATUS + EVIDENCE. ---
+    SOCIAL_EVENTS: dict[str, dict] = {
+        "saved_life":              {"affection": 0.25, "trust": 0.20, "loyalty": 0.20, "debt": 0.30},
+        "abandoned_in_combat":     {"resentment": 0.35, "fear": 0.15, "trust": -0.30, "loyalty": -0.30},
+        "served_together":         {"trust": 0.10, "affection": 0.08, "loyalty": 0.08},
+        "shared_secret":           {"trust": 0.20, "affection": 0.12, "publicity": -0.10},
+        "public_insult":           {"resentment": 0.25, "rivalry": 0.25, "affection": -0.15, "publicity": 0.20},
+        "betrayal":                {"resentment": 0.40, "trust": -0.40, "loyalty": -0.40, "rivalry": 0.30},
+        "repeated_conversations":  {"trust": 0.06, "affection": 0.05, "attraction": 0.03},
+        "player_mediation":        {"resentment": -0.20, "trust": 0.15, "rivalry": -0.15},
+        "flirtation_reciprocated": {"attraction": 0.15, "affection": 0.10, "publicity": 0.05},
+        "rebuffed_advance":        {"attraction": -0.20, "resentment": 0.10},
+        "bereavement":             {},  # status -> grieving (handled via the grief flag)
+    }
+    _SOCIAL_SCALARS = ("trust", "affection", "resentment", "fear", "loyalty", "rivalry", "debt", "attraction", "publicity")
+
+    @staticmethod
+    def _advance_social_status(sc: dict, grief: bool = False) -> tuple:
+        """Pure: emotional scores -> (narrative status, coarse relationship_type). Romance is GATED (rises only
+        with attraction AND affection) so the sim never drifts into universal romance (§7 restraint)."""
+        af, tr = float(sc.get("affection", 0)), float(sc.get("trust", 0))
+        res, riv = float(sc.get("resentment", 0)), float(sc.get("rivalry", 0))
+        att, loy = float(sc.get("attraction", 0)), float(sc.get("loyalty", 0))
+        if grief:
+            return "grieving", "romantic"
+        if res >= 0.7 or riv >= 0.8:
+            return "enemies", "rival"
+        if res >= 0.4 or riv >= 0.5:
+            return "rivals", "rival"
+        if att >= 0.3 and af >= 0.25:            # romance track — gated by attraction AND affection
+            if att >= 0.75 and af >= 0.6:
+                return "partners", "romantic"
+            if att >= 0.55:
+                return "courting", "romantic"
+            if att >= 0.45:
+                return "confession_pending", "romantic"
+            if att >= 0.35:
+                return "flirtation", "romantic"
+            return "private_attraction", "romantic"
+        if loy >= 0.5 and tr >= 0.5 and af < 0.5:
+            return "mentor/student", "mentor"
+        if af >= 0.6 and tr >= 0.6:
+            return "close friends", "friend"
+        if af >= 0.35 and tr >= 0.3:
+            return "friends", "friend"
+        if tr >= 0.2 or af >= 0.2:
+            return "crewmates", "professional"
+        if tr > 0 or af > 0 or res > 0 or att > 0:
+            return "acquaintances", "neutral"
+        return "strangers", "neutral"
+
+    def _write_social_edge(self, conn, save_id, subject, obj, sc, status, rtype, evidence_json, now):
+        conn.execute("""
+            INSERT INTO social_relations (save_id, subject_npc, object_npc, status, relationship_type,
+                trust, affection, resentment, fear, loyalty, rivalry, debt, attraction, publicity, evidence_json, last_updated)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(save_id, subject_npc, object_npc) DO UPDATE SET status=excluded.status,
+                relationship_type=excluded.relationship_type, trust=excluded.trust, affection=excluded.affection,
+                resentment=excluded.resentment, fear=excluded.fear, loyalty=excluded.loyalty, rivalry=excluded.rivalry,
+                debt=excluded.debt, attraction=excluded.attraction, publicity=excluded.publicity,
+                evidence_json=excluded.evidence_json, last_updated=excluded.last_updated
+        """, (save_id, subject, obj, status, rtype, sc["trust"], sc["affection"], sc["resentment"], sc["fear"],
+              sc["loyalty"], sc["rivalry"], sc["debt"], sc["attraction"], sc["publicity"], evidence_json, now))
+
+    def apply_social_event(self, save_id: str, subject_npc: str, object_npc: str, event_type: str, note: str = "") -> dict:
+        """THE driver (#39): a social event mutates the edge's emotional scores, appends EVIDENCE (why the
+        relationship exists), and re-derives the narrative status. The ONLY sanctioned way relationships change."""
+        if event_type not in self.SOCIAL_EVENTS:
+            return {"ok": False, "reason": f"unknown social event '{event_type}'"}
+        if not (save_id and subject_npc and object_npc) or subject_npc == object_npc:
+            return {"ok": False, "reason": "need distinct subject/object npc"}
+        now = time.time()
+        delta = self.SOCIAL_EVENTS[event_type]
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM social_relations WHERE save_id=? AND subject_npc=? AND object_npc=?",
+                               (save_id, subject_npc, object_npc)).fetchone()
+            cur = dict(row) if row else {}
+            sc = {k: max(0.0, min(1.0, float(cur.get(k, 0) or 0) + float(delta.get(k, 0)))) for k in self._SOCIAL_SCALARS}
+            grief = event_type == "bereavement"
+            status, rtype = self._advance_social_status(sc, grief)
+            ev = json.loads(cur.get("evidence_json") or "[]")
+            ev.append({"event": event_type, "note": note, "ts": now})
+            ev = ev[-12:]
+            self._write_social_edge(conn, save_id, subject_npc, object_npc, sc, status, rtype, json.dumps(ev), now)
+            conn.commit()
+        return {"ok": True, "subject_npc": subject_npc, "object_npc": object_npc, "event": event_type,
+                "status": status, "relationship_type": rtype, "scores": {k: round(sc[k], 3) for k in self._SOCIAL_SCALARS}}
+
+    def upsert_social_relation(self, save_id: str, subject_npc: str, object_npc: str, **fields) -> dict:
+        """Direct set/merge of an edge (manual / test path). Clamps scalars 0..1 + recomputes status. Most changes
+        should go through apply_social_event instead."""
+        if not (save_id and subject_npc and object_npc) or subject_npc == object_npc:
+            return {"ok": False, "reason": "need distinct subject/object npc"}
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM social_relations WHERE save_id=? AND subject_npc=? AND object_npc=?",
+                               (save_id, subject_npc, object_npc)).fetchone()
+            cur = dict(row) if row else {}
+            sc = {k: max(0.0, min(1.0, float(fields.get(k, cur.get(k, 0)) or 0))) for k in self._SOCIAL_SCALARS}
+            ds, dr = self._advance_social_status(sc, bool(fields.get("grief")))
+            status = fields.get("status") or ds
+            rtype = fields.get("relationship_type") or dr
+            self._write_social_edge(conn, save_id, subject_npc, object_npc, sc, status, rtype,
+                                    (cur.get("evidence_json") or "[]"), now)
+            conn.commit()
+        return {"ok": True, "subject_npc": subject_npc, "object_npc": object_npc, "status": status, "relationship_type": rtype}
+
+    def list_social_relations(self, save_id: str, npc_key: Optional[str] = None) -> list[dict]:
+        with self._connect() as conn:
+            if npc_key:
+                rows = conn.execute(
+                    "SELECT * FROM social_relations WHERE save_id=? AND (subject_npc=? OR object_npc=?) "
+                    "ORDER BY (affection+rivalry+attraction+resentment) DESC", (save_id, npc_key, npc_key)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM social_relations WHERE save_id=?", (save_id,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["evidence"] = json.loads(d.pop("evidence_json") or "[]")
+            except Exception:
+                d["evidence"] = []
+            out.append(d)
+        return out
+
+    @staticmethod
+    def _band(v: float, hi: str, mid: str, lo: str) -> str:
+        v = float(v or 0)
+        return hi if v >= 0.6 else mid if v >= 0.3 else lo
+
+    def social_edge_brief(self, save_id: str, subject_npc: str, object_npc: str) -> str:
+        """Codex §relationships: when NPC A talks about NPC B, inject ONLY the relevant edge as in-character
+        context. Scores -> English (never raw numbers) + the latest evidence ('you remember …')."""
+        edge = next((e for e in self.list_social_relations(save_id, subject_npc)
+                     if object_npc in (e["object_npc"], e["subject_npc"])), None)
+        if not edge:
+            return ""
+        other = {n["npc_key"]: (n.get("name") or n["npc_key"]) for n in self.list_npcs()}.get(object_npc, object_npc)
+        parts = [f"You know {other} personally — your relationship: {str(edge.get('status','strangers')).replace('_',' ')}"]
+        if float(edge.get("trust", 0)) > 0:
+            parts.append("you trust them " + self._band(edge.get("trust"), "deeply", "somewhat", "a little"))
+        if float(edge.get("resentment", 0)) >= 0.3:
+            parts.append("you resent them")
+        if float(edge.get("attraction", 0)) >= 0.3 and float(edge.get("publicity", 0)) < 0.3:
+            parts.append("an attraction you have not made public")
+        line = "; ".join(parts) + "."
+        ev = edge.get("evidence") or []
+        if ev:
+            note = ev[-1].get("note") or str(ev[-1].get("event", "")).replace("_", " ")
+            if note:
+                line += f" You remember: {note}."
+        return line
+
+    def social_summary(self, save_id: str, npc_key: str, top: int = 3) -> str:
+        """An NPC's closest ties overview (dashboard / general grounding)."""
+        edges = self.list_social_relations(save_id, npc_key)[:top]
+        if not edges:
+            return ""
+        names = {n["npc_key"]: (n.get("name") or n["npc_key"]) for n in self.list_npcs()}
+        bits = []
+        for e in edges:
+            other = e["object_npc"] if e["subject_npc"] == npc_key else e["subject_npc"]
+            bits.append(f"{str(e.get('status','strangers')).replace('_',' ')} with {names.get(other, other)}")
+        return "Personal ties: " + "; ".join(bits) + "."
+
+    # --- G2 (Gameplay Changes doc): classify the PLAYER from stored signals so factions react to who they are ---
+    def classify_player_role(self, save_id: str) -> dict:
+        """Deterministic: read the player's standing per faction + economic leverage + brokered deals -> a role.
+        Roles (the doc's list): war profiteer / supplier / mediator / faction friend / faction threat / newcomer."""
+        # Exclude engine-permanent hostiles / non-combatants: being at war with khaak/xenon is UNIVERSAL, not a
+        # player CHOICE, so it must not drive the player's role (mirrors diplomacy.EXCLUDED_FROM_WAR, #58).
+        _EXCLUDED = {"civilian", "criminal", "khaak", "player", "smuggler", "visitor", "xenon"}
+        per_faction: dict[str, str] = {}
+        friends: list[str] = []
+        threats: list[str] = []
+        for r in self.list_relationships(save_id):
+            if r.get("object") != "player" or not r.get("subject"):
+                continue
+            fid = r["subject"]
+            if fid in _EXCLUDED:
+                continue
+            trust = float(r.get("trust") or 0)
+            res = float(r.get("resentment") or 0)
+            standing = str(r.get("standing") or "")
+            if standing in ("at war", "hostile") or res >= 40:
+                per_faction[fid] = "threat"; threats.append(fid)
+            elif trust >= 50:
+                per_faction[fid] = "friend"; friends.append(fid)
+            else:
+                per_faction[fid] = "neutral"
+        high_dep = [e.get("faction_id") for e in self.list_economy(save_id)
+                    if e.get("faction_id") and float(e.get("dependency_on_player") or 0) >= 0.6]
+        supplies_enemies = any(int(p.get("supplying_enemies") or 0) for p in self.list_player_market(save_id))
+        brokered = [a for a in self.list_agreements(save_id)
+                    if "player" in (a.get("party_a"), a.get("party_b"))
+                    and str(a.get("type") or "") in ("ceasefire", "non_aggression", "trade", "transit", "patrol_cooperation")]
+        tags: list[str] = []
+        if supplies_enemies:
+            tags.append("war profiteer")
+        if len(high_dep) >= 2:
+            tags.append("supplier")
+        if brokered:
+            tags.append("mediator")
+        if friends and not threats:
+            tags.append("faction friend")
+        if threats:
+            tags.append("faction threat")
+        primary = tags[0] if tags else "unaligned newcomer"
+        return {"save_id": save_id, "primary_role": primary, "role_tags": tags,
+                "friends": friends, "threats": threats, "per_faction": per_faction,
+                "high_dependency_factions": [f for f in high_dep if f], "supplies_enemies": bool(supplies_enemies),
+                "brokered_count": len(brokered)}
 
     def upsert_player_market(self, save_id: str, ware: str, sector: str,
                              dominance_level: float = 0.0, supplying_enemies: bool = False,

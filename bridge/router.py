@@ -30,9 +30,13 @@ except ImportError:
 try:
     from . import lore as lore_mod
     from . import catdat as catdat_mod
+    from . import diplomacy as diplomacy_mod
+    from . import offers as offers_mod
 except ImportError:  # pragma: no cover - non-package execution
     import lore as lore_mod  # type: ignore
     import catdat as catdat_mod  # type: ignore
+    import diplomacy as diplomacy_mod  # type: ignore
+    import offers as offers_mod  # type: ignore
 
 
 class NeuralRouter:
@@ -2162,6 +2166,309 @@ class NeuralRouter:
             type=str(payload.get("type", "")), terms=payload.get("terms"),
             deadline=float(payload.get("deadline", 0) or 0), status=str(payload.get("status", "pending")))
         return {"ok": True, "agreement": ag}
+
+    def diplomacy_eligibility(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """#58: is a war/peace move between two factions legal? Refuses excluded (khaak/xenon/player/non-combatant)
+        and unknown/inactive factions. The gate #65 calls before any chat->relation mutation."""
+        a = str(payload.get("a") or payload.get("faction_a") or payload.get("subject") or "")
+        b = str(payload.get("b") or payload.get("faction_b") or payload.get("object") or "")
+        save_id = str(payload.get("save_id") or "")
+        known = None
+        if save_id:
+            try:
+                known = {str(f.get("faction_id") or "").lower() for f in self.memory.list_factions(save_id)}
+                known.discard("")
+            except Exception:
+                known = None
+        return {"ok": True, **diplomacy_mod.war_eligibility(a, b, known)}
+
+    def diplomacy_eligibility_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return diplomacy_mod.run_selftest()
+
+    def player_role(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """G2: the player's classified role(s) from stored signals (factions react to who they are)."""
+        return {"ok": True, **self.memory.classify_player_role(str(payload.get("save_id") or "unindexed"))}
+
+    def player_role_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        m = self.memory
+        s = "__player_role_selftest__" + str(int(time.time() * 1000))
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            ok("newcomer_when_empty", m.classify_player_role(s)["primary_role"] == "unaligned newcomer")
+            m.upsert_economy(s, "argon", dependency_on_player=0.8)
+            m.upsert_economy(s, "teladi", dependency_on_player=0.7)
+            ok("supplier_detected", "supplier" in m.classify_player_role(s)["role_tags"])
+            m.upsert_player_market(s, "energycells", "somewhere", supplying_enemies=True)
+            ok("war_profiteer_is_primary", m.classify_player_role(s)["primary_role"] == "war profiteer")
+            m.adjust_relationship(s, "split", "player", dresentment=60)
+            r = m.classify_player_role(s)
+            ok("threat_faction_listed", "split" in r["threats"] and r["per_faction"].get("split") == "threat", r["per_faction"])
+            m.adjust_relationship(s, "argon", "player", dtrust=70)
+            r2 = m.classify_player_role(s)
+            ok("friend_faction_listed", "argon" in r2["friends"] and r2["per_faction"].get("argon") == "friend", r2["per_faction"])
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
+
+    def _build_patrol_offer(self, save_id: str, faction_id: str = "") -> dict[str, Any]:
+        """G1 (Gameplay Changes doc): render a patrol/defense offer from a REAL contested sector. PURE — no
+        enqueue, no reward. Picks the most-pressing contested sector with a known owner + contester."""
+        cands = [s for s in self.memory.list_sectors(save_id)
+                 if (s.get("contested_by") or []) and s.get("owner_faction")]
+        if faction_id:
+            cands = [s for s in cands if s.get("owner_faction") == faction_id]
+        if not cands:
+            return {"ok": False, "reason": "no contested sector with a known owner to source a patrol contract"}
+        cands.sort(key=lambda s: (int(s.get("player_assets_present") or 0), float(s.get("strategic_value") or 0),
+                                  len(s.get("contested_by") or [])), reverse=True)
+        s = cands[0]
+        owner = s.get("owner_faction")
+        threat_id = (s.get("contested_by") or [""])[0]
+        where = s.get("name") or s.get("sector_id") or "the front"
+        rendered = offers_mod.render_offer("patrol", {
+            "faction": self._fac_name(save_id, owner), "where": where, "threat": self._fac_name(save_id, threat_id)})
+        if not rendered.get("ok"):
+            return {"ok": False, "reason": rendered.get("reason")}
+        return {"ok": True, "sector": where, "owner": owner, "threat": threat_id, "offer": rendered["offer"]}
+
+    def sector_patrol_offer(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """G1: build a patrol offer from a real contested sector and ENQUEUE it as a player communiqué.
+        PROPOSAL only — no order issued, no reward minted."""
+        save_id = str(payload.get("save_id") or "unindexed")
+        fid_in = self.memory.resolve_faction_id(str(payload.get("faction_id") or "")) or str(payload.get("faction_id") or "")
+        res = self._build_patrol_offer(save_id, fid_in)
+        if not res.get("ok"):
+            return res
+        offer = res["offer"]
+        owner_name = self._fac_name(save_id, res["owner"])
+        comm = {"title": f"{owner_name.upper()} PATROL REQUEST", "body": offer["summary"], "faction": res["owner"],
+                "faction_name": owner_name, "category": "diplomacy", "kind": "offer", "save_id": save_id,
+                "ts": time.time(), "offer": offer}
+        self.player_comms.append(comm)
+        while len(self.player_comms) > 200:
+            self.player_comms.popleft()
+        return {"ok": True, "sector": res["sector"], "owner": res["owner"], "threat": res["threat"],
+                "offer": offer, "comm_enqueued": True}
+
+    def sector_patrol_offer_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic: seed synthetic contested sectors -> assert the offer targets the most-pressing one and
+        is grounded in real owner/sector/threat. Throwaway save_id."""
+        s = "__patrol_offer_selftest__" + str(int(time.time() * 1000))
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            self.memory.upsert_sector(s, "sec_quiet", name="Grand Exchange", owner_faction="teladi",
+                                      contested_by=["xenon"], strategic_value=0.2, player_assets_present=False)
+            self.memory.upsert_sector(s, "sec_hot", name="Hatikvah's Choice III", owner_faction="argon",
+                                      contested_by=["khaak", "xenon"], strategic_value=0.9, player_assets_present=True)
+            r = self._build_patrol_offer(s, "")
+            ok("offer_built", r.get("ok") is True, r)
+            ok("targets_most_pressing_sector", r.get("sector") == "Hatikvah's Choice III", r.get("sector"))
+            ok("owner_is_argon", r.get("owner") == "argon", r.get("owner"))
+            ok("kind_is_patrol", r.get("ok") and r["offer"]["kind"] == "Patrol")
+            ok("summary_grounded_no_braces", r.get("ok") and "{" not in r["offer"]["summary"]
+               and "Hatikvah's Choice III" in r["offer"]["summary"], r.get("offer"))
+            ok("no_reward_minted", r.get("ok") and r["offer"]["reward_kind"] == "credits" and "reward_amount" not in r["offer"])
+            ok("no_contested_no_offer", self._build_patrol_offer("__no_such_save__", "").get("ok") is False)
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
+
+    def offers_list(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """#59: the X4-native offer template catalog (shapes an NPC can present)."""
+        return {"ok": True, "templates": offers_mod.list_templates()}
+
+    def offers_render(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """#59: fill one template + params into a concrete offer (proposal only — no reward, no mutation)."""
+        return offers_mod.render_offer(str(payload.get("template_id") or ""), payload.get("params") or {})
+
+    def offers_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return offers_mod.run_selftest()
+
+    def budget_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """#63: a faction's owned spend-capacity (grounded in real stations) vs what's been drawn."""
+        save_id = str(payload.get("save_id") or "unindexed")
+        fid = self.memory.resolve_faction_id(str(payload.get("faction_id") or "")) or str(payload.get("faction_id") or "")
+        cap = self.memory.budget_capacity(save_id, fid)
+        spent = self.memory.budget_spent(save_id, fid)
+        return {"ok": True, "faction_id": fid, "capacity": cap, "spent": round(spent, 2),
+                "remaining": round(cap - spent, 2)}
+
+    def earned_validate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """#63 anti-cheat gate: is an 'earned' transfer of `cost` legitimate for this faction? Server-set, never
+        LLM-settable. `commit:true` debits the ledger when affordable (so it can't be re-spent)."""
+        save_id = str(payload.get("save_id") or "unindexed")
+        fid = self.memory.resolve_faction_id(str(payload.get("faction_id") or "")) or str(payload.get("faction_id") or "")
+        cost = float(payload.get("cost") or 0)
+        commit = bool(payload.get("commit"))
+        return {"ok": True, **self.memory.validate_earned_transfer(save_id, fid, cost, commit=commit)}
+
+    def earned_validate_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic: seed synthetic owned stations -> a faction can spend up to capacity, never beyond, and
+        cannot re-spend what it already drew. Throwaway save_id."""
+        s = "__earned_validate_selftest__" + str(int(time.time() * 1000))  # fresh ledger per run
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            # seed 4 healthy owned stations
+            for i in range(4):
+                self.memory.upsert_economy_station(s, {"station_id": f"b{i}", "faction_id": "argon", "products": ["energycells"], "needs": []})
+            self.memory.upsert_economy(s, "argon", production_health=1.0)
+            cap = self.memory.budget_capacity(s, "argon")
+            ok("capacity_from_real_stations", cap == 4 * self.memory.PER_STATION_CREDITS, cap)
+            v_ok = self.memory.validate_earned_transfer(s, "argon", cap * 0.5)
+            ok("affordable_within_capacity", v_ok["earned"] is True, v_ok)
+            v_over = self.memory.validate_earned_transfer(s, "argon", cap * 2)
+            ok("over_capacity_refused", v_over["earned"] is False, v_over)
+            # spend half (commit), then a second half-spend must still fit, but a third must refuse
+            self.memory.validate_earned_transfer(s, "argon", cap * 0.5, commit=True)
+            self.memory.validate_earned_transfer(s, "argon", cap * 0.5, commit=True)
+            v_resp = self.memory.validate_earned_transfer(s, "argon", cap * 0.5)
+            ok("cannot_respend_drained_budget", v_resp["earned"] is False and v_resp["remaining"] <= 0.01, v_resp)
+            ok("no_capacity_no_spend", self.memory.validate_earned_transfer(s, "nobody", 1)["earned"] is False)
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
+
+    def social_list(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """#39: NPC↔NPC social edges (all, or those touching one npc_key)."""
+        save_id = str(payload.get("save_id") or "unindexed")
+        npc = str(payload.get("npc_key") or "") or None
+        return {"ok": True, "relations": self.memory.list_social_relations(save_id, npc),
+                "summary": (self.memory.social_summary(save_id, npc) if npc else "")}
+
+    def social_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """#39: apply a social EVENT (saved_life, betrayal, served_together, …) to an NPC↔NPC edge — the only
+        sanctioned way relationships change. Mutates scores + evidence + re-derives narrative status."""
+        save_id = str(payload.get("save_id") or "unindexed")
+        return self.memory.apply_social_event(save_id, str(payload.get("subject_npc") or ""),
+                                              str(payload.get("object_npc") or ""),
+                                              str(payload.get("event_type") or ""), str(payload.get("note") or ""))
+
+    def social_edge_brief(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """#39: the in-character edge context to inject when subject talks ABOUT object (scores->English)."""
+        save_id = str(payload.get("save_id") or "unindexed")
+        return {"ok": True, "brief": self.memory.social_edge_brief(save_id, str(payload.get("subject_npc") or ""),
+                                                                   str(payload.get("object_npc") or ""))}
+
+    def social_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        m = self.memory
+        s = "__social_selftest__" + str(int(time.time() * 1000))
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            # status derivation is gated (romance needs attraction AND affection)
+            ok("status_strangers_default", m._advance_social_status({})[0] == "strangers")
+            ok("status_enemies_from_resentment", m._advance_social_status({"resentment": 0.8})[0] == "enemies")
+            ok("attraction_alone_is_not_romance", m._advance_social_status({"attraction": 0.9})[1] != "romantic")
+            ok("romance_gated_needs_affection", m._advance_social_status({"attraction": 0.8, "affection": 0.7})[0] == "partners")
+            # EVENT-DRIVEN: relationships change only via events, with evidence
+            m.apply_social_event(s, "npcA", "npcB", "served_together", "the Kha'ak raid on the dock")
+            m.apply_social_event(s, "npcA", "npcB", "saved_life", "pulled wounded crew from the wreck")
+            ab = next(e for e in m.list_social_relations(s, "npcA") if e["object_npc"] == "npcB")
+            ok("event_moves_scores", ab["trust"] > 0 and ab["affection"] > 0 and ab["loyalty"] > 0)
+            ok("evidence_recorded", len(ab.get("evidence") or []) == 2 and "Kha'ak" in (ab["evidence"][0].get("note") or ""))
+            ok("unknown_event_rejected", m.apply_social_event(s, "npcA", "npcB", "telepathy").get("ok") is False)
+            ok("self_edge_rejected", m.apply_social_event(s, "npcA", "npcA", "served_together").get("ok") is False)
+            # a romance arc progresses through states, never a boolean
+            r = "__social_selftest_r__" + str(int(time.time() * 1000))
+            for _ in range(8):
+                m.apply_social_event(r, "x", "y", "repeated_conversations")
+            m.apply_social_event(r, "x", "y", "flirtation_reciprocated")
+            m.apply_social_event(r, "x", "y", "flirtation_reciprocated")
+            xy = next(e for e in m.list_social_relations(r, "x") if e["object_npc"] == "y")
+            ok("romance_is_a_state_not_boolean", xy["status"] in ("private_attraction", "flirtation", "confession_pending", "courting", "partners"))
+            # edge brief is in-character English (no raw numbers)
+            brief = m.social_edge_brief(s, "npcA", "npcB")
+            ok("edge_brief_in_character", "You know" in brief and "remember" in brief.lower() and not any(c.isdigit() for c in brief.replace("Kha", "")))
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
+
+    def _build_supply_offer(self, save_id: str, faction_id: str = "") -> dict[str, Any]:
+        """#60: render a supply_delivery offer from a REAL faction shortage (#54). PURE — no enqueue, no reward."""
+        cands = [faction_id] if faction_id else [e.get("faction_id") for e in self.memory.list_economy(save_id)]
+        best = None  # (fid, ware, severity, econ)
+        for fid in cands:
+            if not fid:
+                continue
+            econ = self.memory.get_economy(save_id, fid) or {}
+            sh = econ.get("shortages") or {}
+            if not sh:
+                continue
+            ware, sev = max(sh.items(), key=lambda kv: float(kv[1] or 0))
+            sev = float(sev or 0)
+            if best is None or sev > best[2]:
+                best = (fid, ware, sev, econ)
+        if not best:
+            return {"ok": False, "reason": "no faction has a real shortage to source an offer"}
+        fid, ware, sev, _econ = best
+        fname = self._fac_name(save_id, fid)
+        ware_label = self.memory._ware_label(ware)
+        amount = "{:,}".format(int(2000 + round(sev * 8000)))  # REQUEST quantity (text only — not a transfer)
+        where = fname + " space"
+        try:  # use a real station name ONLY if it's meaningful — never leak a placeholder like "Unknown Station".
+            for st_row in (self.memory.list_economy_stations(save_id, fid) or []):
+                nm = str(st_row.get("station_name") or "").strip()
+                if nm and not nm.lower().startswith("unknown"):
+                    where = nm
+                    break
+        except Exception:
+            pass
+        reason = ("Their stations are critically short." if sev >= 0.7
+                  else "Supplies are running low." if sev >= 0.4 else "Stocks are a little tight.")
+        rendered = offers_mod.render_offer("supply_delivery", {
+            "faction": fname, "ware": ware_label, "amount": amount, "where": where, "reason": reason})
+        if not rendered.get("ok"):
+            return {"ok": False, "reason": rendered.get("reason")}
+        return {"ok": True, "faction": fid, "ware": ware, "severity": round(sev, 3), "offer": rendered["offer"]}
+
+    def economy_supply_offer(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """#60: build a supply offer from a real shortage and ENQUEUE it as a player communiqué (surfaces in-game
+        via the /v1/player_comms drain). PROPOSAL only — no ware moved, no reward minted."""
+        save_id = str(payload.get("save_id") or "unindexed")
+        fid_in = self.memory.resolve_faction_id(str(payload.get("faction_id") or "")) or str(payload.get("faction_id") or "")
+        res = self._build_supply_offer(save_id, fid_in)
+        if not res.get("ok"):
+            return res
+        offer = res["offer"]
+        fname = self._fac_name(save_id, res["faction"])
+        comm = {"title": f"{fname.upper()} SUPPLY REQUEST", "body": offer["summary"], "faction": res["faction"],
+                "faction_name": fname, "category": "diplomacy", "kind": "offer", "save_id": save_id,
+                "ts": time.time(), "offer": offer}
+        self.player_comms.append(comm)
+        while len(self.player_comms) > 200:
+            self.player_comms.popleft()
+        return {"ok": True, "faction": res["faction"], "ware": res["ware"], "severity": res["severity"],
+                "offer": offer, "comm_enqueued": True}
+
+    def economy_supply_offer_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic: seed a synthetic faction shortage -> assert the offer is grounded in it. Does NOT touch
+        the live player_comms queue (uses a throwaway save_id + the pure builder)."""
+        s = "__supply_offer_selftest__"
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            self.memory.upsert_economy(s, "argon", shortages={"energycells": 0.9, "foodrations": 0.5},
+                                       key_needs=["energycells", "foodrations"], market_status="importer")
+            r = self._build_supply_offer(s, "argon")
+            ok("offer_built", r.get("ok") is True, r)
+            ok("targets_worst_shortage", r.get("ware") == "energycells", r.get("ware"))
+            ok("kind_is_deliver_wares", r.get("ok") and r["offer"]["kind"] == "Deliver Wares")
+            ok("summary_grounded_no_braces", r.get("ok") and "{" not in r["offer"]["summary"] and "Energy Cells" in r["offer"]["summary"], r.get("offer"))
+            ok("proposal_has_no_reward_grant", r.get("ok") and r["offer"]["reward_kind"] == "credits" and "reward_amount" not in r["offer"])
+            ok("where_no_unknown_placeholder", r.get("ok") and "unknown" not in r["offer"]["summary"].lower(), r.get("offer"))
+            empty = self._build_supply_offer("__no_such_save__", "argon")
+            ok("no_shortage_no_offer", empty.get("ok") is False)
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
 
     def economy_list(self, save_id: str) -> dict[str, Any]:
         econ = self.memory.list_economy(save_id)

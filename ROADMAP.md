@@ -839,16 +839,257 @@ The "Economy — meaning" panel already rendered the aggregate, but with raw war
     debuglog `economy <fac> stations <off>..<last>/<total> sent=N`, then `/api/economy` `shortages` NON-empty +
     `economy_stations` rows>0 + `economy_rollup_selftest` 6/6 live + Economy panel shows real shortages.
 
-#### ▶ SPEC #57 SEED (extracted 2026-06-26 from Ken's `deadairdynamicwars` ref) — faction war/peace eligibility
-The dashboard has NO eligibility data (gap audit). DeadAir `md/dynamicwardiplomacy.xml` is the pattern to port:
-- **Eligibility filter = `$Faction.isactive` AND NOT in an `$ExcludedFactions` list** (the exclusion list is the
-  core artifact — factions that must never be dragged into dynamic war/peace, e.g. story/locked/uncombatant).
-- **Relation scale is the UI value `±25`** (`$F1.relation.{…}.uivalue`); changes are bounded `le 25` / `ge -25`
-  and step ±5; cost-gated by `player.money`. So a legal relation move = within ±25 and both factions active+eligible.
-- **Also check** `dynamicwarfixrelations.xml` (relation repair/normalization) + `dynamicwar.xml` (who-fights-who
-  selection) for the full eligibility/validator set when #57 is built.
-- **#58 will encode this as a bridge validator** (`is_war_eligible(a,b)` = both active, neither excluded, target
-  reachable) + selftest, which then UNBLOCKS #65 (gate ForceWar through the same validator). Not built yet — seed only.
+#### ▶ SPEC #57 ✅ DONE (2026-06-26) — faction war/peace eligibility pattern EXTRACTED from DeadAir
+The dashboard has NO eligibility data (gap audit). Fully grounded against Ken's `deadairdynamicwars` ref
+(`dynamicwar.xml` + `dynamicwardiplomacy.xml`). **The pattern (verbatim from the source):**
+- **`$ExcludedFactions` (the core artifact, `dynamicwar.xml:273` / `:989`):**
+  `[civilian, criminal, khaak, player, smuggler, visitor, xenon]` — these are NEVER subject to dynamic war/peace.
+  Rationale: khaak/xenon are engine-permanent hostiles (not negotiable); civilian/criminal/smuggler/visitor are
+  non-combatant background/economic factions; player is excluded from auto-war. Story factions (buccaneers,
+  hatikvah) are conditionally appended; `PeacefulList`/`VisitorList` also folded in.
+- **Active check (`:314`):** a faction is eligible only if `$faction != null and $faction.isactive == true`
+  (it still exists in this game).
+- **Enemy/ally selection (`:822-824`):** `get_factions_by_relation relation="killmilitary"` → current enemies;
+  `relation="member"` → allies; relation value via `$A.relationto.{$B}`, the factor clamped to a min/max band.
+- **Relation-move bounds (`dynamicwardiplomacy.xml`):** UI value `±25` (`.relation.{…}.uivalue`), step ±5,
+  cost-gated by `player.money`. (Our engine scale is −1..+1; the On_action relation code already clamps to that.)
+**So `is_war_eligible(a, b)` = both known+active, AND neither in the excluded set.** Mirrored into the
+`x4-reference-mods` skill + StarForge canon. **#57 closed.**
+
+#### ▶ SPEC #58 (PLAN 2026-06-26) — bridge faction-eligibility validator + selftest (unblocks #65)
+- **Build:** a pure deterministic validator in the bridge — `war_eligibility(a, b, save_id)` →
+  `{eligible: bool, reason: str}`. Rules ported from #57: `EXCLUDED_FROM_WAR = {civilian, criminal, khaak,
+  player, smuggler, visitor, xenon}`; both factions must be known to the save (our faction table = "active");
+  neither in EXCLUDED. Plus `relation_move_ok(current, delta)` → clamps to engine scale [−1, +1] and reports if a
+  move is in-bounds (mirrors DeadAir's ±25). Place in a small `validators.py` (or memory method) + a public
+  `POST /v1/diplomacy/eligibility_selftest` route.
+- **Anti-cheat tie-in:** this is the gate #65 needs — ForceWar / chat→relation mutations must call
+  `war_eligibility` first and refuse if ineligible (no "declare war on the Xenon", no dragging the player into
+  auto-war, no minting a war between non-combatant factions).
+- **✅ DONE + VERIFIED LIVE (2026-06-26).** New pure module `bridge/diplomacy.py`: `EXCLUDED_FROM_WAR =
+  {civilian, criminal, khaak, player, smuggler, visitor, xenon}`, `war_eligibility(a,b,known)` →
+  `{eligible,reason}`, `relation_move_ok(cur,delta)` (clamp to [−1,+1]), `run_selftest()`. Wired into router
+  (`diplomacy_eligibility` + `diplomacy_eligibility_selftest`, using `memory.list_factions` for the active set)
+  and routed at `POST /v1/diplomacy/eligibility` + `…/eligibility_selftest`.
+- **3-gate verify:** (1) Forge = N/A (bridge-only). (2) Selftest **12/12** — sandbox import AND live endpoint
+  (the new routes hot-reloaded). (3) Live against the real save: argon↔split eligible; paranid↔xenon refused
+  ("xenon is excluded"); argon↔narnia refused ("not an active faction in this game").
+- **▶ UNBLOCKS #65:** ForceWar / chat→relation mutations can now call `war_eligibility` first and refuse the
+  illegal moves (declare-war-on-Xenon, drag-in-player, mint-war-between-non-combatants).
+
+#### ▶ SPEC #65 (PLAN 2026-06-26, workflow demo) — gate the war-causing relation mutation with `war_eligibility`
+**RECONCILE findings (before building):** "ForceWar" is NOT one thing. (a) `ai_influence_conversation.xml`
+`ForceWar_handler` = a hardcoded `[TEST] Declare war on me` dev cue (`set_faction_relation $A↔player -1.0`);
+plus a `[AI TEST]` hotkey in `proving.xml`. (b) The REAL autonomous war-mutation chokepoint is
+`scoring.validate_incident` (the Stage-3 disposer in `router.review_faction`): it gates legal-set / authority
+tier / confidence / cooldown / idempotency / confirmation — **but NOT faction eligibility**, so a hostility-class
+action toward khaak/xenon/player/non-combatant would pass. (c) The chat-driven `adjust_relation` path
+(`ai_influence_contract.xml` On_action) is a separate surface.
+- **Scope (one bounded unit):** add `diplomacy.war_eligibility` to `validate_incident` — for a hostility-class
+  action with a real target, REFUSE if not war-eligible (the pure EXCLUDED check needs no memory). Extend the
+  scoring selftest with eligibility cases. The chat path + the `[TEST]` dev cue are assessed in the SECOND-LAYER
+  PASS (cover or explicitly defer-with-reason — the `[TEST]` cue is a deliberate, marked dev tool, not LLM-reachable).
+- **Validate (cite):** sandbox unit (validate_incident declare_war split→khaak rejected, split→argon allowed);
+  dashboard DB feedback (live `strategic/selftest` or a review call shows the rejection reason). Forge = N/A.
+- **✅ DONE — IMPLEMENTED + VALIDATED + SECOND-LAYER REVIEWED (2026-06-26).**
+  - **Implement:** `scoring.validate_incident` now imports the pure `diplomacy` module and, for any `hostility`/
+    `peace`-class action with a real target, REFUSES (`status:"ineligible"`) if `war_eligibility(faction,target)`
+    fails — the Stage-3 disposer in `router.review_faction` is the live autonomous chokepoint. Selftest extended +4.
+  - **Validate (methods CITED):** (1) **Sandbox unit** — blocked by the known **bash-mount truncation** (the /tmp
+    copy of scoring.py was cut at line 407, past my edits); host file confirmed intact via the Read tool, so the
+    truncation is a mount artifact, not a real syntax error. (2) **Dashboard DB feedback / live endpoint** —
+    `GET /api/strategic/selftest` **22/22 ok**, the 4 new checks pass live (khaak rejected, player rejected,
+    peace-with-xenon rejected, split↔argon eligible-passes), nothing else broke. (3) Forge = N/A (bridge-only).
+  - **SECOND-LAYER PASS (coverage review vs the task's "chat→relation" wording):** RECONCILE named 3 surfaces;
+    my first cut covered only the autonomous one. Re-checked the others: the **chat→relation actions**
+    (`relation_delta_limited`, `faction_to_faction_proposal`, `temporary_diplomatic_flag`) are ALL in
+    `config/action_whitelist.json` → `disabled_until_tested`, so the chat path is **provably inert** today (no live
+    mutation possible). The **`[TEST]` ForceWar_handler** cue is a deliberate, `[TEST]`-marked dev tool (hardcoded
+    NPC↔player, not LLM/manipulation-reachable) — retained on purpose.
+  - **▶ FORWARD-GUARD (must-do when enabling chat diplomacy):** when any of those whitelisted relation actions is
+    moved out of `disabled_until_tested` (e.g. a future contract/diplomacy-chat task), it MUST route through
+    `diplomacy.war_eligibility` before mutating — same gate, different entry point. Logged so it's not forgotten.
+
+### ▶ PLAYER CONTRACTS / OFFERS (#59–#60) — NPC offers grounded in real world state
+#### ▶ SPEC #59 (PLAN 2026-06-26) — X4-native mission/offer TEMPLATE catalog
+**RECONCILE:** `contracts.py` = the mod↔bridge API envelope (NOT mission offers); the `agreements` table stores
+ACCEPTED deals; `mission_offer`/`trade_request` are whitelist-`disabled_until_tested`. **No offer-template catalog
+exists** (grep clean). So #59 is greenfield — build the catalog of shapes; #60 instantiates one against real data.
+- **Scope (one bounded unit):** new pure module `bridge/offers.py` — a catalog of X4-native offer templates, a
+  `render_offer(template_id, params)` that fills a template into a concrete offer dict, `list_templates()`, and
+  `run_selftest()`. Templates grounded in real X4 mission kinds: `supply_delivery` (Deliver Wares → a real
+  shortage, #60), `bounty` (Destroy target → an active conflict), `patrol` (Patrol → a contested sector),
+  `trade_buy`/`trade_sell` (Trade a ware). Each = `{id, kind, title, summary_template, required_params,
+  grounding (world-data source), reward_kind}`.
+- **Anti-cheat:** offers are PROPOSALS only (text/intent). Accepting/fulfilling + any reward is a SEPARATE gated
+  flow (reward must be EARNED, ties to #63) — explicitly OUT of #59/#60 scope.
+- **Validate (cite):** sandbox unit (`offers.run_selftest`), live endpoint (`POST /v1/offers/selftest`), host-
+  confirmed if the bash mount truncates. Forge = N/A (bridge-only).
+- **✅ DONE + VALIDATED + REVIEWED (2026-06-26).** New pure module `bridge/offers.py`: 5 X4-native templates
+  (`supply_delivery`=Deliver Wares, `bounty`=Destroy Target, `patrol`=Patrol, `trade_buy`/`trade_sell`=Trade);
+  `render_offer(template_id, params)` (fails loudly on missing required params — no placeholder offers leak),
+  `list_templates()`, `run_selftest()`. Routed: `POST /v1/offers/{list,render,selftest}`.
+  - **Validate (CITED):** **Sandbox unit** `offers.run_selftest` **8/8** (not truncated this run). **Live
+    endpoints** — `/v1/offers/selftest` **8/8**, `/list` 5 templates, `/render` bounty renders correctly, missing
+    params rejected ("missing required params: ware, amount"). Forge = N/A.
+  - **SECOND-LAYER PASS:** catalog covers the relevant X4-native kinds; each template carries a `grounding` source
+    so #60 can pull real data; render validates (missing/unknown). In-game surfacing of an offer is correctly
+    #60's scope (instantiate a real shortage + deliver via player_comms), not #59's. No partial-coverage gap.
+
+#### ▶ SPEC #60 (PLAN 2026-06-26) — economy-delivery contract: NPC asks player to supply a REAL shortage
+**RECONCILE:** `offers.render_offer('supply_delivery', …)` (#59) ✓; `memory.get_economy` gives live shortages
+(#54) ✓; `memory._ware_label` display names (#55) ✓; `memory.list_economy_stations` gives a real station for
+"where" ✓; the router's `player_comms` deque + `player_comms_prove`/`drain_player_comms` (#27) is the in-game
+surfacing channel (comm shape `{title, body, faction, faction_name, category, kind, save_id, ts}`). Nothing to
+rebuild — WIRE the existing pieces.
+- **Scope (one bounded unit):** `_build_supply_offer(save_id, faction_id="")` — pick the faction with the worst
+  real shortage (or the given one), take its top shortage ware, render `supply_delivery` with display name +
+  severity-scaled REQUEST quantity (text only) + a real captured station as "where" + a severity-banded reason;
+  return `{ok, faction, ware, severity, offer}` (NO enqueue, NO reward). `economy_supply_offer(payload)` wraps it
+  and ENQUEUES a player communiqué. `economy_supply_offer_selftest` seeds a synthetic shortage and asserts the
+  offer is grounded in it (selftest does NOT touch the live queue).
+- **Anti-cheat:** PROPOSAL only — the request quantity is text; no ware is moved, no reward minted. Fulfilment +
+  reward is the separate EARNED flow (#63), out of scope.
+- **Validate (cite):** sandbox/live `economy_supply_offer_selftest`; live `POST /v1/offers/supply` against the
+  real save → a concrete offer from a real shortage (e.g. argon Food Rations). Forge = N/A.
+- **✅ DONE + VALIDATED + REVIEWED (2026-06-26).** Router: `_build_supply_offer` (pure: picks the worst real
+  shortage, renders `supply_delivery` with display name + severity-scaled request quantity + a real station for
+  "where" + severity-banded reason), `economy_supply_offer` (wraps + enqueues a player communiqué),
+  `economy_supply_offer_selftest`. Routed `POST /v1/offers/{supply,supply_selftest}`.
+  - **Validate (CITED):** live `/v1/offers/supply_selftest` **7/7**; live `/v1/offers/supply` against the real
+    save → *"Argon Federation needs 8,584 Food Rations delivered to ARG Graphene Refinery I. Their stations are
+    critically short."* (real faction + real shortage + real station), `comm_enqueued:true`. Forge = N/A.
+  - **SECOND-LAYER PASS caught a real gap:** the first live run rendered "delivered to **Unknown Station**" (the
+    captured station name read back as a placeholder). Re-IMPLEMENTED the "where" fallback to skip empty/`Unknown*`
+    names (use the next real station, else "{faction} space"), added a `where_no_unknown_placeholder` selftest
+    check, and re-validated (7/7, leaks_unknown=false). Anti-cheat: PROPOSAL only — request quantity is text, no
+    ware moved, no reward minted (the EARNED fulfilment flow is #63).
+
+### ▶ SPEC #63 (PLAN 2026-06-26) — earned-economy: faction budget grounded in REAL owned stations
+**RECONCILE:** no budget/stockpile/credits field exists (grep clean). The MD economy branch (#64) gates on
+`$act.$earned=='true'` but NOTHING server-side validates ownership — its own comment names "#63" as the
+owned-budget draw. Canon (`Act_Of_Desperation.md:229`) names `GetSupplyBudget`/`GetTradeWareBudget` as the real
+in-game money primitives (future in-game capture, like #54). For NOW, derive a grounded budget from the REAL
+owned infrastructure already captured (#54): `capacity = station_count × PER_STATION × production_health`.
+- **Scope (one bounded unit):** a budget abstraction + the anti-cheat validator. `faction_budget` ledger table
+  (save_id, faction_id, spent, updated_at); `budget_capacity(save_id,fid)` (derived, grounded in real stations);
+  `budget_spent` / `record_budget_spend`; **`validate_earned_transfer(save_id, fid, cost)` → {earned, reason,
+  capacity, spent, remaining}** — earned=true ONLY if `capacity − spent ≥ cost`. Persistent spend tracking so a
+  faction can't re-spend the same budget (the cheat). Router `budget_status` + `earned_validate` endpoints +
+  selftest. **The `earned` marker is SERVER-set by this validator, never LLM-settable.**
+- **Anti-cheat:** "a faction can only give what it owns." The budget scales with REAL owned stations (#54), so
+  words≠resources holds. Real `GetSupplyBudget` in-game capture = documented follow-up (refines the derivation).
+- **Validate (cite):** sandbox/live `earned_validate_selftest` (afford within capacity True; over-capacity False;
+  spend then re-check refuses re-spend); live `POST /v1/economy/earned_validate` against the real save. Forge N/A.
+- **✅ DONE + VALIDATED + REVIEWED (2026-06-26).** memory: `faction_budget` ledger table + `budget_capacity`
+  (= station_count × PER_STATION(250k) × production_health — grounded in REAL #54 stations), `budget_spent`,
+  `record_budget_spend`, `validate_earned_transfer(save, fid, cost, commit)` (earned ONLY if capacity−spent≥cost;
+  commit debits so it can't be re-spent). Router `budget_status` + `earned_validate` + `earned_validate_selftest`;
+  routed `POST /v1/economy/{budget_status,earned_validate,earned_validate_selftest}`.
+  - **Validate (CITED):** live `earned_validate_selftest` **5/5** (capacity-from-real-stations, affordable,
+    over-capacity refused, cannot-re-spend-drained-budget, no-capacity-no-spend); live `budget_status` argon
+    capacity **6,241,000** (153 stations × health), `earned_validate` 1M→earned, 999B→refused
+    ("exceeds the faction's owned capacity"). Fixed a selftest bug en route (the ledger reset floored negatives to
+    0 → switched to a unique per-run save_id, the established selftest pattern). Forge = N/A.
+  - **SECOND-LAYER PASS — forward-items logged (not core gaps):** (1) credits budget done; a *ware* STOCKPILE is a
+    follow-up IF ware-reward offers (`trade_buy`) get enabled. (2) Real `GetSupplyBudget` in-game capture (Lua,
+    like #54) will refine the derivation later. (3) **FORWARD-WIRE:** when a contract-fulfilment flow is built, it
+    MUST call `validate_earned_transfer(commit=True)` BEFORE any `type:'economy' earned:'true'` dispatch — the
+    `earned` marker is server-set by this validator, never LLM-settable (closes the #64 dormant-branch loop).
+
+### ▶ GAMEPLAY CHANGES DOC — reconciled build plan (Ken's uploaded doc, 2026-06-26)
+**RECONCILE (most of the doc is ALREADY built):** war-state phases ✅(#41/43/44), event priority hierarchy
+✅(#40), local-assignment-facts ✅(#42), live economy→shortages ✅(#54-56), economy contracts ✅(#60),
+Kha'ak/Xenon excluded from normal war ✅(#58), world-event clustering into arcs ✅(Narrator #38), agreements
+table+CRUD ✅(exist, but unpopulated). **Genuinely MISSING (build order per the doc's own "blunt priority"):**
+- **G1 — Patrol/escort/defense contracts from contested sectors** (doc #3, "fastest route to AI gives me real
+  work"). The war-pressure analog of #60: pick a real `sectors.contested_by` sector → render the `patrol` offer
+  (#59) → enqueue a player communiqué. ← BUILD FIRST.
+- **G2 — Player role classification** (supplier/mercenary/mediator/war-profiteer/faction-friend/threat…) derived
+  from stored conversations/influence/contracts/relationships, so factions react differently.
+- **G3 — Kha'ak/Xenon differentiated behavior** (raids/hive/swarm vs expansion/machine/incursion vs normal
+  diplomacy) — they're excluded from normal war (#58) but have no distinct event family yet.
+- **G4 — Two summary modes** (memory-AUDIT summary distinct from in-character recap) + stronger fact promotion.
+- **G5 — Agreements GENERATOR** (the lane exists but is empty: ceasefire/NAP/trade-pact/transit-rights/patrol-
+  cooperation as real gameplay objects).
+
+#### ▶ SPEC G1 (PLAN 2026-06-26) — patrol/defense contract from a REAL contested sector
+**RECONCILE:** `offers.render_offer('patrol', {faction, where, threat})` ✅(#59); `memory.list_sectors` returns
+`name/owner_faction/contested_by[]/strategic_value/player_assets_present` ✅(#3/#4); `_build_supply_offer` +
+`player_comms` enqueue pattern ✅(#60). WIRE them — no new infra.
+- **Scope (one bounded unit):** `_build_patrol_offer(save_id, faction_id="")` — pick the best contested sector
+  (prefer player_assets_present, then strategic_value, then most contesters) with an owner + contesters; render
+  `patrol` with owner=faction, sector=where, first-contester=threat; return `{ok, sector, owner, threat, offer}`
+  (no enqueue/reward). `sector_patrol_offer(payload)` wraps + enqueues a communiqué. `sector_patrol_offer_selftest`
+  seeds a synthetic contested sector and asserts grounding. Routed `POST /v1/offers/{patrol,patrol_selftest}`.
+- **Anti-cheat:** PROPOSAL only (text), no reward minted.
+- **Validate (cite):** live `patrol_selftest`; live `/v1/offers/patrol` against the real save → a concrete patrol
+  offer from a real contested sector. Forge = N/A.
+- **✅ DONE + VALIDATED + REVIEWED (2026-06-26).** Router `_build_patrol_offer` (pure: ranks contested sectors by
+  player_assets_present > strategic_value > #contesters, renders the `patrol` offer), `sector_patrol_offer`
+  (wraps + enqueues a communiqué), `sector_patrol_offer_selftest`. Routed `POST /v1/offers/{patrol,patrol_selftest}`.
+  - **Validate (CITED):** live `patrol_selftest` **7/7** (targets the most-pressing sector, owner/kind/grounding,
+    no reward, no-contested→no-offer); live `/v1/offers/patrol` → *"Teladi Company asks you to patrol Profit
+    Center Alpha, contested by Xenon."* (real contested sector, `comm_enqueued:true`). Forge = N/A.
+  - **SECOND-LAYER PASS:** headline patrol contract from a real contested sector delivered; anti-cheat proposal-
+    only. ◐ Follow-on (extends the #59 catalog, not G1's scope): escort-convoy / scan-activity / deploy-
+    satellites/lasertowers / evacuate templates (bounty already ≈ "destroy raiders").
+
+#### ▶ SPEC G2 (PLAN 2026-06-26) — player role classification (factions react to WHO the player is)
+**RECONCILE:** no `classify_player` exists (greenfield); all signals stored — `relationships` (faction→player
+trust/resentment/standing), `economy.dependency_on_player`, `player_market.supplying_enemies`, `agreements`
+(player-brokered), `conflicts`. WIRE them into a deterministic classifier.
+- **Scope (one bounded unit):** `classify_player_role(save_id)` (pure-ish derive) → `{primary_role, role_tags[],
+  per_faction:{fid: friend|threat|neutral}}` from the stored signals: supplying factions at war → "war profiteer";
+  ≥2 high `dependency_on_player` → "supplier"; player-brokered ceasefire/pact → "mediator"; high trust & no
+  threats → "faction friend"; high resentment/at-war → "faction threat"; else "unaligned newcomer". Endpoint
+  `POST /v1/player/role` + selftest. Surface ONE line into `build_faction_briefing` ("The Commander is regarded
+  here as a …") so factions react in-character.
+- **Validate (cite):** live `player_role_selftest` (seed signals → assert role); live `/v1/player/role` on the
+  real save. Forge = N/A.
+- **✅ DONE + VALIDATED + REVIEWED (2026-06-26).** `memory.classify_player_role(save_id)` (deterministic over
+  relationships/economy/player_market/agreements) → `{primary_role, role_tags, friends, threats, per_faction, …}`;
+  one reputation line surfaced in `build_faction_briefing`. Routed `POST /v1/player/{role,role_selftest}`.
+  - **Validate (CITED):** live `player_role_selftest` **5/5** (newcomer/supplier/war-profiteer-primary/threat/
+    friend); live `/v1/player/role` on the real save → primary "faction threat" w/ threats `[alliance, argon]`.
+  - **SECOND-LAYER PASS caught + fixed a real bug:** the first live run listed khaak/xenon as "threats," inflating
+    the role — but being at war with them is UNIVERSAL, not a player choice. Excluded the engine-permanent/non-
+    combatant set (mirrors `diplomacy.EXCLUDED_FROM_WAR`); re-validated (threats now `[alliance, argon]`, 5/5).
+
+### ▶ SPEC 2c / #39 — NPC↔NPC social relationship graph (✅ DONE bridge foundation, 2026-06-26)
+**Intent (Ken's uploaded docs — "Bannerlord Feature Translation §3" + "Codex_Feedback2 §relationships"):** a
+FIRST-CLASS NPC social graph, EXPLICITLY separate from faction diplomacy ("faction = political; NPC =
+social/emotional; don't overload one table"). Emotional SCORES + narrative STATUS + EVIDENCE; **changes come ONLY
+from social EVENTS, never faction projection or LLM whim**; romance is a PROGRESSION, not a boolean; §7 restraint
+(not universal romance).
+- **⚠ COURSE-CORRECTION (Ken caught it):** my first cut projected faction relations onto NPCs
+  (`seed_social_from_world`: same-faction→colleague, factions-at-war→rivalry) + a thin `affinity`/`romantic`
+  schema. That was faction relationships in NPC clothing — the exact anti-pattern the docs warn against. Rebuilt
+  to the spec before closing.
+- **Built (corrected):** `social_relations(save_id, subject_npc, object_npc, status, relationship_type, trust,
+  affection, resentment, fear, loyalty, rivalry, debt, attraction, publicity, evidence_json)` — all 14 doc edge
+  fields. `SOCIAL_EVENTS` map (all 8 doc events: saved_life, abandoned_in_combat, served_together, shared_secret,
+  public_insult, betrayal, repeated_conversations, player_mediation + flirtation/rebuff/bereavement).
+  `apply_social_event(...)` = THE driver (mutates scores, appends evidence, re-derives status — the only
+  sanctioned change path). `_advance_social_status` = pure scalars→narrative status (strangers..close
+  friends..rivals..enemies..mentor + romance progression private_attraction→flirtation→confession_pending→
+  courting→partners→grieving), **romance GATED on attraction AND affection** (§7 restraint).
+  `social_edge_brief` = the in-character edge injected when subject talks ABOUT object (scores→English, evidence
+  "you remember…", no raw numbers — Codex's example). Routed `POST /v1/social/{list,event,edge_brief,selftest}`.
+  One-time guarded migration drops the stale-schema table (no real data) so the new schema recreates.
+- **Validate (CITED):** live `/v1/social/selftest` **10/10** (status gating, attraction-alone-≠-romance,
+  event-moves-scores, evidence recorded, romance-is-a-state-not-boolean, edge-brief-has-no-numbers, unknown-event
+  + self-edge rejected); live event demo → edge brief *"You know B personally — your relationship: crewmates; you
+  trust them somewhat. You remember: pulled wounded crew from the wreck."* (served_together+saved_life). The
+  schema migration ran live. Forge = N/A (bridge-only).
+- **SECOND-LAYER PASS — coverage vs the doc:** all 14 edge fields ✓, all 8 doc events ✓, status machine ✓,
+  romance-as-progression ✓, evidence ✓, prompt-injection edge-brief ✓, §7 restraint ✓. **◐ Deferred (need
+  previous-status tracking for backward arcs):** the decay/end states `curiosity / strained / separated /
+  ex-partners` — modelling a relationship cooling DOWN needs history the pure status-deriver doesn't carry;
+  logged rather than half-built.
+- **▶ Follow-ups (bridge-foundation-first scope, not this unit):** wire `social_edge_brief` into the live NPC
+  prompt when one NPC references another; feed `apply_social_event` from real in-game events (who saved whose
+  life — like #66 combat capture); a dashboard social panel.
 
 ### ▶ SPEC 3.3 — WAR-PHASE ACTUATION (Ken: "build A then go for B", 2026-06-26) — IN PROGRESS
 Closes Codex's open gap above. Two depths, A first as the substrate for B:

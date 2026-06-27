@@ -31,6 +31,11 @@ from __future__ import annotations
 import time
 from typing import Any, Optional
 
+try:  # #65: war/peace eligibility gate (pure module, keeps scoring stdlib-only + DB-agnostic)
+    from . import diplomacy as _diplomacy
+except ImportError:  # pragma: no cover - non-package execution
+    import diplomacy as _diplomacy  # type: ignore
+
 # --- Weights (tunable per performance profile) -------------------------------
 DEFAULT_WEIGHTS: dict[str, float] = {
     "military_pressure": 0.30,
@@ -235,6 +240,13 @@ def validate_incident(
         return fail("action is not in the current legal option set")
     if npc_tier is not None and not action_allowed_for_tier(action, npc_tier):
         return fail(f"action '{action}' exceeds the proposer's authority tier {npc_tier}")
+    # #65 anti-cheat: a war/peace move must be between WAR-ELIGIBLE factions — NEVER the engine-permanent
+    # hostiles (khaak/xenon), the player, or non-combatant background factions (civilian/criminal/smuggler/
+    # visitor). Pure EXCLUDED check (no DB) ported from DeadAir DynamicWars; see bridge/diplomacy.py.
+    if cls in ("hostility", "peace") and target:
+        _elig = _diplomacy.war_eligibility(faction_id, target)
+        if not _elig.get("eligible"):
+            return fail(f"war/peace move is ineligible — {_elig.get('reason')}", status="ineligible")
     try:
         conf = float(confidence)
     except (TypeError, ValueError):
@@ -400,6 +412,17 @@ def run_scoring_selftest() -> dict:
     # authority: tier-0 proposing hostility → rejected
     va = validate_incident(ESCALATE, "split", "argon", legal_actions=legal, confidence=0.5, npc_tier=0)
     check("stage3_authority_rejected", not va["ok"], str(va))
+
+    # #65 anti-cheat: war/peace move toward an EXCLUDED faction is refused (status 'ineligible').
+    legal_h = [DIALOGUE, DEFENSIVE, ESCALATE]
+    ve_khaak = validate_incident(ESCALATE, "split", "khaak", legal_actions=legal_h, confidence=0.5)
+    check("stage3_ineligible_khaak_rejected", (not ve_khaak["ok"]) and ve_khaak["status"] == "ineligible", str(ve_khaak))
+    ve_player = validate_incident(ESCALATE, "split", "player", legal_actions=legal_h, confidence=0.5)
+    check("stage3_ineligible_player_rejected", (not ve_player["ok"]) and ve_player["status"] == "ineligible", str(ve_player))
+    ve_peace = validate_incident(CEASEFIRE, "split", "xenon", legal_actions=[DIALOGUE, CEASEFIRE], confidence=0.5)
+    check("stage3_ineligible_peace_with_xenon_rejected", (not ve_peace["ok"]) and ve_peace["status"] == "ineligible", str(ve_peace))
+    ve_ok = validate_incident(ESCALATE, "split", "argon", legal_actions=legal_h, confidence=0.5)
+    check("stage3_eligible_pair_passes", ve_ok["ok"], str(ve_ok))
 
     ok = all(c["ok"] for c in checks)
     return {"ok": ok, "passed": sum(c["ok"] for c in checks), "total": len(checks), "checks": checks}
