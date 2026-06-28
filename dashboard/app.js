@@ -216,6 +216,23 @@ async function showNpc(npcKey) {
     </div>
   `).join("") || `<div class="dim">No durable facts yet (condensation triggers once the raw window overflows).</div>`;
 
+  // M7: memory-audit integrity view — durable count + the high-value turns NOT yet promoted (the
+  // "talks a lot, stores few" gap, per-NPC; A4's auto-promotion keeps candidates small during play).
+  try {
+    const audit = await getJson("/v1/memory/audit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ npc_key: npcKey }) });
+    const cands = audit.promotion_candidates || [];
+    document.getElementById("npcAudit").innerHTML = `
+      <div class="auditHead"><strong>Memory audit</strong> —
+        <span class="ok">${esc(audit.durable_fact_count || 0)} durable</span> ·
+        <span class="${audit.promotion_candidate_count ? "warn" : "dim"}">${esc(audit.promotion_candidate_count || 0)} not yet promoted</span></div>
+      ${cands.map((c) => `
+        <div class="fact ${tierClass(c.tier)}">
+          <div class="factTop"><span class="badge ${tierClass(c.tier)}">${esc(c.tier)}</span><span class="badge">${esc(c.category)}</span><span class="badge">${esc(c.role)}</span></div>
+          <div class="factText">${esc(c.text)}</div>
+        </div>`).join("")}
+    `;
+  } catch (e) { const el = document.getElementById("npcAudit"); if (el) el.innerHTML = ""; }
+
   const turns = data.turns || [];
   document.getElementById("npcTurnsHead").style.display = turns.length ? "block" : "none";
   document.getElementById("npcTurns").innerHTML = turns.map((t) => `

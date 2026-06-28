@@ -309,6 +309,14 @@ L=heavy in-game UI/gated. Each closes with named validation (`:8713` selftest/en
   history. Continuity becomes VISIBLE. **Soft dependency:** pairs with A4 (facts gap) — a thin book undersells;
   do A4 first or together. Dashboard-first is S, in-game panel is M. **Validate:** book renders an NPC's real
   facts (Chrome / in-game).
+  - **✅ DONE 2026-06-28 (dashboard slice [S]), dashboard-validated.** Reconcile: `showNpc` ALREADY renders durable
+    facts/turns/persona — so M7's delta is the memory-AUDIT integrity view (A4-deferred). DELIVERED: `npcAudit`
+    panel (index.html) + `showNpc` fetches `/v1/memory/audit` (source-confirmed shape: `durable_fact_count` +
+    `promotion_candidates[{category,tier,role,text}]`) → renders "N durable · M not yet promoted" + the unpromoted
+    candidates. VALIDATED via Claude-in-Chrome (after app reset cleared the browser-permission glitch): drove
+    `showNpc('game_258932640|reaction|Kha'ak High Command')` → section showed **"6 durable · 2 not yet promoted"**
+    + the 2 candidate turns with tier/category/role badges. In-game Memory Book PANEL [M] = separate deferred scope
+    (this dashboard observer view has no in-game player surface → in-game gate N/A).
 
 **Tier 3 — gated (sequence behind in-game capture / UI work, NOT this pass):**
 - **M8 — Negotiation accept→real-effect [observed, doc H].** NPC offer → player-acceptable proposal → real
