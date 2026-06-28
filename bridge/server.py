@@ -91,6 +91,24 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/memory/selftest":
             self._send_json(200, self.router.memory_selftest())
             return
+        if parsed.path == "/api/identity/selftest":
+            self._send_json(200, self.router.npc_identity_selftest())
+            return
+        if parsed.path == "/api/identity/rebind_selftest":
+            self._send_json(200, self.router.npc_rebind_selftest())
+            return
+        if parsed.path == "/api/identity/promotion_selftest":
+            self._send_json(200, self.router.npc_promotion_selftest())
+            return
+        if parsed.path == "/api/identity/backfill":
+            self._send_json(200, self.router.identity_backfill())
+            return
+        if parsed.path == "/api/identities":
+            self._send_json(200, self.router.identities_list())
+            return
+        if parsed.path == "/api/identity":
+            self._send_json(200, self.router.identity_detail(query.get("persistent_npc_key", [""])[0]))
+            return
         if parsed.path == "/api/lore/selftest":
             self._send_json(200, self.router.lore_selftest())
             return
@@ -468,6 +486,11 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
             "/v1/social/selftest": self.router.social_selftest,
             "/v1/wares_harvest": self.router.wares_harvest,
             "/v1/ensure_canon": self.router.ensure_canon,
+            # EPIC I: identity rebind + promotion (payload-bearing POSTs)
+            "/v1/identity/rebind": self.router.identity_rebind,
+            "/api/identity/rebind": self.router.identity_rebind,
+            "/v1/identity/promote": self.router.identity_promote,
+            "/api/identity/promote": self.router.identity_promote,
         }
         if parsed.path in substrate_post:
             try:

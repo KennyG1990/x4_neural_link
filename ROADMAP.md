@@ -1,5 +1,70 @@
 # X4 Neural Link + AI Influence Roadmap
 
+## ★★★ EPIC I — SYNTHETIC PERSISTENT NPC IDENTITY LAYER (spec'd 2026-06-28, Ken) — Neural Link becomes the identity authority
+
+**Why:** the NPC-identity investigation (#99/#102) PROVED X4 exposes no stable cross-reload identity for generic
+crew — runtime `raw` and save `<component id>` are the same volatile UniverseID in hex (Manda: 134465819→236456014
+across one reload), idcode empty. **Decision (Ken): do NOT downgrade richness — make the MOD the identity authority.**
+X4 handles become evidence/session-routing only; NPCs are re-identified each session by deterministic evidence
+scoring. Full design: **[[../../../StarForge/wiki/x4-neural-link/npc-identity-layer-spec]]** (`F:\StarForge\wiki\x4-neural-link\npc-identity-layer-spec.md`).
+
+**RECONCILE (already exists → extend, don't rebuild):** `npcs` table already holds name/faction/role/race/gender/
+ship_class/ship_name/sector/skills/stats/summary + unused `bound_entity_id`; `facts`(tier/importance), `turns`,
+`relationships`(social #39/#76), persona/archetype (#37), RoleRAG (#16/31-33), census scaffold (#98, dormant). The
+NEW work: a **handle-independent `persistent_npc_key`** (current `make_key=save_id|game_id|persona` WRONGLY embeds
+save_id), an evidence table + scoring/rebind, importance tiers + promotion, confidence-gated dialogue, the identity
+dashboard, player soft-confirm. **Keystone/risk:** re-keying facts/turns/relationships off the save_id-embedded key
+(reversible, selftested migration). **Anti-cheat:** observe + memory only; no world mutation, no resources.
+
+**Phases (status: spec'd):**
+- **I0** — schema + handle-independent key + resolution layer [bridge]. **✅ DONE 2026-06-28.** Added
+  `npc_identities` + `npc_identity_evidence` + `npc_runtime_bindings` + `npcs.persistent_key`;
+  `derive_persistent_key` (handle-independent — excludes runtime/save id), `upsert_identity`/`set_identity_fields`
+  (I2/I3 lifecycle writer), `record_evidence`, `bind_runtime`/`expire_session_bindings` (reload flow),
+  `resolve_memory_keys` (cross-reload memory UNION — facts/turns NOT re-keyed → reversible), idempotent
+  `backfill_identities`. Endpoints `/api/identity/{selftest,backfill}`, `/api/identities`, `/api/identity`.
+  **Validated:** bridge `identity/selftest` **13/13** live; backfill on live DB = 19 npc rows → 13 identities
+  (6 collapsed = dedup/union); detail returns evidence + memory keys. Pure backend, in-game gate N/A.
+- **I1** — in-game evidence capture (conversation NPC) [MD/Lua + bridge]. **◐ in-game-grounded + bind proven;
+  hands-free auto-rebind pending bridge restart.** GROUNDED in-game (talked to Manda): runtime-readable person
+  fields = **macro** (`character_argon_female_asi_crew_01_macro`) + sector + skills + name + owner; **NOT** readable
+  = idcode/code/class/commander (so the unique code stays save-only — binding remains evidence-scored, as the spec
+  premised). DELIVERED: aic_uix.lua stashes macro/sector + folds into context; aic_menu sends it via
+  prompt_vars→`request.metadata`; `npc_complete` calls `rebind_session` each exchange (reads macro from metadata,
+  base evidence from the stored row). **PROVEN live:** feeding Manda's REAL in-game macro to `/v1/identity/rebind`
+  → **bound, conf 1.0, tier 1, macro evidence** on `pid:40f717bb500f`. **REMAINING:** auto-fire on chat needs a
+  bridge PROCESS restart (player2_client is a held instance, not hot-reloaded) → then one chat confirms hands-free.
+  Note: the station-NPC census accessor is NOT needed for the conversation NPC (that's I6/#98).
+- **I2** — scoring + `rebind_session` engine [bridge]. **✅ DONE 2026-06-28.** `score_identity` (spec weights:
+  name/faction/role/macro/npc_code/skill_vector/container/sector/recently-talked/same-session-id; penalties:
+  name+diff-faction −0.40, name+diff-role+macro −0.25; faction normalized via resolve_faction_id) +
+  `rebind_session` (≥0.80 bound · ≥0.60 tentative · ≥0.40/near-tie ambiguous→fresh `:amb` key, never merges ·
+  else new; links session npc_key→identity, records evidence, writes runtime binding). Endpoints
+  `/api/identity/rebind_selftest`, `/api/identity/rebind`. **Validated:** rebind selftest **7/7** live — incl. the
+  keystone *reload rebinds + memory unions across the reload*, dup-name/diff-faction not merged, near-tie→ambiguous,
+  brand-new→new. Pure backend, in-game gate N/A. **◐ deferred:** spec "long time gap" penalty (−0.10..−0.30) —
+  needs a game-time model; logged, not built.
+- **I3** — importance tiers (0–3) + promotion rules [bridge]. **✅ DONE 2026-06-28.** `importance_tier` lifecycle
+  on `npc_identities` (0 abstraction · 1 player-significant · 2 local · 3 background); `promote_identity`
+  (idempotent, never demotes) + `promote_identity_for_npc` (npc_key→identity bridge); `record_turn` hook promotes
+  to Tier 1 on any conversation (covers talk/mission/negotiate + the 2+-memories case); `PROMOTION_TIER` maps all
+  spec triggers; endpoints `/api/identity/promotion_selftest`, `/api/identity/promote`. **Validated:** promotion
+  selftest **7/7** live (talk→1, never-demote, event→2, abstraction→0, unknown/unlinked no-op). Pure backend,
+  in-game gate N/A. **◐ deferred:** wiring promote calls into non-conversation event sources (news/social/
+  relationship/assignment handlers) — API ready, conversation path live.
+- **I4** — confidence-gated dialogue + RoleRAG layering [bridge; dialogue half in-game gated].
+- **I5** — dashboard identity panel + "why bound?" evidence [dashboard]. **✅ DONE 2026-06-28.** `npcIdentity`
+  section in `showNpc` fed by enriched `/api/identity` (identity + evidence + memory_keys + bindings +
+  name_collisions). Shows status (color-coded), tier+label, confidence, persistent key, runtime id, memory-link
+  count (cross-reload), evidence count, **last seen**, conditional collision warning, and the **"why bound?"**
+  evidence breakdown. **Validated (Chrome, live):** Manda → "SESSION-ONLY · TIER 3 background · CONF 100% · key
+  pid:40f717bb500f · 1 memory link · evidence 4 · last seen 18m ago · why bound? faction/name/role/skill_vector".
+  Dashboard observer surface → Chrome render is its bar; in-game gate N/A.
+- **I6** — throttled census priority order [extends #98, in-game gated].
+- **I7** — player soft-confirmation path (guarded, anti-abuse) [bridge; in-game gated].
+- **Build order:** I0 → I2 → I3 → I5 (verifiable now) → I1 → I4 → I6 → I7 (need in-game accessor / player surface).
+
+
 **Status:** backend ✅ · **conversation → real gamestate change LIVE + verified in-game ✅** (declare war in
 chat → X4 relation flips → factions fight) · world-model sync ✅ (relations + Tier-1 conflicts/events/
 agreements) · **readers all live-verified ✅** (skills, sectors, economy, fleet census, war-losses,

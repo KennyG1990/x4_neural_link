@@ -12,7 +12,8 @@ from .contracts import ContractError, NeuralRequest, NeuralResponse
 from .events import EventQueue
 from .memory import (
     MemoryStore, run_memory_selftest, run_memory_stress,
-    run_universe_selftest, run_full_stress,
+    run_universe_selftest, run_full_stress, run_npc_identity_selftest,
+    run_npc_rebind_selftest, run_npc_promotion_selftest,
 )
 from .player2_client import Player2Client
 from .telemetry import BridgeTelemetry
@@ -205,6 +206,58 @@ class NeuralRouter:
 
     def memory_selftest(self) -> dict[str, Any]:
         return run_memory_selftest()
+
+    # --- EPIC I (I0): persistent NPC identity layer ---------------------------
+    def npc_identity_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for the identity foundation (handle-independent key, evidence,
+        bindings, backfill, cross-reload memory resolution). No live data touched."""
+        return run_npc_identity_selftest()
+
+    def npc_rebind_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for I2 scoring + per-session rebind (cross-reload re-identify)."""
+        return run_npc_rebind_selftest()
+
+    def npc_promotion_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for I3 importance-tier promotion."""
+        return run_npc_promotion_selftest()
+
+    def identity_promote(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Promote an identity's tracking priority. payload: {persistent_npc_key|npc_key, reason}."""
+        payload = payload or {}
+        reason = str(payload.get("reason") or "")
+        if payload.get("npc_key"):
+            tier = self.memory.promote_identity_for_npc(str(payload["npc_key"]), reason)
+        else:
+            tier = self.memory.promote_identity(str(payload.get("persistent_npc_key") or ""), reason)
+        return {"ok": tier is not None, "importance_tier": tier}
+
+    def identity_rebind(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Rebind a batch of observed runtime NPCs to persistent identities for a game session.
+        payload: {game_session_id, save_id?, observed:[{runtime_component_id, npc_key, name, faction,
+        role, macro, npc_code, skills, ship_id?, station_id?, sector?, recently_talked?}]}."""
+        payload = payload or {}
+        return self.memory.rebind_session(
+            str(payload.get("game_session_id") or ""),
+            payload.get("observed") or [],
+            save_id=str(payload.get("save_id") or ""),
+        )
+
+    def identity_backfill(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Give every existing npcs row a persistent identity (idempotent + reversible)."""
+        return self.memory.backfill_identities()
+
+    def identities_list(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {"ok": True, "identities": self.memory.list_identities()}
+
+    def identity_detail(self, persistent_npc_key: str = "") -> dict[str, Any]:
+        ident = self.memory.get_identity(persistent_npc_key) if persistent_npc_key else None
+        if not ident:
+            return {"ok": False, "error": "identity not found", "persistent_npc_key": persistent_npc_key}
+        return {"ok": True, "identity": ident,
+                "evidence": self.memory.get_evidence(persistent_npc_key),
+                "memory_keys": self.memory.resolve_memory_keys(persistent_npc_key),
+                "bindings": self.memory.get_runtime_bindings(persistent_npc_key),
+                "name_collisions": self.memory.count_name_collisions(ident.get("display_name", ""), exclude=persistent_npc_key)}
 
     def memory_metrics(self, npc_key: str | None = None) -> dict[str, Any]:
         return self.memory.metrics(npc_key)

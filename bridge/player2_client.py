@@ -872,7 +872,7 @@ class Player2Client:
         # X4 NPC stats (crew skills, role, race, ship assignment) attached to this
         # NPC. Accept a whole `stats` dict, or individual stat fields on target.
         npc_stats: dict[str, Any] = dict(request.target.get("stats")) if isinstance(request.target.get("stats"), dict) else {}
-        for field in ("race", "role", "gender", "ship_class", "ship_name", "sector", "skills"):
+        for field in ("race", "role", "gender", "ship_class", "ship_name", "sector", "skills", "macro"):
             value = request.target.get(field)
             if value is not None and field not in npc_stats:
                 npc_stats[field] = value
@@ -1010,6 +1010,31 @@ class Player2Client:
                 self.memory.record_turn(npc_key, "user", sender_message)
                 self.memory.record_turn(npc_key, "assistant", message)
                 self.memory.condense_if_needed(npc_key)
+                # I1/I2 (2026-06-28): re-identify this conversation NPC against the persistent identity
+                # layer from the evidence we have (name+faction+role+skills, + macro/sector when the UI
+                # captured them). macro is the corroborator that lifts a re-encountered NPC tentative→bound,
+                # so memory survives a reload (#99). Advisory — never break a reply over identity bookkeeping.
+                try:
+                    _row = self.memory.get_npc(npc_key) or {}
+                    # The UI chat sends evidence in prompt_vars (full_context) → request.METADATA, not target
+                    # (aic_menu.lua SendToBridge). So read macro/sector/runtime from metadata first, with
+                    # target + the stored row as fallbacks. macro is the corroborator that lifts tentative→bound.
+                    _meta = request.metadata if isinstance(request.metadata, dict) else {}
+                    self.memory.rebind_session(save_id or "live", [{
+                        "npc_key": npc_key,
+                        "runtime_component_id": str(request.target.get("runtime_component_id") or _meta.get("runtime_component_id") or request.target.get("component") or ""),
+                        # Base evidence from the stored row (indexing populates name/faction/role/skills),
+                        # overlaid with fresh chat evidence (macro/sector) from the UI.
+                        "name": _row.get("name") or persona.get("name") or "",
+                        "faction": _row.get("faction_id") or fac,
+                        "role": _row.get("role") or npc_stats.get("role") or "",
+                        "macro": request.target.get("macro") or _meta.get("macro") or npc_stats.get("macro") or _row.get("macro") or "",
+                        "sector": npc_stats.get("sector") or _meta.get("sector") or _row.get("sector") or "",
+                        "skills": _row.get("skills") or npc_stats.get("skills"),
+                        "recently_talked": True,
+                    }], save_id=save_id)
+                except Exception:
+                    pass
                 # Rolling TOPIC summary for long-range continuity. Every 4 turns (to bound LLM calls):
                 # re-summarize recent turns into a thematic gist stored on the NPC (auto-injected by
                 # build_memory_context as "What you remember overall").

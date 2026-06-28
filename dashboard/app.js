@@ -204,6 +204,45 @@ async function showNpc(npcKey) {
   // SPEC 2a: the situated PersonaCard (archetype + AUTHORITY + concerns + can/cannot), consolidated on the sheet.
   renderPersonaCard(npc);
 
+  // I5: persistent IDENTITY panel — the spec's "why bound?" + binding status. The identity survives reloads
+  // even though X4's runtime component id does not (#99); fed by /api/identity via the npc's persistent_key.
+  (async () => {
+    const el = document.getElementById("npcIdentity");
+    if (!el) return;
+    const pkey = npc.persistent_key;
+    if (!pkey) { el.innerHTML = `<div class="dim">No persistent identity yet — run identity backfill or a session rebind.</div>`; return; }
+    try {
+      const idr = await getJson(`/api/identity?persistent_npc_key=${encodeURIComponent(pkey)}`);
+      if (!idr.ok) { el.innerHTML = ""; return; }
+      const id = idr.identity || {};
+      const ev = idr.evidence || [];
+      const TIERS = ["faction-abstraction", "player-significant", "local-important", "background"];
+      const tier = (id.importance_tier != null ? id.importance_tier : 3);
+      const statusClass = ({ bound: "ok", tentative: "warn", ambiguous: "warn" })[id.status] || "dim";
+      const conf = (id.identity_confidence != null) ? Math.round(id.identity_confidence * 100) + "%" : "—";
+      const rt = (idr.bindings && idr.bindings[0] && idr.bindings[0].runtime_component_id) || npc.npc_id || "—";
+      const collisions = idr.name_collisions || 0;
+      const memN = (idr.memory_keys || []).length;
+      const seenTs = (idr.bindings && idr.bindings[0] && idr.bindings[0].seen_at) || id.updated_at;
+      const ago = (() => {
+        const t = +seenTs; if (!t) return "—";
+        const d = Math.max(0, Date.now() / 1000 - t);
+        if (d < 60) return "moments ago"; if (d < 3600) return Math.floor(d / 60) + "m ago";
+        if (d < 86400) return Math.floor(d / 3600) + "h ago"; return Math.floor(d / 86400) + "d ago";
+      })();
+      el.innerHTML = `
+        <div class="identHead"><strong>Identity</strong>
+          <span class="badge ${statusClass}">${esc(id.status || "session-only")}</span>
+          <span class="badge">tier ${esc(tier)} · ${esc(TIERS[tier] || "")}</span>
+          <span class="badge">conf ${esc(conf)}</span>
+          ${collisions ? `<span class="badge warn">⚠ ${esc(collisions)} same-name collision${collisions > 1 ? "s" : ""}</span>` : ""}
+        </div>
+        <div class="identMeta dim">key <code>${esc(id.persistent_npc_key)}</code> · runtime <code>${esc(rt)}</code> · ${esc(memN)} memory link${memN === 1 ? "" : "s"} (cross-reload) · evidence ${esc(ev.length)} · last seen ${esc(ago)}</div>
+        ${ev.length ? `<div class="identWhy"><span class="label">why bound?</span> ${ev.map((e) => `<span class="badge">${esc(e.evidence_type)}: ${esc(e.value)}${e.weight ? ` <span class="dim">+${esc(e.weight)}</span>` : ""}</span>`).join(" ")}</div>` : ""}
+      `;
+    } catch (e) { el.innerHTML = ""; }
+  })();
+
   document.getElementById("npcFacts").innerHTML = (data.facts || []).map((f) => `
     <div class="fact ${tierClass(f.tier)}">
       <div class="factTop">

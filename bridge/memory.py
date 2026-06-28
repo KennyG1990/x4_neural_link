@@ -20,6 +20,7 @@ burning joules.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -540,6 +541,64 @@ class MemoryStore:
             for col, decl in typed_cols.items():
                 if col not in existing:
                     conn.execute(f"ALTER TABLE npcs ADD COLUMN {col} {decl}")
+            # --- EPIC I (I0): Synthetic Persistent NPC Identity Layer ------------------
+            # X4 exposes NO stable cross-reload identity for generic crew (proven #99: runtime `raw`
+            # and the save `<component id>` are the SAME volatile UniverseID, regenerated every reload;
+            # idcode empty). So Neural Link OWNS identity: a handle-independent persistent_npc_key
+            # derived from STABLE evidence, with per-session runtime bindings. Memory stays in
+            # facts/turns (NOT destructively re-keyed); a resolution layer (resolve_memory_keys) unions
+            # every npc_key ever linked to an identity. Adds only new tables + npcs.persistent_key →
+            # fully reversible.
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(npcs)").fetchall()}
+            if "persistent_key" not in existing:
+                conn.execute("ALTER TABLE npcs ADD COLUMN persistent_key TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_npcs_persistent ON npcs(persistent_key)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS npc_identities (
+                    persistent_npc_key  TEXT PRIMARY KEY,
+                    display_name        TEXT,
+                    faction             TEXT,
+                    role                TEXT,
+                    race                TEXT,
+                    gender              TEXT,
+                    macro               TEXT,
+                    npc_code            TEXT,
+                    first_seen_save     TEXT,
+                    first_seen_time     REAL,
+                    importance_tier     INTEGER DEFAULT 3,   -- 0 faction-abstraction .. 3 background (spec tiers)
+                    identity_confidence REAL DEFAULT 1.0,
+                    status              TEXT DEFAULT 'session-only',
+                    updated_at          REAL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS npc_identity_evidence (
+                    persistent_npc_key  TEXT NOT NULL,
+                    evidence_type       TEXT NOT NULL,       -- name|faction|role|macro|npc_code|skill_vector|...
+                    value               TEXT NOT NULL,
+                    weight              REAL DEFAULT 0,
+                    first_seen          REAL,
+                    last_seen           REAL,
+                    PRIMARY KEY (persistent_npc_key, evidence_type, value)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_identity_evidence ON npc_identity_evidence(persistent_npc_key)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS npc_runtime_bindings (
+                    runtime_component_id TEXT NOT NULL,      -- volatile X4 UniverseID for THIS session
+                    persistent_npc_key   TEXT NOT NULL,
+                    save_id              TEXT,
+                    game_session_id      TEXT NOT NULL,
+                    seen_at              REAL,
+                    sector               TEXT,
+                    ship_id              TEXT,
+                    station_id           TEXT,
+                    confidence           REAL DEFAULT 0,
+                    evidence_json        TEXT,
+                    PRIMARY KEY (runtime_component_id, game_session_id)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_bindings_persistent ON npc_runtime_bindings(persistent_npc_key)")
             conn.commit()
 
     # --- NPC binding / retrieval ---------------------------------------------
@@ -550,6 +609,12 @@ class MemoryStore:
 
     # X4 crew skills (0..15 internal = 0..5 stars). morale is universal.
     X4_SKILLS = ("piloting", "management", "engineering", "boarding", "morale")
+
+    # EPIC I (I2) identity-rebind thresholds + near-tie delta (from the spec).
+    IDENTITY_BIND = 0.80          # >= → bind automatically
+    IDENTITY_TENTATIVE = 0.60     # >= → tentative bind
+    IDENTITY_AMBIGUOUS = 0.40     # >= (or near-tie) → ambiguous, do NOT merge memories
+    IDENTITY_NEAR_TIE = 0.07      # top-second gap at/below this = ambiguous
 
     # Per-faction pressure aggregates (the deterministic scoring inputs).
     PRESSURE_FIELDS = (
@@ -788,6 +853,432 @@ class MemoryStore:
             conn.commit()
         return {"ok": True, "deleted_npc": npc_key, "turns_purged": turns, "facts_purged": facts}
 
+    # --- EPIC I (I0): Persistent NPC identity layer ---------------------------
+    # persistent_npc_key is HANDLE-INDEPENDENT: derived ONLY from stable evidence (name, faction,
+    # role, macro, npc_code, skill-vector) — never from a volatile runtime/save handle. So the SAME
+    # NPC yields the SAME key across reloads even though X4's component id changes every load.
+
+    @staticmethod
+    def _skill_vector_sig(skills: Any) -> str:
+        """Order-stable signature of a crew skill vector, for identity evidence/derivation."""
+        if isinstance(skills, str):
+            try:
+                skills = json.loads(skills)
+            except Exception:
+                skills = None
+        if not isinstance(skills, dict):
+            return ""
+        parts: list[str] = []
+        for k in MemoryStore.X4_SKILLS:
+            if k in skills and skills[k] not in (None, ""):
+                try:
+                    parts.append(f"{k}:{int(float(skills[k]))}")
+                except Exception:
+                    parts.append(f"{k}:{skills[k]}")
+        return " ".join(parts)
+
+    @staticmethod
+    def derive_persistent_key(evidence: dict) -> str:
+        """Deterministic, handle-independent identity key from STABLE evidence only. Volatile fields
+        (runtime_component_id, save_id, game_session_id, ship_name, sector) are DELIBERATELY excluded
+        so the key survives a reload. Returns 'pid:<12-hex>'."""
+        name = str(evidence.get("name") or evidence.get("display_name") or "").strip().lower()
+        faction = str(evidence.get("faction") or evidence.get("faction_id") or evidence.get("owner") or "").strip().lower()
+        role = str(evidence.get("role") or "").strip().lower()
+        macro = str(evidence.get("macro") or "").strip().lower()
+        code = str(evidence.get("npc_code") or evidence.get("code") or "").strip().lower()
+        skills = MemoryStore._skill_vector_sig(evidence.get("skills"))
+        basis = "|".join([name, faction, role, macro, code, skills])
+        return "pid:" + hashlib.sha1(basis.encode("utf-8")).hexdigest()[:12]
+
+    def upsert_identity(self, persistent_npc_key: str, attrs: Optional[dict] = None) -> None:
+        """Create/refresh an identity. Descriptive attrs are merged on conflict; tier/confidence/
+        status are set ONLY on first insert (their lifecycle is owned by I3/I2, not this writer)."""
+        attrs = attrs or {}
+        now = time.time()
+        tier = attrs.get("importance_tier")
+        conf = attrs.get("identity_confidence")
+        with self._lock, self._connect() as conn:
+            conn.execute("""
+                INSERT INTO npc_identities (persistent_npc_key, display_name, faction, role, race, gender,
+                                            macro, npc_code, first_seen_save, first_seen_time,
+                                            importance_tier, identity_confidence, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(persistent_npc_key) DO UPDATE SET
+                    display_name = COALESCE(NULLIF(excluded.display_name,''), npc_identities.display_name),
+                    faction      = COALESCE(NULLIF(excluded.faction,''), npc_identities.faction),
+                    role         = COALESCE(NULLIF(excluded.role,''), npc_identities.role),
+                    race         = COALESCE(NULLIF(excluded.race,''), npc_identities.race),
+                    gender       = COALESCE(NULLIF(excluded.gender,''), npc_identities.gender),
+                    macro        = COALESCE(NULLIF(excluded.macro,''), npc_identities.macro),
+                    npc_code     = COALESCE(NULLIF(excluded.npc_code,''), npc_identities.npc_code),
+                    updated_at   = excluded.updated_at
+            """, (
+                persistent_npc_key,
+                str(attrs.get("display_name") or attrs.get("name") or ""),
+                str(attrs.get("faction") or attrs.get("faction_id") or ""),
+                str(attrs.get("role") or ""),
+                str(attrs.get("race") or ""),
+                str(attrs.get("gender") or ""),
+                str(attrs.get("macro") or ""),
+                str(attrs.get("npc_code") or attrs.get("code") or ""),
+                str(attrs.get("first_seen_save") or ""),
+                float(attrs.get("first_seen_time") or now),
+                int(tier) if tier is not None else 3,
+                float(conf) if conf is not None else 1.0,
+                str(attrs.get("status") or "session-only"),
+                now,
+            ))
+            conn.commit()
+
+    def set_identity_fields(self, persistent_npc_key: str, *, importance_tier: Optional[int] = None,
+                            identity_confidence: Optional[float] = None, status: Optional[str] = None) -> None:
+        """Lifecycle writer for tier/confidence/status (used by I2 rebind + I3 promotion)."""
+        sets, vals = [], []
+        if importance_tier is not None:
+            sets.append("importance_tier = ?"); vals.append(int(importance_tier))
+        if identity_confidence is not None:
+            sets.append("identity_confidence = ?"); vals.append(float(identity_confidence))
+        if status is not None:
+            sets.append("status = ?"); vals.append(str(status))
+        if not sets:
+            return
+        sets.append("updated_at = ?"); vals.append(time.time())
+        vals.append(persistent_npc_key)
+        with self._lock, self._connect() as conn:
+            conn.execute(f"UPDATE npc_identities SET {', '.join(sets)} WHERE persistent_npc_key = ?", vals)
+            conn.commit()
+
+    def record_evidence(self, persistent_npc_key: str, evidence_type: str, value: str, weight: float = 0.0) -> None:
+        v = str(value or "").strip()
+        if not persistent_npc_key or not evidence_type or not v:
+            return
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute("""
+                INSERT INTO npc_identity_evidence (persistent_npc_key, evidence_type, value, weight, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(persistent_npc_key, evidence_type, value) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    weight = MAX(npc_identity_evidence.weight, excluded.weight)
+            """, (persistent_npc_key, str(evidence_type), v, float(weight), now, now))
+            conn.commit()
+
+    def get_evidence(self, persistent_npc_key: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT evidence_type, value, weight, first_seen, last_seen FROM npc_identity_evidence "
+                "WHERE persistent_npc_key = ? ORDER BY weight DESC, evidence_type",
+                (persistent_npc_key,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def link_npc_to_identity(self, npc_key: str, persistent_npc_key: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE npcs SET persistent_key = ? WHERE npc_key = ?", (persistent_npc_key, npc_key))
+            conn.commit()
+
+    def resolve_memory_keys(self, persistent_npc_key: str) -> list[str]:
+        """Every npc_key ever linked to this identity — the basis for cross-reload memory union.
+        facts/turns stay keyed by npc_key; the identity unions them WITHOUT destructive re-keying."""
+        if not persistent_npc_key:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute("SELECT npc_key FROM npcs WHERE persistent_key = ?", (persistent_npc_key,)).fetchall()
+        return [r["npc_key"] for r in rows]
+
+    def bind_runtime(self, runtime_component_id: str, persistent_npc_key: str, game_session_id: str,
+                     save_id: str = "", sector: str = "", ship_id: str = "", station_id: str = "",
+                     confidence: float = 0.0, evidence_json: str = "") -> None:
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute("""
+                INSERT INTO npc_runtime_bindings (runtime_component_id, persistent_npc_key, save_id, game_session_id,
+                                                  seen_at, sector, ship_id, station_id, confidence, evidence_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(runtime_component_id, game_session_id) DO UPDATE SET
+                    persistent_npc_key = excluded.persistent_npc_key,
+                    seen_at = excluded.seen_at, sector = excluded.sector,
+                    ship_id = excluded.ship_id, station_id = excluded.station_id,
+                    confidence = excluded.confidence, evidence_json = excluded.evidence_json
+            """, (str(runtime_component_id), persistent_npc_key, save_id, str(game_session_id),
+                  now, sector, ship_id, station_id, float(confidence), evidence_json))
+            conn.commit()
+
+    def expire_session_bindings(self, game_session_id: str) -> int:
+        """Reload-flow step 2: drop the prior session's volatile runtime bindings. Identities + memory KEPT."""
+        with self._lock, self._connect() as conn:
+            n = conn.execute("DELETE FROM npc_runtime_bindings WHERE game_session_id = ?",
+                             (str(game_session_id),)).rowcount or 0
+            conn.commit()
+        return n
+
+    def get_identity(self, persistent_npc_key: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM npc_identities WHERE persistent_npc_key = ?",
+                               (persistent_npc_key,)).fetchone()
+        return dict(row) if row else None
+
+    def list_identities(self, limit: int = 500) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM npc_identities ORDER BY importance_tier ASC, updated_at DESC LIMIT ?",
+                (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_runtime_bindings(self, persistent_npc_key: str, limit: int = 5) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT runtime_component_id, save_id, game_session_id, seen_at, sector, ship_id, station_id, confidence "
+                "FROM npc_runtime_bindings WHERE persistent_npc_key = ? ORDER BY seen_at DESC LIMIT ?",
+                (persistent_npc_key, int(limit))).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_name_collisions(self, display_name: str, exclude: str = "") -> int:
+        """How many OTHER identities share this display name — a duplicate-name collision risk surfaced
+        on the dashboard so a wrong evidence-merge is visible, not silent."""
+        nm = (display_name or "").strip().lower()
+        if not nm:
+            return 0
+        with self._connect() as conn:
+            n = conn.execute("SELECT COUNT(*) AS c FROM npc_identities WHERE lower(display_name) = ? AND persistent_npc_key != ?",
+                             (nm, exclude)).fetchone()["c"]
+        return int(n)
+
+    def backfill_identities(self) -> dict:
+        """Idempotent + reversible: give every existing npcs row that lacks one a persistent identity
+        derived from its stable evidence. Writes ONLY npc_identities/evidence + npcs.persistent_key —
+        never touches facts/turns — so it is safe to re-run and to roll back. (Precise merging of
+        sparse vs rich rows for the SAME NPC is I2's scorer; this just guarantees every row has an id.)"""
+        created = 0
+        linked = 0
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT npc_key, name, faction_id, role, race, gender, skills, save_id, persistent_key FROM npcs"
+            ).fetchall()
+        scanned = len(rows)
+        for r in rows:
+            if r["persistent_key"]:
+                continue  # already linked — idempotent skip
+            ev = {"name": r["name"], "faction": r["faction_id"], "role": r["role"],
+                  "race": r["race"], "gender": r["gender"], "skills": r["skills"]}
+            pkey = self.derive_persistent_key(ev)
+            if self.get_identity(pkey) is None:
+                created += 1
+            self.upsert_identity(pkey, {
+                "display_name": r["name"], "faction": r["faction_id"], "role": r["role"],
+                "race": r["race"], "gender": r["gender"], "first_seen_save": r["save_id"],
+            })
+            for et, val in (("name", r["name"]), ("faction", r["faction_id"]), ("role", r["role"]),
+                            ("race", r["race"]), ("gender", r["gender"])):
+                if val:
+                    self.record_evidence(pkey, et, str(val))
+            sv = self._skill_vector_sig(r["skills"])
+            if sv:
+                self.record_evidence(pkey, "skill_vector", sv)
+            self.link_npc_to_identity(r["npc_key"], pkey)
+            linked += 1
+        return {"ok": True, "identities_created": created, "rows_linked": linked, "rows_scanned": scanned}
+
+    # --- EPIC I (I2): evidence scoring + per-session rebind --------------------
+    # X4 ids are session handles; on each reload we re-identify current NPCs against existing
+    # identities by SCORING evidence (not one id), then bind/tentative/ambiguous/new per the spec.
+
+    def _norm_fac(self, v: Any) -> str:
+        v = str(v or "").strip()
+        if not v:
+            return ""
+        try:
+            return (self.resolve_faction_id(v) or v).lower()
+        except Exception:
+            return v.lower()
+
+    def _candidate_identity_keys(self, conn: sqlite3.Connection, name: str, code: str) -> set[str]:
+        """Cheap candidate gather: identities sharing the (strong) name or npc_code signals."""
+        keys: set[str] = set()
+        nm = (name or "").strip().lower()
+        cd = (code or "").strip().lower()
+        if nm:
+            for r in conn.execute("SELECT persistent_npc_key FROM npc_identities WHERE lower(display_name) = ?", (nm,)):
+                keys.add(r["persistent_npc_key"])
+            for r in conn.execute("SELECT persistent_npc_key FROM npc_identity_evidence WHERE evidence_type='name' AND lower(value) = ?", (nm,)):
+                keys.add(r["persistent_npc_key"])
+        if cd:
+            for r in conn.execute("SELECT persistent_npc_key FROM npc_identity_evidence WHERE evidence_type='npc_code' AND lower(value) = ?", (cd,)):
+                keys.add(r["persistent_npc_key"])
+        return keys
+
+    def score_identity(self, evidence: dict, game_session_id: str = "") -> list[dict]:
+        """Score an observed NPC's evidence against existing identities (spec weights/penalties).
+        Returns candidates sorted by score desc: [{persistent_npc_key, score, reasons, display_name}]."""
+        name = str(evidence.get("name") or "").strip()
+        role = str(evidence.get("role") or "").strip().lower()
+        macro = str(evidence.get("macro") or "").strip().lower()
+        code = str(evidence.get("npc_code") or evidence.get("code") or "").strip().lower()
+        skillsig = self._skill_vector_sig(evidence.get("skills")).lower()
+        container = str(evidence.get("ship_id") or evidence.get("station_id") or evidence.get("container") or "").strip().lower()
+        sector = str(evidence.get("sector") or "").strip().lower()
+        recently = bool(evidence.get("recently_talked"))
+        rcid = str(evidence.get("runtime_component_id") or "").strip()
+        nl = name.lower()
+        fl = self._norm_fac(evidence.get("faction") or evidence.get("faction_id") or evidence.get("owner"))
+        results: list[dict] = []
+        with self._connect() as conn:
+            for pkey in self._candidate_identity_keys(conn, name, code):
+                ident = conn.execute("SELECT * FROM npc_identities WHERE persistent_npc_key = ?", (pkey,)).fetchone()
+                if not ident:
+                    continue
+                ev: dict[str, set] = {}
+                for e in conn.execute("SELECT evidence_type, value FROM npc_identity_evidence WHERE persistent_npc_key = ?", (pkey,)):
+                    ev.setdefault(e["evidence_type"], set()).add(str(e["value"]).lower())
+
+                def has(et: str, val: str) -> bool:
+                    return bool(val) and val in ev.get(et, set())
+
+                cand_name = (ident["display_name"] or "").lower()
+                cand_fac = self._norm_fac(ident["faction"])
+                cand_role = (ident["role"] or "").lower()
+                cand_macro = (ident["macro"] or "").lower()
+                cand_code = (ident["npc_code"] or "").lower()
+                score = 0.0
+                reasons: list[str] = []
+                name_match = bool(nl) and (nl == cand_name or has("name", nl))
+                if name_match:
+                    score += 0.25; reasons.append("same name")
+                fac_match = bool(fl) and fl == cand_fac
+                if fac_match:
+                    score += 0.15; reasons.append("same faction")
+                role_match = bool(role) and (role == cand_role or has("role", role))
+                if role_match:
+                    score += 0.10; reasons.append("same role")
+                macro_match = bool(macro) and (macro == cand_macro or has("macro", macro))
+                if macro_match:
+                    score += 0.15; reasons.append("same macro")
+                code_match = bool(code) and (code == cand_code or has("npc_code", code))
+                if code_match:
+                    score += 0.25; reasons.append("same npc_code")
+                if skillsig and has("skill_vector", skillsig):
+                    score += 0.15; reasons.append("same skill_vector")
+                if container and has("container", container):
+                    score += 0.20; reasons.append("same container")
+                if sector and has("sector", sector):
+                    score += 0.05; reasons.append("same sector")
+                if recently:
+                    score += 0.10; reasons.append("recently talked")
+                if rcid and game_session_id:
+                    b = conn.execute("SELECT persistent_npc_key FROM npc_runtime_bindings WHERE runtime_component_id=? AND game_session_id=?",
+                                     (rcid, game_session_id)).fetchone()
+                    if b and b["persistent_npc_key"] == pkey:
+                        score += 0.10; reasons.append("same-session runtime id")
+                # Penalties — guard against false merges on a shared name.
+                if name_match and fl and cand_fac and fl != cand_fac:
+                    score -= 0.40; reasons.append("name match but different faction")
+                if name_match and role and cand_role and role != cand_role and macro and cand_macro and macro != cand_macro:
+                    score -= 0.25; reasons.append("name match but different role+macro")
+                score = max(0.0, min(1.0, score))
+                results.append({"persistent_npc_key": pkey, "score": round(score, 4),
+                                "reasons": reasons, "display_name": ident["display_name"]})
+        results.sort(key=lambda r: r["score"], reverse=True)
+        return results
+
+    def _record_obs_evidence(self, pkey: str, obs: dict) -> None:
+        for et, val, w in (
+            ("name", obs.get("name"), 0.25),
+            ("faction", obs.get("faction") or obs.get("faction_id"), 0.15),
+            ("role", obs.get("role"), 0.10),
+            ("macro", obs.get("macro"), 0.15),
+            ("npc_code", obs.get("npc_code") or obs.get("code"), 0.25),
+            ("container", obs.get("ship_id") or obs.get("station_id") or obs.get("container"), 0.20),
+            ("sector", obs.get("sector"), 0.05),
+        ):
+            if val:
+                self.record_evidence(pkey, et, str(val), w)
+        sv = self._skill_vector_sig(obs.get("skills"))
+        if sv:
+            self.record_evidence(pkey, "skill_vector", sv, 0.15)
+
+    def rebind_session(self, game_session_id: str, observed: list[dict], save_id: str = "") -> dict:
+        """Reload flow: score each observed NPC vs existing identities and bind. Decisions:
+        >=0.80 (no near-tie) bound · >=0.60 tentative · >=0.40 OR near-tie ambiguous (fresh temp
+        identity, NO memory merge) · else new. Links this session's npc_key to the chosen identity
+        so resolve_memory_keys unions memory across reloads. Never merges into an ambiguous match."""
+        counts = {"bound": 0, "tentative": 0, "ambiguous": 0, "new": 0}
+        out: list[dict] = []
+        for obs in observed or []:
+            rcid = str(obs.get("runtime_component_id") or "")
+            npc_key = str(obs.get("npc_key") or "")
+            ranked = self.score_identity(obs, game_session_id=game_session_id)
+            top = ranked[0] if ranked else None
+            second = ranked[1] if len(ranked) > 1 else None
+            near_tie = bool(top and second and (top["score"] - second["score"]) <= self.IDENTITY_NEAR_TIE)
+            conf = float(top["score"]) if top else 0.0
+            if top and top["score"] >= self.IDENTITY_BIND and not near_tie:
+                decision = "bound"; pkey = top["persistent_npc_key"]
+            elif top and top["score"] >= self.IDENTITY_TENTATIVE and not near_tie:
+                decision = "tentative"; pkey = top["persistent_npc_key"]
+            elif top and (top["score"] >= self.IDENTITY_AMBIGUOUS or near_tie):
+                decision = "ambiguous"
+                pkey = self.derive_persistent_key(obs) + ":amb"   # fresh temp identity — never merges into a real one
+                self.upsert_identity(pkey, {**obs, "status": "ambiguous", "identity_confidence": conf})
+            else:
+                decision = "new"; conf = 1.0
+                pkey = self.derive_persistent_key(obs)
+                self.upsert_identity(pkey, {**obs, "status": "new"})
+            counts[decision] += 1
+            if decision in ("bound", "tentative"):
+                self.set_identity_fields(pkey, identity_confidence=conf, status=decision)
+            self._record_obs_evidence(pkey, obs)
+            if npc_key:
+                self.link_npc_to_identity(npc_key, pkey)
+            if rcid:
+                self.bind_runtime(rcid, pkey, game_session_id, save_id=save_id,
+                                  sector=str(obs.get("sector") or ""), ship_id=str(obs.get("ship_id") or ""),
+                                  station_id=str(obs.get("station_id") or ""), confidence=conf,
+                                  evidence_json=json.dumps(top["reasons"]) if top else "")
+            out.append({"npc_key": npc_key, "runtime_component_id": rcid, "decision": decision,
+                        "persistent_npc_key": pkey, "confidence": round(conf, 4), "near_tie": near_tie,
+                        "top_score": top["score"] if top else 0.0})
+        return {"ok": True, "game_session_id": game_session_id, **counts, "results": out}
+
+    # --- EPIC I (I3): importance-tier promotion -------------------------------
+    # Tracking priority on npc_identities.importance_tier (lower = more important):
+    # 0 faction-abstraction · 1 player-significant · 2 local-important · 3 background (default).
+    # NOTE: distinct from npcs.tier (faction-AUTHORITY hierarchy, leader=3) — different axis.
+    PROMOTION_TIER: dict[str, int] = {
+        "talked": 1, "mission": 1, "negotiated": 1, "assigned": 1, "romance": 1,
+        "rivalry": 1, "relationship": 1, "named_recall": 1,
+        "news_event": 2, "social_event": 2, "local": 2,
+        "faction_abstraction": 0,
+    }
+
+    def promote_identity(self, persistent_npc_key: str, reason: str) -> Optional[int]:
+        """Raise tracking priority when a promotion trigger fires. Idempotent — only ever LOWERS the
+        tier number (more important), never demotes. Returns the resulting tier, or None if no-op."""
+        target = self.PROMOTION_TIER.get(str(reason or "").lower())
+        if target is None or not persistent_npc_key:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT importance_tier FROM npc_identities WHERE persistent_npc_key = ?",
+                               (persistent_npc_key,)).fetchone()
+            if not row:
+                return None
+            cur = row["importance_tier"] if row["importance_tier"] is not None else 3
+            if target >= cur:
+                return cur  # never demote
+            conn.execute("UPDATE npc_identities SET importance_tier = ?, updated_at = ? WHERE persistent_npc_key = ?",
+                         (target, time.time(), persistent_npc_key))
+            conn.commit()
+            return target
+
+    def promote_identity_for_npc(self, npc_key: str, reason: str) -> Optional[int]:
+        """Promote the identity linked to a session npc_key — the bridge from runtime turns/events to
+        the persistent identity. No-op if the npc isn't linked to an identity yet."""
+        if not npc_key:
+            return None
+        with self._connect() as conn:
+            row = conn.execute("SELECT persistent_key FROM npcs WHERE npc_key = ?", (npc_key,)).fetchone()
+        pkey = row["persistent_key"] if row else None
+        return self.promote_identity(pkey, reason) if pkey else None
+
     # --- Turns (Stage A) ------------------------------------------------------
 
     def record_turn(self, npc_key: str, role: str, text: str) -> None:
@@ -812,6 +1303,13 @@ class MemoryStore:
                 self.promote_durable_facts(npc_key, max_promote=6)
             except Exception:
                 pass
+        # I3: conversing with an NPC makes them player-significant (Tier 1). Idempotent (only ever
+        # raises priority) + cheap (skips once already <= Tier 1) + guarded. No-op until the npc is
+        # linked to an identity (I0 backfill / I2 rebind). Covers talk/mission/negotiate (all conversations).
+        try:
+            self.promote_identity_for_npc(npc_key, "talked")
+        except Exception:
+            pass
 
     def _turn_count(self, conn: sqlite3.Connection, npc_key: str) -> int:
         return conn.execute("SELECT COUNT(*) AS c FROM turns WHERE npc_key = ?", (npc_key,)).fetchone()["c"]
@@ -3748,6 +4246,196 @@ def run_memory_stress(store: "MemoryStore", n_npcs: int = 100, turns_per: int = 
         "db_mb": round(db_bytes / 1048576, 2) if db_bytes else None,
         "checks": checks,
     }
+
+
+def run_npc_identity_selftest() -> dict:
+    """Deterministic oracle for EPIC I (I0): handle-independent key derivation, identity upsert,
+    evidence dedup, runtime bindings + session expiry, idempotent/reversible backfill, and the
+    cross-reload memory-key RESOLUTION layer (the whole point — memory survives a reload)."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_identity_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "identity.sqlite3")
+        ev = {"name": "Manda Smitt", "faction": "argon", "role": "service",
+              "macro": "character_argon_female_asi_crew_01_macro", "npc_code": "RDU-996",
+              "skills": {"boarding": 6, "engineering": 2, "morale": 3, "piloting": 1, "management": 1}}
+        k1 = MemoryStore.derive_persistent_key(ev)
+
+        # 1. deterministic — same evidence → same key
+        check("key_deterministic", k1 == MemoryStore.derive_persistent_key(dict(ev)), k1)
+        # 2. handle-independent — adding volatile fields does NOT change the key (the whole fix)
+        ev_vol = dict(ev); ev_vol.update({"runtime_component_id": "236456014", "save_id": "save_007",
+                                          "game_session_id": "sess-Z", "ship_name": "ANV X", "sector": "Grand Exchange"})
+        check("key_handle_independent", MemoryStore.derive_persistent_key(ev_vol) == k1)
+        # 3. discriminates on STABLE evidence — different faction → different key
+        ev2 = dict(ev); ev2["faction"] = "teladi"
+        check("key_discriminates", MemoryStore.derive_persistent_key(ev2) != k1)
+
+        # 4. upsert + get (status defaults to session-only; tier defaults to 3)
+        store.upsert_identity(k1, {"display_name": "Manda Smitt", "faction": "argon", "role": "service"})
+        ident = store.get_identity(k1)
+        check("identity_upsert", bool(ident) and ident["display_name"] == "Manda Smitt"
+              and ident["status"] == "session-only" and ident["importance_tier"] == 3)
+        # 4b. lifecycle writer (I2/I3 path) updates tier/confidence/status without clobbering attrs
+        store.set_identity_fields(k1, importance_tier=1, identity_confidence=0.86, status="bound")
+        ident = store.get_identity(k1)
+        check("identity_lifecycle", ident["importance_tier"] == 1 and abs(ident["identity_confidence"] - 0.86) < 1e-6
+              and ident["status"] == "bound" and ident["display_name"] == "Manda Smitt")
+
+        # 5. evidence record + dedup (same type+value coalesces, keeps max weight)
+        store.record_evidence(k1, "npc_code", "RDU-996", weight=0.25)
+        store.record_evidence(k1, "npc_code", "RDU-996", weight=0.10)
+        elist = store.get_evidence(k1)
+        codes = [e for e in elist if e["evidence_type"] == "npc_code"]
+        check("evidence_recorded_dedup", len(codes) == 1 and abs(codes[0]["weight"] - 0.25) < 1e-6, str(codes))
+
+        # 6. CROSS-RELOAD memory union — same NPC in two sessions (two npc_keys), one identity
+        ka = MemoryStore.make_key("save_006", "g", "Manda Smitt")
+        kb = MemoryStore.make_key("save_007", "g", "Manda Smitt")
+        store.bind_npc(ka, "rt-1", save_id="save_006", game_id="g", name="Manda Smitt", faction_id="argon")
+        store.bind_npc(kb, "rt-2", save_id="save_007", game_id="g", name="Manda Smitt", faction_id="argon")
+        store.link_npc_to_identity(ka, k1); store.link_npc_to_identity(kb, k1)
+        store.record_turn(ka, "assistant", "We argued about the trade corridor.")
+        store.record_turn(kb, "assistant", "Good to see you again, commander.")
+        resolved = set(store.resolve_memory_keys(k1))
+        check("resolve_unions_sessions", resolved == {ka, kb}, str(resolved))
+        check("union_reaches_memory", sum(store.turn_count(x) for x in resolved) >= 2)
+
+        # 7. runtime binding + session expiry (reload-flow step 2)
+        store.bind_runtime("236456014", k1, "sess-A", save_id="save_007", confidence=0.9)
+        with store._connect() as c:
+            nb = c.execute("SELECT COUNT(*) AS n FROM npc_runtime_bindings WHERE game_session_id='sess-A'").fetchone()["n"]
+        check("runtime_bind", nb == 1)
+        check("session_expiry", store.expire_session_bindings("sess-A") == 1)
+
+        # 8. backfill creates an identity for an UNLINKED npc, and is idempotent/reversible on re-run
+        kc = MemoryStore.make_key("save_006", "g", "Bron Velsk")
+        store.bind_npc(kc, "rt-3", save_id="save_006", game_id="g", name="Bron Velsk", faction_id="teladi")
+        r1 = store.backfill_identities()
+        check("backfill_creates", r1["identities_created"] >= 1 and bool(store.get_npc(kc).get("persistent_key")), str(r1))
+        r2 = store.backfill_identities()
+        check("backfill_idempotent", r2["identities_created"] == 0 and r2["rows_linked"] == 0, str(r2))
+        check("backfill_preserves_manual_link", store.get_npc(ka).get("persistent_key") == k1)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_npc_rebind_selftest() -> dict:
+    """Deterministic oracle for EPIC I (I2): evidence scoring + per-session rebind. Proves a
+    reloaded NPC (new runtime id, new npc_key, same stable evidence) re-binds to its existing
+    identity and UNIONS memory; that a same-name/different-faction NPC is NOT merged; that a
+    genuine ambiguous near-tie does not merge; and that a brand-new NPC gets a fresh identity."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_rebind_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "rebind.sqlite3")
+        rich = {"name": "Manda Smitt", "faction": "argon", "role": "service",
+                "macro": "character_argon_female_asi_crew_01_macro", "npc_code": "RDU-996",
+                "skills": {"boarding": 6, "engineering": 2, "morale": 3}}
+
+        # Session 1: first encounter → brand-new identity.
+        s1 = dict(rich); s1["runtime_component_id"] = "134465819"; s1["npc_key"] = MemoryStore.make_key("save_006", "g", "Manda Smitt")
+        store.bind_npc(s1["npc_key"], "rt-1", save_id="save_006", game_id="g", name="Manda Smitt", faction_id="argon")
+        d1 = store.rebind_session("sess-1", [s1], save_id="save_006")["results"][0]
+        check("first_encounter_new", d1["decision"] == "new", str(d1))
+        pkey = d1["persistent_npc_key"]
+        store.record_turn(s1["npc_key"], "assistant", "We argued about the trade corridor.")
+
+        # Session 2 (reload): NEW runtime id + NEW npc_key, SAME stable evidence → BIND to same identity.
+        s2 = dict(rich); s2["runtime_component_id"] = "236456014"; s2["npc_key"] = MemoryStore.make_key("save_007", "g", "Manda Smitt")
+        store.bind_npc(s2["npc_key"], "rt-2", save_id="save_007", game_id="g", name="Manda Smitt", faction_id="argon")
+        d2 = store.rebind_session("sess-2", [s2], save_id="save_007")["results"][0]
+        check("reload_rebinds", d2["decision"] == "bound" and d2["persistent_npc_key"] == pkey and d2["confidence"] >= 0.80, str(d2))
+        # The whole point: memory now unions BOTH sessions under one identity.
+        mk = set(store.resolve_memory_keys(pkey))
+        check("memory_union_after_rebind", mk == {s1["npc_key"], s2["npc_key"]}, str(mk))
+
+        # Same name, DIFFERENT faction → must NOT merge into the argon Manda.
+        s3 = {"name": "Manda Smitt", "faction": "teladi", "role": "service",
+              "runtime_component_id": "999", "npc_key": MemoryStore.make_key("save_007", "g", "Manda Smitt#teladi")}
+        store.bind_npc(s3["npc_key"], "rt-3", save_id="save_007", game_id="g", name="Manda Smitt", faction_id="teladi")
+        d3 = store.rebind_session("sess-2", [s3], save_id="save_007")["results"][0]
+        check("dupname_difffaction_not_merged", d3["persistent_npc_key"] != pkey and d3["decision"] in ("new", "ambiguous"), str(d3))
+
+        # Near-tie ambiguity: two same-name identities, observe with no distinguishing evidence.
+        vexA = store.derive_persistent_key({"name": "Vex Korrin", "faction": "argon", "role": "pilot", "macro": "mA"})
+        vexB = store.derive_persistent_key({"name": "Vex Korrin", "faction": "argon", "role": "pilot", "macro": "mB"})
+        for vk, mc in ((vexA, "mA"), (vexB, "mB")):
+            store.upsert_identity(vk, {"display_name": "Vex Korrin", "faction": "argon", "role": "pilot", "macro": mc})
+            store.record_evidence(vk, "name", "Vex Korrin"); store.record_evidence(vk, "faction", "argon"); store.record_evidence(vk, "role", "pilot")
+        obsv = {"name": "Vex Korrin", "faction": "argon", "role": "pilot",
+                "runtime_component_id": "5", "npc_key": MemoryStore.make_key("save_007", "g", "Vex Korrin")}
+        ranked = store.score_identity(obsv, game_session_id="sess-2")
+        check("near_tie_detected", len(ranked) >= 2 and abs(ranked[0]["score"] - ranked[1]["score"]) <= store.IDENTITY_NEAR_TIE, str(ranked[:2]))
+        dv = store.rebind_session("sess-2", [obsv], save_id="save_007")["results"][0]
+        check("near_tie_ambiguous", dv["decision"] == "ambiguous" and dv["persistent_npc_key"] not in (vexA, vexB), str(dv))
+
+        # Brand-new name → new identity.
+        dn = store.rebind_session("sess-2", [{"name": "Zog Nobody", "faction": "split",
+                                              "runtime_component_id": "7", "npc_key": MemoryStore.make_key("save_007", "g", "Zog")}],
+                                  save_id="save_007")["results"][0]
+        check("brand_new_identity", dn["decision"] == "new", str(dn))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_npc_promotion_selftest() -> dict:
+    """Deterministic oracle for EPIC I (I3): importance-tier promotion. Proves conversing promotes to
+    Tier 1, promotion never demotes, event triggers map correctly, and unknown/unlinked are no-ops."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_promo_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "promo.sqlite3")
+        pkey = store.derive_persistent_key({"name": "Reyes", "faction": "argon", "role": "pilot"})
+        store.upsert_identity(pkey, {"display_name": "Reyes", "faction": "argon", "role": "pilot"})
+        nk = MemoryStore.make_key("s", "g", "Reyes")
+        store.bind_npc(nk, "rt", save_id="s", game_id="g", name="Reyes", faction_id="argon")
+        store.link_npc_to_identity(nk, pkey)
+        check("default_tier_background", store.get_identity(pkey)["importance_tier"] == 3)
+
+        # conversation promotes to Tier 1 (player-significant)
+        store.record_turn(nk, "user", "Hello there.")
+        check("talk_promotes_to_1", store.get_identity(pkey)["importance_tier"] == 1)
+        # never demote — a weaker (higher-number) trigger does not undo it
+        store.promote_identity(pkey, "news_event")
+        check("never_demote", store.get_identity(pkey)["importance_tier"] == 1)
+
+        # a fresh background identity → news_event lands it at Tier 2
+        p2 = store.derive_persistent_key({"name": "Galaxy News Desk", "faction": "argon", "role": "news"})
+        store.upsert_identity(p2, {"display_name": "Galaxy News Desk"})
+        check("news_event_to_2", store.promote_identity(p2, "social_event") == 2 and store.get_identity(p2)["importance_tier"] == 2)
+        # faction abstraction → Tier 0 (most-tracked)
+        check("abstraction_to_0", store.promote_identity(p2, "faction_abstraction") == 0)
+        # unknown reason → no-op None
+        check("unknown_reason_noop", store.promote_identity(p2, "nonsense") is None)
+        # unlinked npc → no-op None
+        check("unlinked_npc_noop", store.promote_identity_for_npc(MemoryStore.make_key("s", "g", "Ghost"), "talked") is None)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
 
 
 def run_universe_selftest() -> dict:
