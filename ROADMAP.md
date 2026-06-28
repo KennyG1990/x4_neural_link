@@ -154,6 +154,69 @@ validation (Forge diag where relevant · `:8713` selftest/endpoint + dashboard r
       =>`; next = in-game chat → save/reload → chat again, compare the logged id (needs a UI reload to take effect).
       If unstable (expected), re-scope the key to a STABLE identifier (person idcode if it exists, else a composite
       name+faction+ship+role) or accept session-only binding. Resolve BEFORE building the capture→persist chain.
+      **SPEC — Stable NPC Identity Binding (Codex+Claude, 2026-06-27) — EVIDENCE-FIRST, phased.** Core principle:
+      TWO identifiers, never one — `runtime_component_id` (who am I talking to now) vs `persistent_npc_key` (same
+      person across reloads). **Phase 0 (NOW):** extend the probe to log `idcode`+candidate fields; in-game chat →
+      FULL save+exit+reload → chat again → compare. Answers Q1 (stable idcode?) + Q2 (runtime id survives?).
+      **Then pick:** Path A (stable idcode) → key memory on idcode, write `bound_entity_id`, opportunistic
+      name-key migration, dashboard column — MINIMAL, no resolver. Path B (no idcode, runtime id survives reload)
+      → key on runtime id behind the persistent-key abstraction. Path C (neither) → session-binding=runtime id +
+      best-effort composite (name+faction+role+assignment), confidence-marked, dashboard shows "imperfect".
+      **DEFER to phase 2 (only if collisions observed):** `npc_runtime_bindings` table, merge/split/rebind
+      endpoints+UI, full collision workflow, NPC social/romance on top. **Rules:** don't assume UniverseID
+      persists; don't auto-merge same-name; don't delete old name-key memory on migrate. Build order: probe →
+      idcode investigation → choose path → schema → payload fields → write bound id → dashboard → safe migration.
+      **PHASE 0 RESULT — IN-GAME VERIFIED 2026-06-27 (Manda Smitt, full save→menu→load):** `raw=458069` →
+      `raw=2059935` (CHANGED); `idcode=` empty both times; `name`+`owner`(faction) present. ⇒ **Q1: NO persistent
+      person idcode (Path A out). Q2: runtime UniverseID CHANGES on reload (Path B out). → PATH C.** HONEST
+      CEILING: X4 exposes no reliable persistent per-crew id, and a composite (name+faction+role+ship/sector) is
+      MORE unique but LESS stable (role/ship/sector change on transfer) — so true per-individual cross-session
+      identity for generic crew is NOT achievable; name+faction is only a marginal collision-reduction over
+      name-only. RELIABLE memory tier = FACTION-level (already works by name=faction). DECISION (pending Ken):
+      minimal Path C — key memory by name+faction, confidence-mark it, dashboard shows "name-key (imperfect)" not
+      "(unbound)", optionally session-bind the runtime id for in-session targeting; DEFER all heavy machinery
+      (runtime_bindings table, merge/split UI, collision workflow) — it can't overcome the missing stable id.
+      **LEAD (community tip via Ken, 2026-06-27): "characters have an id in the save XML; idk what MD can see."**
+      → narrows the conclusion: a PERSISTENT character id may EXIST in save data; we only proved it absent via
+      `idcode` + runtime UniverseID. **Path A REOPENED, conditional on a runtime accessor.** Investigation (Codex,
+      offline): inspect `Documents/Egosoft/X4/<id>/save/*.xml.gz` for the character `id` + structure; then find
+      which `GetComponentData(person,…)` key / MD person-property returns that SAME id at runtime AND is stable
+      across reload. Found → Path A (stable key, minimal build). If the save id is just the runtime UniverseID
+      serialized at save-time (would differ next save) → dead end, stay Path C.
+
+### ★ NPC CENSUS / LIVE ROSTER — incremental tiered indexer (2026-06-27) — spec'd, NOT started
+**Problem:** the NPC table is interaction-driven — an NPC enters the DB only when the player talks to it (chat
+path) or as a bridge abstraction (High Command / News Desk). So the dashboard is a record of WHO-INTERACTED, not
+a LIVE roster of the world. (Confirmed via reconcile: `AI_Influence.IndexNpcs` exists in Lua but NO MD cue feeds
+it.) Does NOT fix cross-reload identity (proven impossible for generic crew); it operationalizes Path C.
+**Build:** a throttled, tiered NPC census — reuse the PROVEN pattern of the economy round-robin indexer (#54) +
+the fleet census (`GetContainedObjectsByOwner`) — that scans relevant NPCs in small chunks per tick and POSTs to
+`/v1/npcs/index`, populating/refreshing the roster gradually WITHOUT freezing the game and WITHOUT dumping the
+galaxy's thousands of generic crew.
+**Tiers (priority-scoped, ties to SPEC-3 gates):** T0 always = abstract actors (High Command / reps, exist);
+T1 each tick (cheap) = NPCs at the PLAYER's current location (talk-able now); T2 round-robin throttled =
+important operational NPCs (station managers, ship captains, mission/named actors), a chunk per tick faction by
+faction; T3 = generic long-tail crew → DO NOT pre-census, index lazily ON INTERACTION (current behavior).
+**Payload (extend `/v1/npcs/index`):** runtime_component_id, name, faction, role, location(ship/station/sector),
+owner, skills, seen_at, source="npc_indexer".
+**Bridge ACTIVE ROSTER (the session-binding layer):** runtime_component_id → current-session NPC; composite key
+(name+faction+role+assignment) → best-effort memory identity; refresh each tick (relations-sync pattern).
+Persistent memory stays strongest at faction/station/named-role tier.
+**Acceptance (HONEST):** SUCCESS = live roster + dashboard shows nearby NPCs without a chat + clean in-session
+identity. NOT-success ≠ perfect permanent memory for every random crew member.
+**Defer:** heavy identity machinery (runtime_bindings table beyond the in-memory roster, merge/split UI,
+collision workflow) until collisions are observed.
+**Build order:** confirm enumeration primitives (location NPCs + crew via GetContainedObjectsByOwner) → T0/T1
+first (cheap, high value) → extend index payload → bridge roster + session binding → dashboard live roster →
+T2 round-robin → tune throttle. **Validate per the IN-GAME GATE:** roster populates in-game WITHOUT interaction.
+**◐ BUILT 2026-06-27 (in-game test PENDING):** Tier-2 first cut — `Census_npcs` library in `ai_influence_worldsync.xml`
+finds `player.sector` stations → indexes each `.controlentity.knownname` + `.owner.knownname` via the EXISTING
+`AIChat.index_npcs`→`/v1/npcs/index` path (one-file change, no bridge/Lua edit). Reconcile pivot: Tier-1 generic-crew
+enumeration is NOT grounded (no person-enumeration in DeadAir/refs; needs the vanilla crew-menu primitive) → did
+Tier-2 (controlentity, grounded — schema + conversation.xml). Forge `project/validate`: census MD schema-CLEAN
+(only "error" = `missing_content_xml`, a single-file artifact; cross-file/lua warnings are single-file artifacts
+too). `find_station groupname=` for `multiple` (DeadAir pattern). NEXT (in-game gate): `/refreshmd` → stand in a
+sector with stations → confirm the dashboard NPC roster gains those station managers WITHOUT a chat.
 - **A4 — Fact-promotion tuning [IG-2, HIGH]. ✅ DONE+VERIFIED 2026-06-27 (live).** Root cause (reconcile):
   condensation is DELIBERATELY disabled (raw turns kept full-fidelity for retrieval — Codex's accuracy choice)
   and `promote_durable_facts` was ON-DEMAND only (ran once via #77 → 11 facts). FIX: auto-wire promotion into
