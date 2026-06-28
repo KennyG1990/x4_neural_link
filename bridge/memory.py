@@ -1052,8 +1052,12 @@ class MemoryStore:
         created = 0
         linked = 0
         with self._connect() as conn:
+            # I8: identities are for PERSONS the player converses with (game_id='chat'). Faction
+            # abstractions / reaction / news rows are NOT persons — they're faction-keyed already and
+            # must not get evidence-scored identities (that polluted the table with duplicates).
             rows = conn.execute(
-                "SELECT npc_key, name, faction_id, role, race, gender, skills, save_id, persistent_key FROM npcs"
+                "SELECT npc_key, name, faction_id, role, race, gender, skills, save_id, persistent_key "
+                "FROM npcs WHERE game_id = 'chat'"
             ).fetchall()
         scanned = len(rows)
         for r in rows:
@@ -1078,6 +1082,21 @@ class MemoryStore:
             self.link_npc_to_identity(r["npc_key"], pkey)
             linked += 1
         return {"ok": True, "identities_created": created, "rows_linked": linked, "rows_scanned": scanned}
+
+    def reset_identities(self) -> dict:
+        """I8 CLEANUP: wipe the identity layer (identities + evidence + runtime bindings) and unlink all
+        npcs, then rebuild cleanly from chat NPCs only. Use after the pre-gate rebind polluted the table
+        with faction-abstraction / reaction / news duplicates. Touches ONLY the identity tables +
+        npcs.persistent_key — facts/turns/memory are untouched, so it is safe."""
+        with self._lock, self._connect() as conn:
+            cleared = conn.execute("SELECT COUNT(*) AS c FROM npc_identities").fetchone()["c"]
+            conn.execute("DELETE FROM npc_identities")
+            conn.execute("DELETE FROM npc_identity_evidence")
+            conn.execute("DELETE FROM npc_runtime_bindings")
+            conn.execute("UPDATE npcs SET persistent_key = NULL")
+            conn.commit()
+        bf = self.backfill_identities()
+        return {"ok": True, "cleared_identities": int(cleared), "rebuilt": bf}
 
     # --- EPIC I (I2): evidence scoring + per-session rebind --------------------
     # X4 ids are session handles; on each reload we re-identify current NPCs against existing
@@ -1659,32 +1678,57 @@ class MemoryStore:
 
     # --- Retrieval (injection) ------------------------------------------------
 
-    def build_memory_context(self, npc_key: str, max_significant: int = 6) -> str:
-        """Assemble the bounded memory block injected into each turn.
+    def identity_recall_gate(self, npc_key: str) -> dict:
+        """I4: how much PERSONAL memory to surface, gated by identity-bind confidence (the spec's
+        confidence-gated retrieval). bound / session-only / new / unbound → full recall, UNIONED across
+        every npc_key the identity owns (resolve_memory_keys — its real consumer). tentative → recall but
+        HEDGED (half-recognition). ambiguous → SUPPRESS personal memory (faction/role only; never assert
+        shared history). Non-chat NPCs have no identity → default full recall on their own key (unchanged)."""
+        npc = self.get_npc(npc_key)
+        pkey = (npc or {}).get("persistent_key")
+        if not pkey:
+            return {"keys": [npc_key], "inject_personal": True, "hedge": False, "status": "", "confidence": None}
+        ident = self.get_identity(pkey) or {}
+        status = str(ident.get("status") or "")
+        keys = self.resolve_memory_keys(pkey) or [npc_key]
+        if status == "ambiguous":
+            return {"keys": keys, "inject_personal": False, "hedge": False, "status": status, "confidence": ident.get("identity_confidence")}
+        if status == "tentative":
+            return {"keys": keys, "inject_personal": True, "hedge": True, "status": status, "confidence": ident.get("identity_confidence")}
+        return {"keys": keys, "inject_personal": True, "hedge": False, "status": status, "confidence": ident.get("identity_confidence")}
 
-        CORE facts always included (verbatim); top significant facts by
-        importance×recency; routine omitted. Touches last_used_at so retrieved
-        facts decay slower (use it or lose it).
+    def build_memory_context(self, npc_key: str, max_significant: int = 6) -> str:
+        """Assemble the bounded PERSONAL memory block injected into each turn — confidence-gated (I4).
+
+        CORE facts always included (verbatim); top significant facts by importance×recency; routine
+        omitted. Facts are UNIONED across the identity's keys (cross-reload recall). Touches last_used_at
+        so retrieved facts decay slower. AMBIGUOUS binds inject no personal memory; TENTATIVE binds hedge.
         """
         now = time.time()
+        gate = self.identity_recall_gate(npc_key)
+        keys = list(gate["keys"]) if gate["inject_personal"] else []
+        core: list = []
+        sig: list = []
         with self._lock, self._connect() as conn:
-            core = conn.execute(
-                "SELECT id, text FROM facts WHERE npc_key = ? AND tier = 'core' "
-                "ORDER BY importance DESC, created_at ASC",
-                (npc_key,),
-            ).fetchall()
-            sig = conn.execute(
-                "SELECT id, text FROM facts WHERE npc_key = ? AND tier = 'significant' "
-                "ORDER BY importance DESC, last_used_at DESC LIMIT ?",
-                (npc_key, max_significant),
-            ).fetchall()
-            used_ids = [r["id"] for r in core] + [r["id"] for r in sig]
-            if used_ids:
-                conn.execute(
-                    f"UPDATE facts SET last_used_at = ? WHERE id IN ({','.join('?' for _ in used_ids)})",
-                    [now, *used_ids],
-                )
             npc = conn.execute("SELECT * FROM npcs WHERE npc_key = ?", (npc_key,)).fetchone()
+            if keys:
+                ph = ",".join("?" for _ in keys)
+                core = conn.execute(
+                    f"SELECT id, text FROM facts WHERE npc_key IN ({ph}) AND tier = 'core' "
+                    "ORDER BY importance DESC, created_at ASC",
+                    keys,
+                ).fetchall()
+                sig = conn.execute(
+                    f"SELECT id, text FROM facts WHERE npc_key IN ({ph}) AND tier = 'significant' "
+                    "ORDER BY importance DESC, last_used_at DESC LIMIT ?",
+                    [*keys, max_significant],
+                ).fetchall()
+                used_ids = [r["id"] for r in core] + [r["id"] for r in sig]
+                if used_ids:
+                    conn.execute(
+                        f"UPDATE facts SET last_used_at = ? WHERE id IN ({','.join('?' for _ in used_ids)})",
+                        [now, *used_ids],
+                    )
             conn.commit()
 
         lines: list[str] = []
@@ -1692,8 +1736,17 @@ class MemoryStore:
             identity = self._identity_line(dict(npc))
             if identity:
                 lines.append(identity)
+        # I4 AMBIGUOUS: can't be sure this is the same person — surface NO personal history.
+        if not gate["inject_personal"]:
+            lines.append("(You do not clearly recognize this individual; you may not have met. Rely on what you "
+                         "know of their faction and role, not personal history — do not claim shared past unless they prove it.)")
+            return "\n".join(lines).strip()
+        # I4 TENTATIVE: half-recognition — recall, but hedged.
+        if gate["hedge"]:
+            lines.append("(You half-recognize this person — you think you've spoken before but are not certain; "
+                         "do not assert specific shared history unless they confirm it.)")
         if npc and npc["summary"]:
-            lines.append("What you remember overall: " + npc["summary"])
+            lines.append(("You vaguely recall discussing: " if gate["hedge"] else "What you remember overall: ") + npc["summary"])
         if core:
             lines.append("Things you will never forget:")
             lines.extend(f"- {r['text']}" for r in core)
@@ -4105,8 +4158,11 @@ def run_memory_selftest() -> dict:
         m = store.metrics(key)
         # 3. Memory now KEEPS EVERYTHING (condensation disabled) — every fed turn is retained.
         check("turns_all_retained", m["turns"] >= total_turns - 1, f"turns={m['turns']} of {total_turns} fed")
-        # 4. No condensation → no auto-generated facts (retrieval handles relevance instead).
-        check("no_auto_condensation", m["facts"] == 0, f"facts={m['facts']}")
+        # 4. A4 (IG-2): record_turn now ADDITIVELY promotes durable facts during play (raw turns are KEPT).
+        # So a few facts are EXPECTED now (was ==0 pre-A4 — this assertion was stale). The anti-lossy
+        # guarantee is that turns are all retained (checked above) and promotion is additive + bounded —
+        # NOT the old lossy condensation that dropped turns.
+        check("additive_promotion_bounded", 0 <= m["facts"] <= 12, f"facts={m['facts']} (A4 additive promotion)")
 
         # 5. CORE content is RETAINED verbatim in raw memory (we keep everything now — no condensation).
         with store._connect() as _c:
@@ -4315,8 +4371,9 @@ def run_npc_identity_selftest() -> dict:
         check("session_expiry", store.expire_session_bindings("sess-A") == 1)
 
         # 8. backfill creates an identity for an UNLINKED npc, and is idempotent/reversible on re-run
-        kc = MemoryStore.make_key("save_006", "g", "Bron Velsk")
-        store.bind_npc(kc, "rt-3", save_id="save_006", game_id="g", name="Bron Velsk", faction_id="teladi")
+        # backfill is chat-NPC-only (I8): the test NPC must be a chat NPC to be picked up.
+        kc = MemoryStore.make_key("save_006", "chat", "Bron Velsk")
+        store.bind_npc(kc, "rt-3", save_id="save_006", game_id="chat", name="Bron Velsk", faction_id="teladi")
         r1 = store.backfill_identities()
         check("backfill_creates", r1["identities_created"] >= 1 and bool(store.get_npc(kc).get("persistent_key")), str(r1))
         r2 = store.backfill_identities()
@@ -4432,6 +4489,63 @@ def run_npc_promotion_selftest() -> dict:
         check("unknown_reason_noop", store.promote_identity(p2, "nonsense") is None)
         # unlinked npc → no-op None
         check("unlinked_npc_noop", store.promote_identity_for_npc(MemoryStore.make_key("s", "g", "Ghost"), "talked") is None)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_npc_recall_gate_selftest() -> dict:
+    """Deterministic oracle for EPIC I (I4): confidence-gated personal-memory recall. Proves a BOUND NPC
+    recalls fully and UNIONS memory across its keys (cross-reload), a TENTATIVE bind hedges, an AMBIGUOUS
+    bind surfaces NO personal history, and an unbound (non-chat) NPC keeps default full recall."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_recall_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "recall.sqlite3")
+        # Same NPC across TWO session keys (the cross-reload union case), one identity.
+        k_old = MemoryStore.make_key("save_a", "chat", "Manda Smitt")
+        k_new = MemoryStore.make_key("save_b", "chat", "Manda Smitt")
+        store.bind_npc(k_old, "rt1", save_id="save_a", game_id="chat", name="Manda Smitt", faction_id="argon")
+        store.bind_npc(k_new, "rt2", save_id="save_b", game_id="chat", name="Manda Smitt", faction_id="argon")
+        pk = store.derive_persistent_key({"name": "Manda Smitt", "faction": "argon"})
+        store.upsert_identity(pk, {"display_name": "Manda Smitt", "faction": "argon"})
+        store.link_npc_to_identity(k_old, pk)
+        store.link_npc_to_identity(k_new, pk)
+        store.add_fact(k_old, "You betrayed us by backing our rivals at Profit Center.", "betrayal")  # core, on the OLD key
+        store.add_fact(k_new, "You rescued our convoy at Hatikvah's Choice.", "rescue")               # significant, NEW key
+
+        # BOUND → full recall, unioned across both keys.
+        store.set_identity_fields(pk, identity_confidence=0.9, status="bound")
+        ctx_b = store.build_memory_context(k_new)
+        check("bound_unions_both_keys", ("rivals" in ctx_b) and ("rescued our convoy" in ctx_b), ctx_b[:200])
+        check("bound_no_hedge", "half-recognize" not in ctx_b)
+
+        # TENTATIVE → still recalls, but hedged.
+        store.set_identity_fields(pk, status="tentative", identity_confidence=0.7)
+        ctx_t = store.build_memory_context(k_new)
+        check("tentative_hedges", "half-recognize" in ctx_t, ctx_t[:160])
+        check("tentative_still_recalls", ("rivals" in ctx_t) or ("rescued our convoy" in ctx_t))
+
+        # AMBIGUOUS → NO personal history surfaced.
+        store.set_identity_fields(pk, status="ambiguous", identity_confidence=0.5)
+        ctx_a = store.build_memory_context(k_new)
+        check("ambiguous_suppresses_personal",
+              ("do not clearly recognize" in ctx_a) and ("rivals" not in ctx_a) and ("rescued our convoy" not in ctx_a),
+              ctx_a[:200])
+
+        # Unbound / non-chat NPC (no identity) → default full recall on its own key (no regression).
+        k_solo = MemoryStore.make_key("save_a", "reaction", "argon High Command")
+        store.bind_npc(k_solo, "rt3", save_id="save_a", game_id="reaction", name="argon High Command", faction_id="argon")
+        store.add_fact(k_solo, "The Xenon pushed into Grand Exchange.", "threat")
+        ctx_s = store.build_memory_context(k_solo)
+        check("unbound_default_recall", ("Grand Exchange" in ctx_s) and ("half-recognize" not in ctx_s), ctx_s[:160])
     finally:
         shutil.rmtree(d, ignore_errors=True)
     return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),

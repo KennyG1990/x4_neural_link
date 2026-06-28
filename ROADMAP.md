@@ -54,7 +54,16 @@ dashboard, player soft-confirm. **Keystone/risk:** re-keying facts/turns/relatio
   selftest **7/7** live (talk→1, never-demote, event→2, abstraction→0, unknown/unlinked no-op). Pure backend,
   in-game gate N/A. **◐ deferred:** wiring promote calls into non-conversation event sources (news/social/
   relationship/assignment handlers) — API ready, conversation path live.
-- **I4** — confidence-gated dialogue + RoleRAG layering [bridge; dialogue half in-game gated].
+- **I4** — confidence-gated dialogue + RoleRAG layering [bridge]. **◐ logic DONE + selftest-verified; in-game
+  dialogue confirmation pending.** Added `identity_recall_gate(npc_key)` + rewrote `build_memory_context` to gate
+  PERSONAL recall by bind status: **bound** → full recall UNIONED across the identity's keys (resolve_memory_keys —
+  finally consumed, the I8-deferred wiring); **tentative** → recall but HEDGED ("you half-recognize…"); **ambiguous**
+  → suppress personal history (faction/role only, never assert shared past). Non-chat/unbound NPCs → default full
+  recall (no regression). **Validated:** new recall selftest **6/6** (bound-unions-both-keys, tentative-hedges,
+  ambiguous-suppresses, unbound-default); I0 13/13, I2 7/7, I3 7/7, core memory selftest green (fixed a STALE A4
+  assertion `no_auto_condensation` that had been silently red since A4's record_turn promotion). **REMAINING (in-game
+  gate):** see it in dialogue — talk to a bound NPC (recalls you) vs an ambiguous one (stays neutral). The RoleRAG
+  boundary layer already injects faction/role context on every call (SPEC 1e); I4 adds the personal-memory gating on top.
 - **I5** — dashboard identity panel + "why bound?" evidence [dashboard]. **✅ DONE 2026-06-28.** `npcIdentity`
   section in `showNpc` fed by enriched `/api/identity` (identity + evidence + memory_keys + bindings +
   name_collisions). Shows status (color-coded), tier+label, confidence, persistent key, runtime id, memory-link
@@ -64,7 +73,29 @@ dashboard, player soft-confirm. **Keystone/risk:** re-keying facts/turns/relatio
   Dashboard observer surface → Chrome render is its bar; in-game gate N/A.
 - **I6** — throttled census priority order [extends #98, in-game gated].
 - **I7** — player soft-confirmation path (guarded, anti-abuse) [bridge; in-game gated].
-- **Build order:** I0 → I2 → I3 → I5 (verifiable now) → I1 → I4 → I6 → I7 (need in-game accessor / player surface).
+- **I8** — fix second-layer misses from the I1 wiring [bridge]. **✅ DONE 2026-06-28.** DEFECT fixed: the rebind in
+  `npc_complete` fired for ALL callers (reactions/news/influence), polluting identities (Galaxy News Desk ×5, High
+  Command dups) — now gated to `game_id=='chat'` (real player conversations only). CLEANUP: chat-only backfill +
+  `reset_identities()` + `/api/identity/reset` → 22 junk identities cleared, rebuilt to 3 real chat NPCs, zero dups.
+  Validated: I0 13/13 (selftest updated for chat-only backfill), I2 7/7, I3 7/7; dashboard identities clean. The
+  `resolve_memory_keys` union (earlier flagged) is DEFERRED to I4 — low-value now (npc_key stable per playthrough →
+  memory already persists), real consumer is I4's confidence-gated retrieval.
+- **Build order:** I0 → I2 → I3 → I5 (verifiable now) → I1 → **I8 (cleanup)** → I4 → I6 → I7 (need in-game accessor / player surface).
+
+## ★ CONVERSATION UX — choice-driven dialogue (Ken, 2026-06-28)
+- **Chat wheel: instant presets + conversation-aware suggestions [#112]. ◐ code-done + Forge-validated; in-game pending.**
+  First wheel shows instant presets (no '(thinking)' placeholder); LLM suggestions follow the conversation
+  (generate_suggestions reads recent turns) and refresh each open. Validate in-game: /refreshmd → open wheel.
+- **Conversation flow: choice-driven loop, don't force the text box [#113]. SPEC'D (not built).** Picking a
+  suggested option currently forces the edit-box (Open_chat → custom window focused on typing). Target = ME-style:
+  pick choice → NPC replies → new contextual choices → pick; text box ONLY via "Type my own message"; "Goodbye"
+  ends. Design B (chosen): render suggestions as CLICKABLE BUTTONS in the existing aic_menu window, stop
+  auto-focusing the edit-box — reuses the window (async reply display) + #112's conversation-aware suggestions.
+  Full design: [[../../../StarForge/wiki/x4-neural-link/conversation-flow-spec]].
+- **Bugfix: chat window not isolated per NPC [#114]. ◐ FIXED; in-game pending.** The window transcript
+  (`menu.history`) was never reset between conversations → showed every NPC's turns, relabeled to the current NPC
+  (bridge memory was fine — isolated by npc_key). Fix: reset `termMenu.history` on NPC change (onOpenCommLink).
+  Validate: /reloadui → talk to two NPCs → each window shows only its own turns.
 
 
 **Status:** backend ✅ · **conversation → real gamestate change LIVE + verified in-game ✅** (declare war in

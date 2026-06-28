@@ -13,7 +13,7 @@ from .events import EventQueue
 from .memory import (
     MemoryStore, run_memory_selftest, run_memory_stress,
     run_universe_selftest, run_full_stress, run_npc_identity_selftest,
-    run_npc_rebind_selftest, run_npc_promotion_selftest,
+    run_npc_rebind_selftest, run_npc_promotion_selftest, run_npc_recall_gate_selftest,
 )
 from .player2_client import Player2Client
 from .telemetry import BridgeTelemetry
@@ -221,6 +221,10 @@ class NeuralRouter:
         """Deterministic oracle for I3 importance-tier promotion."""
         return run_npc_promotion_selftest()
 
+    def npc_recall_gate_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for I4 confidence-gated recall (bound/tentative/ambiguous + union)."""
+        return run_npc_recall_gate_selftest()
+
     def identity_promote(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Promote an identity's tracking priority. payload: {persistent_npc_key|npc_key, reason}."""
         payload = payload or {}
@@ -243,8 +247,12 @@ class NeuralRouter:
         )
 
     def identity_backfill(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Give every existing npcs row a persistent identity (idempotent + reversible)."""
+        """Give every existing chat-NPC row a persistent identity (idempotent + reversible)."""
         return self.memory.backfill_identities()
+
+    def identity_reset(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """I8 cleanup: wipe + rebuild the identity layer from chat NPCs only (clears pre-gate pollution)."""
+        return self.memory.reset_identities()
 
     def identities_list(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         return {"ok": True, "identities": self.memory.list_identities()}

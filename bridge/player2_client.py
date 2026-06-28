@@ -671,12 +671,25 @@ class Player2Client:
         RAG-grounded in the NPC's faction standing + recent memory. In-world only."""
         fac = str(faction_id or "argon")
         ctx_parts: list[str] = []
+        in_progress = False
         if self.memory is not None:
+            npc_key = self.memory.make_key(save_id, game_id, npc_name or "")
             try:
-                npc_key = self.memory.make_key(save_id, game_id, npc_name or "")
                 brief = self.memory.build_situation_briefing(npc_key)
                 if brief:
                     ctx_parts.append(str(brief))
+            except Exception:
+                pass
+            # Continuity: feed the recent conversation so the openers FOLLOW the chat (a natural next line),
+            # instead of restarting. When there are no turns yet, the MD shows instant presets — no LLM needed.
+            try:
+                turns = self.memory.get_recent_turns(npc_key, limit=6)
+                if turns:
+                    in_progress = True
+                    convo = "\n".join(
+                        (("Player" if str(t.get("role")) == "user" else (npc_name or "NPC")) + ": " + str(t.get("content") or ""))
+                        for t in turns)
+                    ctx_parts.append("The conversation so far (your suggestions must continue THIS naturally):\n" + convo)
             except Exception:
                 pass
             try:
@@ -688,7 +701,12 @@ class Player2Client:
                 pass
         instruction = (
             "You suggest things the PLAYER could say to " + (npc_name or "this character") + ", a " + fac +
-            " character in the universe of X4: Foundations. Propose exactly " + str(count) + " DISTINCT, "
+            " character in the universe of X4: Foundations." +
+            (" The conversation is ALREADY IN PROGRESS — your suggestions must FOLLOW what was just said "
+             "(a natural next line, a follow-up question, a reaction to their last reply), NOT restart it."
+             if in_progress else
+             " This is the START of the conversation — propose natural opening lines.") +
+            " Propose exactly " + str(count) + " DISTINCT, "
             "contextually relevant openers — vary them (a question, a probe, a request). Each item has a "
             "short 2-4 word menu label (Mass Effect wheel style) and the fuller single sentence the player "
             "would actually speak. Stay strictly inside the X4 universe. Respond with ONLY a JSON array, "
@@ -1014,31 +1032,31 @@ class Player2Client:
                 # layer from the evidence we have (name+faction+role+skills, + macro/sector when the UI
                 # captured them). macro is the corroborator that lifts a re-encountered NPC tentative→bound,
                 # so memory survives a reload (#99). Advisory — never break a reply over identity bookkeeping.
-                try:
-                    _row = self.memory.get_npc(npc_key) or {}
-                    # The UI chat sends evidence in prompt_vars (full_context) → request.METADATA, not target
-                    # (aic_menu.lua SendToBridge). So read macro/sector/runtime from metadata first, with
-                    # target + the stored row as fallbacks. macro is the corroborator that lifts tentative→bound.
-                    _meta = request.metadata if isinstance(request.metadata, dict) else {}
-                    self.memory.rebind_session(save_id or "live", [{
-                        "npc_key": npc_key,
-                        "runtime_component_id": str(request.target.get("runtime_component_id") or _meta.get("runtime_component_id") or request.target.get("component") or ""),
-                        # Base evidence from the stored row (indexing populates name/faction/role/skills),
-                        # overlaid with fresh chat evidence (macro/sector) from the UI.
-                        "name": _row.get("name") or persona.get("name") or "",
-                        "faction": _row.get("faction_id") or fac,
-                        "role": _row.get("role") or npc_stats.get("role") or "",
-                        "macro": request.target.get("macro") or _meta.get("macro") or npc_stats.get("macro") or _row.get("macro") or "",
-                        "sector": npc_stats.get("sector") or _meta.get("sector") or _row.get("sector") or "",
-                        "skills": _row.get("skills") or npc_stats.get("skills"),
-                        "recently_talked": True,
-                    }], save_id=save_id)
-                    # Promote AFTER the rebind links the identity (record_turn's hook above runs before the
-                    # link exists on a brand-new NPC, so it no-ops). This guarantees a talked-to NPC reaches
-                    # Tier 1 (player-significant) on the very first conversation.
-                    self.memory.promote_identity_for_npc(npc_key, "talked")
-                except Exception:
-                    pass
+                # I8 GATE: only REAL player conversations (game_id=='chat') drive the identity rebind.
+                # npc_complete is also called for faction reactions / news / influence steps — those are NOT
+                # persons and were polluting the identities table (Galaxy News Desk ×5, High Command dups).
+                if str(game_id) == "chat":
+                    try:
+                        _row = self.memory.get_npc(npc_key) or {}
+                        # The UI chat sends evidence in prompt_vars → router promotes pv.macro/sector/runtime to
+                        # request.TARGET (see router build); read target first, then metadata + the stored row.
+                        _meta = request.metadata if isinstance(request.metadata, dict) else {}
+                        self.memory.rebind_session(save_id or "live", [{
+                            "npc_key": npc_key,
+                            "runtime_component_id": str(request.target.get("runtime_component_id") or _meta.get("runtime_component_id") or request.target.get("component") or ""),
+                            "name": _row.get("name") or persona.get("name") or "",
+                            "faction": _row.get("faction_id") or fac,
+                            "role": _row.get("role") or npc_stats.get("role") or "",
+                            "macro": request.target.get("macro") or _meta.get("macro") or npc_stats.get("macro") or _row.get("macro") or "",
+                            "sector": request.target.get("sector") or npc_stats.get("sector") or _meta.get("sector") or _row.get("sector") or "",
+                            "skills": _row.get("skills") or npc_stats.get("skills"),
+                            "recently_talked": True,
+                        }], save_id=save_id)
+                        # Promote AFTER the rebind links the identity (record_turn's hook ran before the link
+                        # existed on a brand-new NPC). Guarantees a talked-to NPC reaches Tier 1 immediately.
+                        self.memory.promote_identity_for_npc(npc_key, "talked")
+                    except Exception:
+                        pass
                 # Rolling TOPIC summary for long-range continuity. Every 4 turns (to bound LLM calls):
                 # re-summarize recent turns into a thematic gist stored on the NPC (auto-injected by
                 # build_memory_context as "What you remember overall").

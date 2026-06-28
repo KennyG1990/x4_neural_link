@@ -100,8 +100,14 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/identity/promotion_selftest":
             self._send_json(200, self.router.npc_promotion_selftest())
             return
+        if parsed.path == "/api/identity/recall_selftest":
+            self._send_json(200, self.router.npc_recall_gate_selftest())
+            return
         if parsed.path == "/api/identity/backfill":
             self._send_json(200, self.router.identity_backfill())
+            return
+        if parsed.path == "/api/identity/reset":
+            self._send_json(200, self.router.identity_reset())
             return
         if parsed.path == "/api/identities":
             self._send_json(200, self.router.identities_list())
