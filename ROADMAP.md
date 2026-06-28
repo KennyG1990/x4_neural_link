@@ -217,6 +217,14 @@ Tier-2 (controlentity, grounded — schema + conversation.xml). Forge `project/v
 (only "error" = `missing_content_xml`, a single-file artifact; cross-file/lua warnings are single-file artifacts
 too). `find_station groupname=` for `multiple` (DeadAir pattern). NEXT (in-game gate): `/refreshmd` → stand in a
 sector with stations → confirm the dashboard NPC roster gains those station managers WITHOUT a chat.
+      **IN-GAME RESULT 2026-06-27 (3× /refreshmd, diagnostic debug_text):** cue FIRES every tick; `find_station
+      space="player.sector"` = **24 stations ✓**; BUT no MD property exposes a station's commanding NPC —
+      `controlentity` (ship-only) AND `manager` both give `npcs=[]` for AI-faction stations. **2 guesses failed →
+      STOPPED guessing (stop-and-research).** Census wiring DISABLED (library kept, DORMANT). **BLOCKED on the
+      grounded station-NPC / person-enumeration accessor** — likely AI stations don't expose a manager-person to
+      MD, so this needs the vanilla crew/station-info menu primitive (SAME gap as Tier-1). → Codex grounding:
+      find the accessor in `scriptproperties.xml` + the unpacked ego crew/station menu lua, then re-enable the two
+      `run_actions ref=…Census_npcs`. Proven + ready: cue scaffold, find_station, the index→bridge→dashboard path.
 - **A4 — Fact-promotion tuning [IG-2, HIGH]. ✅ DONE+VERIFIED 2026-06-27 (live).** Root cause (reconcile):
   condensation is DELIBERATELY disabled (raw turns kept full-fidelity for retrieval — Codex's accuracy choice)
   and `promote_durable_facts` was ON-DEMAND only (ran once via #77 → 11 facts). FIX: auto-wire promotion into
