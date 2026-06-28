@@ -72,7 +72,19 @@ dashboard, player soft-confirm. **Keystone/risk:** re-keying facts/turns/relatio
   pid:40f717bb500f · 1 memory link · evidence 4 · last seen 18m ago · why bound? faction/name/role/skill_vector".
   Dashboard observer surface → Chrome render is its bar; in-game gate N/A.
 - **I6** — throttled census priority order [extends #98, in-game gated].
-- **I7** — player soft-confirmation path (guarded, anti-abuse) [bridge; in-game gated].
+- **I7** — player soft-confirmation path (guarded, anti-abuse) [bridge]. **◐ logic DONE + selftest-verified;
+  player-facing recall effect in-game pending.** (2026-06-28) `memory.soft_confirm_identity(npc_key, assertion)`:
+  promotes a TENTATIVE bind → BOUND **iff** the player's message shares ≥2 significant words (stopword-filtered,
+  >3 chars) with the NPC's REAL stored memory (facts + last 40 turns, unioned via `resolve_memory_keys`).
+  Anti-abuse: an unsupported claim is a no-op — never promotes without a memory match, never merges identities,
+  never invents memory; never throws. Wired into `npc_complete` after the rebind, **gated to game_id=='chat'**
+  (same gate as I8). Effect: after the player asserts shared history that checks out, the NPC stops hedging
+  ("I half-recognize you") and recalls fully on the next turn (I4 gate). VALIDATE: `run_soft_confirm_selftest`
+  **6/6** (match→promote · unsupported→reject · already-bound no-op · thin-assertion reject); full identity suite
+  green post-change (identity 13/13, rebind 7/7, promotion 7/7, recall 6/6, role 11/11, memory 15/15 — no
+  regression). Endpoints: GET `/api/identity/soft_confirm_selftest`, POST `/api/identity/soft_confirm`
+  `{npc_key, assertion}`. **◐ in-game pending:** confirm in-game that asserting real shared history flips a
+  tentative NPC to full recognition.
 - **I8** — fix second-layer misses from the I1 wiring [bridge]. **✅ DONE 2026-06-28.** DEFECT fixed: the rebind in
   `npc_complete` fired for ALL callers (reactions/news/influence), polluting identities (Galaxy News Desk ×5, High
   Command dups) — now gated to `game_id=='chat'` (real player conversations only). CLEANUP: chat-only backfill +
@@ -92,10 +104,31 @@ dashboard, player soft-confirm. **Keystone/risk:** re-keying facts/turns/relatio
   ends. Design B (chosen): render suggestions as CLICKABLE BUTTONS in the existing aic_menu window, stop
   auto-focusing the edit-box — reuses the window (async reply display) + #112's conversation-aware suggestions.
   Full design: [[../../../StarForge/wiki/x4-neural-link/conversation-flow-spec]].
+  **◐ P1+P2 BUILT 2026-06-28 (in-game pending).** aic_menu renders 3 choice buttons (suggestions/presets) +
+  "Type my own message" (the ONLY path to the edit-box; no auto-focus) + "Goodbye"; picking sends the line and the
+  choices refresh after each reply (aic_uix.FetchSuggestions GET /api/suggest; onOpenCommLink resets+fetches;
+  handleUpdates refreshes). Second-layer re-read clean; /api/suggest returns 3 labeled choices; bridge 13/13.
+  Validate in-game: /reloadui → pick a choice → NOT forced into the text box → reply → choices update. P3/P4 pending.
 - **Bugfix: chat window not isolated per NPC [#114]. ◐ FIXED; in-game pending.** The window transcript
   (`menu.history`) was never reset between conversations → showed every NPC's turns, relabeled to the current NPC
   (bridge memory was fine — isolated by npc_key). Fix: reset `termMenu.history` on NPC change (onOpenCommLink).
   Validate: /reloadui → talk to two NPCs → each window shows only its own turns.
+- **Bugfix: NPC role mis-recorded (manager → crew) [#115]. ✅ DONE 2026-06-28.** MD role cue only detects
+  entityrole marine/service → managers/pilots default to generic 'crew'. Fix (skills-based, avoids unverifiable
+  enum): `role_from_skills` (dominant non-morale skill ≥5 & > runner-up → manager/pilot/engineer/marine) +
+  `_role_with_skills` override in bind_npc/index_npc; `reinfer_roles()` one-shot for existing rows. Validated: role
+  selftest 11/11, all selftests green, bridge stable; **Selaia → "manager"**, Manda stays "service crew". Both
+  helpers hardened never-throw (they run in the heartbeat's hot bind/index path). CAUTION banked: a replace_all of
+  the role line also hit a substring inside `_role_with_skills` → self-recursion → crashed the bridge until fixed.
+- **Follow-up [#117]: propagate the inferred role to the IDENTITIES mirror. ✅ DONE + live-verified 2026-06-28.**
+  Second-layer finding during the in-game pass: #115 fixed the `npcs` role (Selaia → manager) but the
+  `npc_identities` row stayed stale 'crew' (the dashboard identity panel misreported her). `reinfer_roles()` now,
+  after fixing `npcs.role`, also propagates a SPECIFIC role to the linked identity when the identity's role is still
+  generic/empty — guarded so it never clobbers a non-generic identity role. (The ongoing path was already fine:
+  rebind passes the npcs role into `upsert_identity`, which COALESCE-overwrites.) Validated: role selftest **14/14**
+  (+3: stale-before, propagated, specific-preserved), full identity suite green (identity 13/13, rebind 7/7,
+  promotion 7/7, recall 6/6, soft_confirm 6/6, memory 15/15), and **live `reinfer_roles` → identities_fixed:1,
+  Selaia's identity now reads "manager"** on the dashboard.
 
 
 **Status:** backend ✅ · **conversation → real gamestate change LIVE + verified in-game ✅** (declare war in
@@ -396,10 +429,29 @@ L=heavy in-game UI/gated. Each closes with named validation (`:8713` selftest/en
   avoid spam. **Validate:** beats fire on real transitions, throttled; comms queue not flooded.
 
 **Tier 2 — plan-next (heavier or one confirmation away):**
-- **M5 — NPC-initiated → openable chat [M, observed, doc B].** Upgrade the comms queue (#27–#30) from
-  "text in logbook" to "a faction is hailing you" → opening it drops into a live chat with that NPC pre-seeded
-  with why. The world reaches OUT (blueprint §5.6/§5.7). **Confirm first:** chat UI can open targeting a specific
-  NPC. **Validate:** in-game hail → open → contextual chat.
+- **M5 — NPC-initiated → openable chat [M, observed, doc B]. ◐ SPEC'D 2026-06-28 (Ken) — full spec:
+  `F:\StarForge\wiki\x4-neural-link\m5-npc-initiated-chat-spec.md`.** Decision: NPCs contact the player via X4's
+  **native Messages system** (From:<NPC>), each message with a **Reply** button that opens the comm-link chat
+  targeted at that NPC, with memory continuity. RECONCILED: chat-open works from name+faction with **no physical
+  entity** (confirmed via Explore recon); the gap is (a) the player_comms payload carries faction only — needs a
+  SENDER NPC identity, and (b) messages aren't actionable — needs a Reply hook. Phasing: M5a bridge sender-identity
+  enrichment (verifiable now) → M5b MD/Lua Messages-post + Reply→Open_chat (Forge-validated) → M5c in-game gate.
+  OPEN DECISION (resolve at build): exact native Reply hook — (A) patch the vanilla Messages menu [most faithful,
+  fragile] / (B) Interact Menu API + hotkey [light] / (C) mod-owned Transmissions window w/ Reply [robust];
+  recommend prototyping A, fall back to C. Anti-cheat: reply chat is words-only (no world mutation). **Validate:**
+  bridge selftest (sender) + dashboard (queued transmissions carry sender) + in-game (message From NPC → Reply →
+  continuous chat).
+  - **M5a ✅ DONE + live-verified 2026-06-28.** `_build_comms` now enriches every communiqué via the pure helper
+    `comms_sender_fields(save,fid,fname,rep,kind,reasons)` → `{tx_id, sender_name, sender_faction, sender_npc_key,
+    sender_role, priority}`. Sender = the faction's named representative (`factions.representative`) when known,
+    else `"<Faction> High Command"`; `sender_npc_key = save|chat|<name>` (the key the Reply chat opens →
+    that NPC's unioned memory); `tx_id` = `tx_<uuid>` (isolation-registry key); priority high for
+    major/near/threat/favour else low. VALIDATE: `run_comms_sender_selftest` **9/9**, memory 15/15 (no regression),
+    and **live `POST /v1/player_comms/prove` (argon) → comm carries tx_id + sender "Melissa Mettel" +
+    sender_npc_key `game_301276512|chat|Melissa Mettel` + priority high.** Endpoint: GET
+    `/api/comms/sender_selftest`. CAUGHT BY SELFTEST: first cut minted `tx_id` from `time.time_ns()` → collided on
+    rapid calls (coarse Windows ns granularity) → switched to `uuid4`. **M5b/M5c pending** (MD/Lua Messages-post +
+    Reply menu-patch; in-game).
 - **M6 — Player2 voice/TTS [M, observed-with-caveat, doc C].** Route NPC lines through Player2 TTS; play on
   desktop audio + a TTS on/off toggle. **Honest caveat:** audio is desktop-companion, NOT in-engine X4 audio
   (true in-world voice is L/gated). **Validate:** spoken line plays; toggle works.

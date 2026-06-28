@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any, Optional
@@ -14,6 +15,7 @@ from .memory import (
     MemoryStore, run_memory_selftest, run_memory_stress,
     run_universe_selftest, run_full_stress, run_npc_identity_selftest,
     run_npc_rebind_selftest, run_npc_promotion_selftest, run_npc_recall_gate_selftest,
+    run_role_inference_selftest, run_soft_confirm_selftest,
 )
 from .player2_client import Player2Client
 from .telemetry import BridgeTelemetry
@@ -38,6 +40,56 @@ except ImportError:  # pragma: no cover - non-package execution
     import catdat as catdat_mod  # type: ignore
     import diplomacy as diplomacy_mod  # type: ignore
     import offers as offers_mod  # type: ignore
+
+
+def comms_sender_fields(save_id: str, fid: str, fname: str, rep: str, kind: str, reasons: list) -> dict:
+    """M5a: derive the SENDER + transmission-id fields for a player communiqué. Pure (no LLM/DB) so it's
+    deterministically testable. sender = the faction's named representative when known, else '<Faction> High
+    Command'. sender_npc_key is the chat key the Reply will open (save|chat|name) → resolves the NPC's memory.
+    priority gates the Messages High/Low tab. tx_id is the stable per-transmission id for the menu isolation
+    registry (§4.1) and tells the reply chat which message is being answered."""
+    sender_name = (rep or "").strip() or (f"{fname} High Command")
+    reasons = reasons or []
+    priority = "high" if ("major" in reasons or "near" in reasons or kind in ("threat", "favour")) else "low"
+    return {
+        "tx_id": "tx_" + uuid.uuid4().hex[:12],
+        "sender_name": sender_name,
+        "sender_faction": fid,
+        "sender_npc_key": MemoryStore.make_key(save_id, "chat", sender_name),
+        "sender_role": "faction_representative",
+        "priority": priority,
+    }
+
+
+def run_comms_sender_selftest() -> dict:
+    """Deterministic oracle for M5a: a known representative becomes the sender; otherwise a named faction-rep
+    fallback; sender_npc_key is the chat key for that name; priority follows major/near/threat/favour; tx_id is
+    present, prefixed, and unique per call."""
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    rep = comms_sender_fields("game_1", "argon", "Argon Federation", "Melissa Mettel", "alert", ["major"])
+    check("uses_named_representative", rep["sender_name"] == "Melissa Mettel", rep["sender_name"])
+    check("sender_key_is_chat_key", rep["sender_npc_key"] == MemoryStore.make_key("game_1", "chat", "Melissa Mettel"))
+    check("sender_faction_set", rep["sender_faction"] == "argon" and rep["sender_role"] == "faction_representative")
+    check("major_is_high_priority", rep["priority"] == "high")
+
+    fb = comms_sender_fields("game_1", "teladi", "Teladi Company", "", "alert", [])
+    check("fallback_rep_name", fb["sender_name"] == "Teladi Company High Command", fb["sender_name"])
+    check("no_reason_is_low_priority", fb["priority"] == "low", fb["priority"])
+
+    threat = comms_sender_fields("game_1", "split", "Split", "", "threat", [])
+    check("threat_is_high_priority", threat["priority"] == "high")
+
+    check("tx_id_prefixed", str(rep["tx_id"]).startswith("tx_"))
+    a = comms_sender_fields("game_1", "argon", "Argon", "X", "alert", [])
+    b = comms_sender_fields("game_1", "argon", "Argon", "X", "alert", [])
+    check("tx_id_unique", a["tx_id"] != b["tx_id"], f'{a["tx_id"]} vs {b["tx_id"]}')
+
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
 
 
 class NeuralRouter:
@@ -225,6 +277,29 @@ class NeuralRouter:
         """Deterministic oracle for I4 confidence-gated recall (bound/tentative/ambiguous + union)."""
         return run_npc_recall_gate_selftest()
 
+    def role_inference_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for skill-based role inference (manager/pilot/… from skills)."""
+        return run_role_inference_selftest()
+
+    def npc_soft_confirm_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for I7 player soft-confirmation (match→promote, unsupported→reject)."""
+        return run_soft_confirm_selftest()
+
+    def identity_soft_confirm(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """I7: promote a tentative bind IFF the player's assertion matches stored memory.
+        payload: {npc_key, assertion}."""
+        payload = payload or {}
+        return self.memory.soft_confirm_identity(
+            str(payload.get("npc_key") or ""), str(payload.get("assertion") or ""))
+
+    def reinfer_roles(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """One-shot: correct existing generic-role rows from their skills (fixes pre-inference records)."""
+        return self.memory.reinfer_roles()
+
+    def comms_sender_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for M5a: player-comms sender/tx_id/priority enrichment."""
+        return run_comms_sender_selftest()
+
     def identity_promote(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Promote an identity's tracking priority. payload: {persistent_npc_key|npc_key, reason}."""
         payload = payload or {}
@@ -384,7 +459,7 @@ class NeuralRouter:
                 "canon_relations": len(self.memory.list_relationships(canon))}
 
     def suggest(self, save_id: str, faction_id: str, npc_name: str,
-                game_id: str = "x4_neural_link", count: int = 3) -> dict[str, Any]:
+                game_id: str = "chat", count: int = 3) -> dict[str, Any]:
         """ME-wheel openers for a conversation: `count` short paraphrase labels + the fuller line,
         RAG-grounded in the NPC's faction standing + memory. faction_id may be a display name."""
         sugg = self.player2.generate_suggestions(
@@ -2004,8 +2079,19 @@ class NeuralRouter:
         title_word = {"threat": "WARNING", "favour": "OVERTURE"}.get(kind, "STRATEGIC ALERT")
         # Diplomacy for overtures/peace/alliance; Alerts for threats/war/embargo.
         category = "diplomacy" if (kind == "favour" or action in ("form_alliance", "sue_for_peace")) else "alerts"
-        return {"title": f"{fname.upper()} {title_word}", "body": body, "faction": fid,
+        # M5a: name a SENDER (the faction's representative NPC) + a stable transmission id, so the message can be
+        # posted to the native Messages system "From: <NPC>" and the menu patch can attach a Reply ONLY to our tx
+        # (isolation §4.1). The reply chat resolves sender_npc_key (save|chat|name) → that NPC's unioned memory.
+        rep = ""
+        try:
+            fac = self.memory.get_faction(save_id, fid) or {}
+            rep = str(fac.get("representative") or "").strip()
+        except Exception:
+            rep = ""
+        base = {"title": f"{fname.upper()} {title_word}", "body": body, "faction": fid,
                 "faction_name": fname, "category": category, "kind": kind, "save_id": save_id, "ts": time.time()}
+        base.update(comms_sender_fields(save_id, fid, fname, rep, kind, reasons))
+        return base
 
     def _maybe_player_comms(self, save_id: str, fid: str, dec: dict) -> Optional[dict]:
         """Evaluate the 3 triggers for a freshly-made decision; if any fires (and not on cooldown), build +

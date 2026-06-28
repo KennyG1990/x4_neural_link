@@ -20,7 +20,7 @@ burning joules.
 
 from __future__ import annotations
 
-import hashlib
+import hashlib  # identity keys + skill-based role inference
 import json
 import re
 import sqlite3
@@ -656,6 +656,90 @@ class MemoryStore:
         except Exception:
             return default
 
+    # Role inference (bugfix 2026-06-28): the MD only detects entityrole marine/service and defaults
+    # everything else (managers, pilots, …) to a generic 'crew'. When the role is generic but the skill
+    # vector clearly dominates, infer the real posting from the dominant non-morale skill (morale is
+    # universal). So a station Manager (management-dominant) is recorded as 'manager', not 'crew'.
+    GENERIC_ROLES = frozenset({"", "crew", "default", "officer", "faction officer"})
+    SKILL_ROLE = {"management": "manager", "piloting": "pilot", "engineering": "engineer", "boarding": "marine"}
+
+    @staticmethod
+    def role_from_skills(skills: Any) -> str:
+        """Dominant crew skill → posting (manager/pilot/engineer/marine), morale excluded. Requires a clear
+        lead (top >= 5 of 15 and strictly above the runner-up) to avoid noise. '' if none."""
+        try:
+            if isinstance(skills, str):
+                try:
+                    skills = json.loads(skills)
+                except Exception:
+                    return ""
+            if not isinstance(skills, dict):
+                return ""
+            pairs: list[tuple[str, float]] = []
+            for k, v in skills.items():
+                if k not in MemoryStore.SKILL_ROLE or v in (None, ""):
+                    continue
+                try:
+                    pairs.append((k, float(v)))
+                except (TypeError, ValueError):
+                    continue
+            if not pairs:
+                return ""
+            pairs.sort(key=lambda kv: kv[1], reverse=True)
+            top_k, top_v = pairs[0]
+            second_v = pairs[1][1] if len(pairs) > 1 else 0.0
+            return MemoryStore.SKILL_ROLE[top_k] if (top_v >= 5 and top_v > second_v) else ""
+        except Exception:
+            return ""
+
+    def _role_with_skills(self, stats: Any) -> str:
+        """The MD-provided role if specific; else inferred from the skill vector; else as given. NEVER throws
+        (it runs in the hot bind/index path the heartbeat hammers — bad input must degrade, not crash)."""
+        try:
+            stats = stats if isinstance(stats, dict) else {}
+            role = str(stats.get("role") or "").strip()
+            if role.lower() in MemoryStore.GENERIC_ROLES:
+                inferred = MemoryStore.role_from_skills(stats.get("skills"))
+                if inferred:
+                    return inferred
+            return role
+        except Exception:
+            return ""
+
+    def reinfer_roles(self) -> dict:
+        """One-shot: correct existing npcs rows whose stored role is generic but whose skills clearly
+        indicate a posting (fixes records captured before the inference existed), AND propagate the
+        corrected/specific role to each NPC's linked persistent identity (the dashboard identity mirror —
+        otherwise a re-inferred 'manager' stays 'crew' on the identity until the NPC is next talked to).
+        Read-only otherwise; never clobbers a non-generic identity role."""
+        fixed = 0
+        idents_fixed = 0
+        with self._connect() as conn:
+            rows = conn.execute("SELECT npc_key, role, skills, persistent_key FROM npcs").fetchall()
+        for r in rows:
+            cur = str(r["role"] or "").strip()
+            inferred = self.role_from_skills(r["skills"])
+            # 1) Fix the npcs-table role when it's generic but the skills clearly say otherwise.
+            if inferred and cur.lower() in MemoryStore.GENERIC_ROLES and inferred != cur:
+                with self._lock, self._connect() as conn:
+                    conn.execute("UPDATE npcs SET role = ? WHERE npc_key = ?", (inferred, r["npc_key"]))
+                    conn.commit()
+                fixed += 1
+                cur = inferred
+            # 2) Propagate a SPECIFIC role to the linked identity if its role is still generic/empty.
+            pkey = str(r["persistent_key"] or "").strip()
+            if pkey and cur and cur.lower() not in MemoryStore.GENERIC_ROLES:
+                with self._lock, self._connect() as conn:
+                    iv = conn.execute("SELECT role FROM npc_identities WHERE persistent_npc_key = ?", (pkey,)).fetchone()
+                    if iv is not None:
+                        irole = str(iv["role"] or "").strip()
+                        if irole.lower() in MemoryStore.GENERIC_ROLES and irole.lower() != cur.lower():
+                            conn.execute("UPDATE npc_identities SET role = ?, updated_at = ? WHERE persistent_npc_key = ?",
+                                         (cur, time.time(), pkey))
+                            conn.commit()
+                            idents_fixed += 1
+        return {"ok": True, "rows_fixed": fixed, "identities_fixed": idents_fixed}
+
     def bind_npc(
         self,
         npc_key: str,
@@ -679,7 +763,7 @@ class MemoryStore:
         skills_json = json.dumps(skills) if skills is not None else None
         stats_json = json.dumps(stats) if stats else None
         race = str(stats.get("race") or "")
-        role = str(stats.get("role") or "")
+        role = self._role_with_skills(stats)
         ship_class = str(stats.get("ship_class") or "")
         gender = str(stats.get("gender") or "")
         ship_name = str(stats.get("ship_name") or "")
@@ -729,7 +813,7 @@ class MemoryStore:
         skills_json = json.dumps(skills) if skills is not None else None
         stats_json = json.dumps(stats) if stats else None
         race = str(stats.get("race") or "")
-        role = str(stats.get("role") or "")
+        role = self._role_with_skills(stats)
         ship_class = str(stats.get("ship_class") or "")
         gender = str(stats.get("gender") or "")
         ship_name = str(stats.get("ship_name") or "")
@@ -1297,6 +1381,55 @@ class MemoryStore:
             row = conn.execute("SELECT persistent_key FROM npcs WHERE npc_key = ?", (npc_key,)).fetchone()
         pkey = row["persistent_key"] if row else None
         return self.promote_identity(pkey, reason) if pkey else None
+
+    # --- EPIC I (I7): player soft-confirmation of a tentative bind --------------
+    # Words too common to count as a "specific" shared-history match (incl. the recall verbs themselves).
+    _CONFIRM_STOPWORDS = frozenset({
+        "about", "after", "again", "ago", "also", "another", "back", "been", "before", "being", "could",
+        "discussed", "does", "doing", "down", "earlier", "from", "have", "here", "into", "just", "know",
+        "last", "like", "mentioned", "more", "much", "remember", "said", "same", "she", "some", "spoke",
+        "still", "talk", "talked", "than", "that", "their", "them", "then", "there", "these", "they",
+        "thing", "things", "this", "those", "time", "told", "very", "want", "we're", "well", "were", "what",
+        "when", "where", "which", "while", "with", "would", "yesterday", "your", "yours", "you're",
+    })
+
+    @staticmethod
+    def _significant_words(text: str) -> set:
+        """Content words (>3 chars, not a stopword) used to test whether a player's claim of shared history
+        overlaps the NPC's REAL stored memory."""
+        return {w for w in re.findall(r"[a-z0-9']+", str(text or "").lower())
+                if len(w) > 3 and w not in MemoryStore._CONFIRM_STOPWORDS}
+
+    def soft_confirm_identity(self, npc_key: str, assertion: str, min_overlap: int = 2) -> dict:
+        """I7: when an NPC is bound TENTATIVE and the player asserts shared history, promote to BOUND ONLY IF the
+        assertion matches the NPC's STORED memory (>= min_overlap significant words shared with a real fact/turn).
+        Never promotes on an unsupported claim (anti-abuse); never merges identities or invents memory; never throws."""
+        try:
+            claim = self._significant_words(assertion)
+            if len(claim) < min_overlap:
+                return {"promoted": False, "reason": "assertion too thin"}
+            npc = self.get_npc(npc_key)
+            pkey = (npc or {}).get("persistent_key")
+            if not pkey:
+                return {"promoted": False, "reason": "no identity"}
+            ident = self.get_identity(pkey) or {}
+            if str(ident.get("status") or "") != "tentative":
+                return {"promoted": False, "reason": "not tentative"}
+            best, matched = 0, ""
+            for k in (self.resolve_memory_keys(pkey) or [npc_key]):
+                texts = [str(f.get("text") or "") for f in self.get_facts(k)]
+                texts += [str(t.get("content") or "") for t in self.get_recent_turns(k, limit=40)]
+                for txt in texts:
+                    ov = len(claim & self._significant_words(txt))
+                    if ov > best:
+                        best, matched = ov, txt
+            if best >= min_overlap:
+                conf = max(float(ident.get("identity_confidence") or 0.0), 0.85)
+                self.set_identity_fields(pkey, status="bound", identity_confidence=conf)
+                return {"promoted": True, "overlap": best, "matched_on": matched[:120]}
+            return {"promoted": False, "reason": "no memory match", "overlap": best}
+        except Exception:
+            return {"promoted": False, "reason": "error"}
 
     # --- Turns (Stage A) ------------------------------------------------------
 
@@ -4495,6 +4628,60 @@ def run_npc_promotion_selftest() -> dict:
             "total": len(checks), "checks": checks}
 
 
+def run_role_inference_selftest() -> dict:
+    """Deterministic oracle for skill-based role inference (bugfix): a management-dominant NPC is a
+    manager, not generic 'crew'; a specific MD role is preserved; weak/tied skills don't guess."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    rfs = MemoryStore.role_from_skills
+    check("manager_from_management", rfs({"management": 10, "piloting": 4, "morale": 9}) == "manager")
+    check("pilot_from_piloting", rfs({"piloting": 12, "management": 2}) == "pilot")
+    check("marine_from_boarding", rfs({"boarding": 11, "engineering": 1}) == "marine")
+    check("engineer_from_engineering", rfs({"engineering": 9, "management": 1}) == "engineer")
+    check("weak_skills_no_guess", rfs({"engineering": 2, "morale": 3, "piloting": 1}) == "")  # Manda-like: <5
+    check("morale_ignored", rfs({"morale": 15}) == "")
+    check("tie_no_guess", rfs({"management": 8, "piloting": 8}) == "")
+    check("json_string_ok", rfs('{"management": 10, "piloting": 1}') == "manager")
+    d = tempfile.mkdtemp(prefix="nl_role_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "role.sqlite3")
+        check("specific_role_preserved", store._role_with_skills({"role": "service crew", "skills": {"management": 10}}) == "service crew")
+        check("generic_role_inferred", store._role_with_skills({"role": "crew", "skills": {"management": 10, "piloting": 4}}) == "manager")
+        # reinfer corrects an existing generic row (the Selaia case)
+        k = MemoryStore.make_key("s", "chat", "Selaia")
+        store.bind_npc(k, "rt", save_id="s", game_id="chat", name="Selaia", faction_id="argon",
+                       stats={"role": "crew", "skills": {"management": 10, "piloting": 4, "morale": 9}})
+        # bind_npc already infers on store → should be 'manager' immediately
+        check("bind_infers_on_store", (store.get_npc(k) or {}).get("role") == "manager", (store.get_npc(k) or {}).get("role"))
+        # #117: reinfer_roles PROPAGATES the specific role to a linked identity whose role is stale/generic.
+        pk = store.derive_persistent_key({"name": "Selaia", "faction": "argon"})
+        store.upsert_identity(pk, {"display_name": "Selaia", "faction": "argon", "role": "crew"})
+        store.link_npc_to_identity(k, pk)
+        check("identity_role_stale_before", str((store.get_identity(pk) or {}).get("role")) == "crew")
+        store.reinfer_roles()
+        check("identity_role_propagated", str((store.get_identity(pk) or {}).get("role")) == "manager",
+              str((store.get_identity(pk) or {}).get("role")))
+        # Non-clobber: a NON-generic identity role is preserved (never overwritten by propagation).
+        k2 = MemoryStore.make_key("s", "chat", "Veers")
+        store.bind_npc(k2, "rt2", save_id="s", game_id="chat", name="Veers", faction_id="argon",
+                       stats={"role": "crew", "skills": {"management": 10, "piloting": 4, "morale": 9}})
+        pk2 = store.derive_persistent_key({"name": "Veers", "faction": "argon"})
+        store.upsert_identity(pk2, {"display_name": "Veers", "faction": "argon", "role": "captain"})
+        store.link_npc_to_identity(k2, pk2)
+        store.reinfer_roles()
+        check("identity_specific_role_preserved", str((store.get_identity(pk2) or {}).get("role")) == "captain",
+              str((store.get_identity(pk2) or {}).get("role")))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
 def run_npc_recall_gate_selftest() -> dict:
     """Deterministic oracle for EPIC I (I4): confidence-gated personal-memory recall. Proves a BOUND NPC
     recalls fully and UNIONS memory across its keys (cross-reload), a TENTATIVE bind hedges, an AMBIGUOUS
@@ -4546,6 +4733,54 @@ def run_npc_recall_gate_selftest() -> dict:
         store.add_fact(k_solo, "The Xenon pushed into Grand Exchange.", "threat")
         ctx_s = store.build_memory_context(k_solo)
         check("unbound_default_recall", ("Grand Exchange" in ctx_s) and ("half-recognize" not in ctx_s), ctx_s[:160])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_soft_confirm_selftest() -> dict:
+    """Deterministic oracle for EPIC I (I7): player soft-confirmation of a TENTATIVE bind. Proves a
+    tentative NPC is promoted to BOUND when the player's assertion MATCHES stored memory, is NOT promoted
+    on an unsupported claim (anti-abuse), is a no-op when already bound, and ignores a too-thin assertion."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_softconfirm_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "sc.sqlite3")
+        k = MemoryStore.make_key("save_a", "chat", "Selaia Keppel")
+        store.bind_npc(k, "rt1", save_id="save_a", game_id="chat", name="Selaia Keppel", faction_id="argon")
+        pk = store.derive_persistent_key({"name": "Selaia Keppel", "faction": "argon"})
+        store.upsert_identity(pk, {"display_name": "Selaia Keppel", "faction": "argon"})
+        store.link_npc_to_identity(k, pk)
+        store.add_fact(k, "We coordinated the defense against the Kha'ak raids near Hatikvah.", "shared")
+
+        # MATCHING assertion on a TENTATIVE bind → promote to bound.
+        store.set_identity_fields(pk, status="tentative", identity_confidence=0.7)
+        r1 = store.soft_confirm_identity(k, "Remember the Kha'ak raids we fought off together?")
+        check("matching_claim_promotes", r1.get("promoted") is True, str(r1))
+        check("status_now_bound", str((store.get_identity(pk) or {}).get("status")) == "bound")
+
+        # UNSUPPORTED claim on a TENTATIVE bind → NOT promoted (anti-abuse).
+        store.set_identity_fields(pk, status="tentative", identity_confidence=0.7)
+        r2 = store.soft_confirm_identity(k, "We grew up together on the same homeworld colony.")
+        check("unsupported_claim_rejected", r2.get("promoted") is False, str(r2))
+        check("status_stays_tentative", str((store.get_identity(pk) or {}).get("status")) == "tentative")
+
+        # Already BOUND → no-op (only tentative is a candidate).
+        store.set_identity_fields(pk, status="bound", identity_confidence=0.9)
+        r3 = store.soft_confirm_identity(k, "Remember the Kha'ak raids we fought off together?")
+        check("bound_is_noop", r3.get("promoted") is False and r3.get("reason") == "not tentative", str(r3))
+
+        # Too-thin assertion → rejected before any work.
+        store.set_identity_fields(pk, status="tentative", identity_confidence=0.7)
+        r4 = store.soft_confirm_identity(k, "hey")
+        check("thin_assertion_rejected", r4.get("promoted") is False, str(r4))
     finally:
         shutil.rmtree(d, ignore_errors=True)
     return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),

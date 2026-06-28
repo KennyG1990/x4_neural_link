@@ -91,6 +91,15 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/memory/selftest":
             self._send_json(200, self.router.memory_selftest())
             return
+        if parsed.path == "/api/memory/role_selftest":
+            self._send_json(200, self.router.role_inference_selftest())
+            return
+        if parsed.path == "/api/memory/reinfer_roles":
+            self._send_json(200, self.router.reinfer_roles())
+            return
+        if parsed.path == "/api/comms/sender_selftest":
+            self._send_json(200, self.router.comms_sender_selftest())
+            return
         if parsed.path == "/api/identity/selftest":
             self._send_json(200, self.router.npc_identity_selftest())
             return
@@ -102,6 +111,9 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/identity/recall_selftest":
             self._send_json(200, self.router.npc_recall_gate_selftest())
+            return
+        if parsed.path == "/api/identity/soft_confirm_selftest":
+            self._send_json(200, self.router.npc_soft_confirm_selftest())
             return
         if parsed.path == "/api/identity/backfill":
             self._send_json(200, self.router.identity_backfill())
@@ -130,10 +142,12 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
                 query.get("save_id", [""])[0], int((query.get("limit", ["50"])[0]) or 50)))
             return
         if parsed.path == "/api/suggest":
+            # game_id MUST match the chat NPC key namespace ('chat') or generate_suggestions finds no turns
+            # and falls back to generic openers instead of conversation-aware follow-ups.
             self._send_json(200, self.router.suggest(
                 query.get("save_id", [""])[0], query.get("faction_id", ["argon"])[0],
                 query.get("npc_name", ["Officer"])[0],
-                query.get("game_id", ["x4_neural_link"])[0]))
+                query.get("game_id", ["chat"])[0]))
             return
         if parsed.path == "/api/lore/harvest":
             self._send_json(200, self.router.lore_harvest(
@@ -497,6 +511,8 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
             "/api/identity/rebind": self.router.identity_rebind,
             "/v1/identity/promote": self.router.identity_promote,
             "/api/identity/promote": self.router.identity_promote,
+            "/v1/identity/soft_confirm": self.router.identity_soft_confirm,
+            "/api/identity/soft_confirm": self.router.identity_soft_confirm,
         }
         if parsed.path in substrate_post:
             try:

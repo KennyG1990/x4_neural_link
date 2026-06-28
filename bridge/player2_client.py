@@ -672,16 +672,10 @@ class Player2Client:
         fac = str(faction_id or "argon")
         ctx_parts: list[str] = []
         in_progress = False
+        last_npc = ""
         if self.memory is not None:
             npc_key = self.memory.make_key(save_id, game_id, npc_name or "")
-            try:
-                brief = self.memory.build_situation_briefing(npc_key)
-                if brief:
-                    ctx_parts.append(str(brief))
-            except Exception:
-                pass
-            # Continuity: feed the recent conversation so the openers FOLLOW the chat (a natural next line),
-            # instead of restarting. When there are no turns yet, the MD shows instant presets — no LLM needed.
+            # Read the conversation FIRST so we know whether it is in progress.
             try:
                 turns = self.memory.get_recent_turns(npc_key, limit=6)
                 if turns:
@@ -689,39 +683,71 @@ class Player2Client:
                     convo = "\n".join(
                         (("Player" if str(t.get("role")) == "user" else (npc_name or "NPC")) + ": " + str(t.get("content") or ""))
                         for t in turns)
-                    ctx_parts.append("The conversation so far (your suggestions must continue THIS naturally):\n" + convo)
+                    last_npc = next((str(t.get("content") or "") for t in reversed(turns) if str(t.get("role")) != "user"), "")
+                    ctx_parts.append("The conversation so far:\n" + convo)
             except Exception:
                 pass
-            try:
-                sub = self.memory.graph_retrieve(
-                    save_id, fac, recent_message or "tensions allies enemies current situation", k=5)
-                if sub:
-                    ctx_parts.append("Faction standing:\n" + "\n".join("- " + str(d.get("text") or "") for d in sub))
-            except Exception:
-                pass
+            # World context (faction mood / wars / sectors / personal memory + faction standing) ONLY for
+            # OPENERS. During a conversation it DROWNS OUT the specific last reply and the LLM drifts to generic
+            # war/patrol/supply topics — so an in-progress chat is grounded ONLY in the conversation above.
+            if not in_progress:
+                try:
+                    brief = self.memory.build_situation_briefing(npc_key)
+                    if brief:
+                        ctx_parts.append(str(brief))
+                except Exception:
+                    pass
+                try:
+                    sub = self.memory.graph_retrieve(
+                        save_id, fac, recent_message or "tensions allies enemies current situation", k=5)
+                    if sub:
+                        ctx_parts.append("Faction standing:\n" + "\n".join("- " + str(d.get("text") or "") for d in sub))
+                except Exception:
+                    pass
+        role = ""
+        try:
+            if self.memory is not None:
+                role = str((self.memory.get_npc(npc_key) or {}).get("role") or "")
+        except Exception:
+            role = ""
+        who = (npc_name or "this character") + ((" (" + role + ")") if role else "") + ", a " + fac + " character"
+        # A low-ranking crew member can't broker faction deals — keep suggestions in their lane.
+        low_rank = role.lower() in ("", "crew", "service crew", "service", "engineer", "marine", "pilot")
         instruction = (
-            "You suggest things the PLAYER could say to " + (npc_name or "this character") + ", a " + fac +
-            " character in the universe of X4: Foundations." +
-            (" The conversation is ALREADY IN PROGRESS — your suggestions must FOLLOW what was just said "
-             "(a natural next line, a follow-up question, a reaction to their last reply), NOT restart it."
+            "Suggest exactly " + str(count) + " things the PLAYER could say to " + who +
+            " in the universe of X4: Foundations." +
+            (" The conversation is IN PROGRESS — each suggestion MUST directly engage a SPECIFIC detail from their "
+             "most recent reply: name the exact thing they said (a faction, place, event, claim or number) and "
+             "respond to THAT. A generic follow-up ('how's it going?', 'tell me more', 'how's the crew holding "
+             "up?') is WRONG — it must show you heard their actual words. Do NOT restart or change the subject."
              if in_progress else
-             " This is the START of the conversation — propose natural opening lines.") +
-            " Propose exactly " + str(count) + " DISTINCT, "
-            "contextually relevant openers — vary them (a question, a probe, a request). Each item has a "
-            "short 2-4 word menu label (Mass Effect wheel style) and the fuller single sentence the player "
-            "would actually speak. Stay strictly inside the X4 universe. Respond with ONLY a JSON array, "
-            'no prose: [{"label":"...","line":"..."}]'
+             " This opens the conversation — propose specific, natural opening lines.") +
+            (" This person is low-ranking crew — they talk about their own work, their ship, and the local "
+             "situation. They CANNOT broker truces, sanctions, trade pacts or faction policy, so do NOT propose "
+             "those; keep it to what THEY would actually know and do."
+             if low_rank else
+             " This person has authority — diplomacy, requests and faction matters are in scope.") +
+            " Each item has: `label` = a SHORT, CONCRETE preview of the actual line so the player knows what they "
+            "are about to say (e.g. 'Ask about the raids' or 'Thank her for the resupply' — NOT a vague category "
+            "like 'Demand Information' or 'Offer Exchange'); and `line` = the full single sentence the player "
+            "speaks. Make the three DISTINCT. Stay strictly inside the X4 universe. Respond with ONLY a JSON "
+            'array, no prose: [{"label":"...","line":"..."}]'
         )
         messages = [{"role": "system", "content": instruction}]
         if ctx_parts:
             messages.append({"role": "system", "content": "Context:\n" + "\n\n".join(ctx_parts)})
-        messages.append({"role": "user", "content": "Give me the menu options now."})
+        if in_progress and last_npc:
+            messages.append({"role": "user", "content":
+                "They just said: \"" + last_npc + "\"\nGive me 3 options that EACH react to a specific detail in "
+                "that exact line — name the thing they mentioned, don't ask a generic question. JSON array only."})
+        else:
+            messages.append({"role": "user", "content": "Give me the menu options now."})
         raw = ""
         with self._chat_lock:
             try:
                 data = self._json("POST", "/v1/chat/completions",
                                   {"messages": messages, "stream": False,
-                                   "temperature": 0.9, "max_tokens": 400},
+                                   "temperature": 0.6, "max_tokens": 400},
                                   timeout=self.timeout_seconds)
                 raw = self._extract_reply(data)
             except Exception:
@@ -1055,6 +1081,10 @@ class Player2Client:
                         # Promote AFTER the rebind links the identity (record_turn's hook ran before the link
                         # existed on a brand-new NPC). Guarantees a talked-to NPC reaches Tier 1 immediately.
                         self.memory.promote_identity_for_npc(npc_key, "talked")
+                        # I7: if this bind only reached TENTATIVE and the player's message asserts shared
+                        # history that MATCHES stored memory, soft-confirm it to BOUND. Anti-abuse: a no-op
+                        # unless the claim overlaps a real fact/turn (never promotes on an unsupported claim).
+                        self.memory.soft_confirm_identity(npc_key, sender_message)
                     except Exception:
                         pass
                 # Rolling TOPIC summary for long-range continuity. Every 4 turns (to bound LLM calls):
