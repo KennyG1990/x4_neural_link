@@ -1033,6 +1033,10 @@ class Player2Client:
                         "skills": _row.get("skills") or npc_stats.get("skills"),
                         "recently_talked": True,
                     }], save_id=save_id)
+                    # Promote AFTER the rebind links the identity (record_turn's hook above runs before the
+                    # link exists on a brand-new NPC, so it no-ops). This guarantees a talked-to NPC reaches
+                    # Tier 1 (player-significant) on the very first conversation.
+                    self.memory.promote_identity_for_npc(npc_key, "talked")
                 except Exception:
                     pass
                 # Rolling TOPIC summary for long-range continuity. Every 4 turns (to bound LLM calls):

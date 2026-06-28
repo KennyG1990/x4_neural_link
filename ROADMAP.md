@@ -25,16 +25,18 @@ dashboard, player soft-confirm. **Keystone/risk:** re-keying facts/turns/relatio
   `backfill_identities`. Endpoints `/api/identity/{selftest,backfill}`, `/api/identities`, `/api/identity`.
   **Validated:** bridge `identity/selftest` **13/13** live; backfill on live DB = 19 npc rows → 13 identities
   (6 collapsed = dedup/union); detail returns evidence + memory keys. Pure backend, in-game gate N/A.
-- **I1** — in-game evidence capture (conversation NPC) [MD/Lua + bridge]. **◐ in-game-grounded + bind proven;
-  hands-free auto-rebind pending bridge restart.** GROUNDED in-game (talked to Manda): runtime-readable person
-  fields = **macro** (`character_argon_female_asi_crew_01_macro`) + sector + skills + name + owner; **NOT** readable
-  = idcode/code/class/commander (so the unique code stays save-only — binding remains evidence-scored, as the spec
-  premised). DELIVERED: aic_uix.lua stashes macro/sector + folds into context; aic_menu sends it via
-  prompt_vars→`request.metadata`; `npc_complete` calls `rebind_session` each exchange (reads macro from metadata,
-  base evidence from the stored row). **PROVEN live:** feeding Manda's REAL in-game macro to `/v1/identity/rebind`
-  → **bound, conf 1.0, tier 1, macro evidence** on `pid:40f717bb500f`. **REMAINING:** auto-fire on chat needs a
-  bridge PROCESS restart (player2_client is a held instance, not hot-reloaded) → then one chat confirms hands-free.
-  Note: the station-NPC census accessor is NOT needed for the conversation NPC (that's I6/#98).
+- **I1** — in-game evidence capture (conversation NPC) [MD/Lua + bridge]. **✅ DONE 2026-06-28, in-game verified
+  HANDS-FREE.** GROUNDED in-game: runtime-readable person fields = **macro**
+  (`character_argon_female_asi_crew_01_macro`) + sector + skills + name + owner; NOT readable = idcode/code/class/
+  commander (unique code stays save-only → binding is evidence-scored, as the spec premised). FULL CHAIN: aic_uix.lua
+  reads macro/sector (event-order-independent direct read at fold) → folds into `context` → aic_menu sends as
+  `prompt_vars` → **router promotes `pv.macro/sector/runtime_component_id` to first-class `target` fields** (the
+  missing link — the chat builder cherry-picks pv→target; macro wasn't in the list) → `npc_complete` rebinds each
+  exchange → confident bind + Tier-1 promotion (promote AFTER link). **VALIDATED (all 3):** selftests green;
+  dashboard shows Manda `bound conf 0.9` evidence `name,faction,macro,skill_vector,role,sector`; **in-game: a real
+  chat auto-wrote a fresh binding with the live runtime id `303620034`, no manual step.** ◐ deferred: `container`
+  (readable but a volatile handle, low value). Station-NPC census accessor NOT needed here (that's I6/#98).
+  NOTE: a diagnostic `AIChat.open folded identity evidence` log line remains in aic_uix.lua (harmless; remove on next pass).
 - **I2** — scoring + `rebind_session` engine [bridge]. **✅ DONE 2026-06-28.** `score_identity` (spec weights:
   name/faction/role/macro/npc_code/skill_vector/container/sector/recently-talked/same-session-id; penalties:
   name+diff-faction −0.40, name+diff-role+macro −0.25; faction normalized via resolve_faction_id) +

@@ -3347,6 +3347,14 @@ class NeuralRouter:
                         _sk = None
                 if isinstance(_sk, dict) and _sk:
                     target.setdefault("skills", {str(k): v for k, v in _sk.items()})
+            # I1: promote the identity evidence the UI captured (macro/sector/runtime id) to first-class
+            # target fields so npc_complete's rebind can see them. macro lifts a re-encounter tentative→bound.
+            if pv.get("macro") not in (None, ""):
+                target.setdefault("macro", str(pv.get("macro")))
+            if pv.get("sector") not in (None, ""):
+                target.setdefault("sector", str(pv.get("sector")))
+            if pv.get("runtime_component_id") not in (None, ""):
+                target.setdefault("runtime_component_id", str(pv.get("runtime_component_id")))
             hint = "; ".join(f"{k}={v}" for k, v in pv.items() if isinstance(v, (str, int, float)))
             if hint:
                 target.setdefault("game_state_info", hint)
