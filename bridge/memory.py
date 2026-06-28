@@ -801,6 +801,17 @@ class MemoryStore:
             )
             conn.execute("UPDATE npcs SET last_active = ? WHERE npc_key = ?", (now, npc_key))
             conn.commit()
+            count = self._turn_count(conn, npc_key)
+        # A4 (IG-2): grow durable memory DURING play instead of only via the on-demand backfill — the cause
+        # of the 'talks a lot, stores few facts' gap. promote_durable_facts is ADDITIVE (copies high-value
+        # turns into facts, keeps the raw turns) and DETERMINISTIC (regex classify, no LLM) — so it is NOT the
+        # lossy condensation that was deliberately disabled. Cadence-throttled + guarded so a promotion error
+        # can never break turn recording. (Runs OUTSIDE the lock above; promote takes its own lock.)
+        if count and count % 6 == 0:
+            try:
+                self.promote_durable_facts(npc_key, max_promote=6)
+            except Exception:
+                pass
 
     def _turn_count(self, conn: sqlite3.Connection, npc_key: str) -> int:
         return conn.execute("SELECT COUNT(*) AS c FROM turns WHERE npc_key = ?", (npc_key,)).fetchone()["c"]
@@ -1504,13 +1515,41 @@ class MemoryStore:
                 conn.execute(f"DELETE FROM turns WHERE npc_key IN ({ph})", keys)
                 conn.execute(f"DELETE FROM facts WHERE npc_key IN ({ph})", keys)
                 conn.execute("DELETE FROM npcs WHERE save_id = ?", (save_id,))
-            for table in ("factions", "relationships", "strategic_state", "incidents",
-                          "agreements", "economy", "player_market", "sectors",
-                          "conflicts", "war_losses", "world_events",
-                          "conversations", "players"):  # newer tables were being left behind
-                conn.execute(f"DELETE FROM {table} WHERE save_id = ?", (save_id,))
+            # Dynamic: delete from EVERY save_id-scoped table (npcs/turns/facts handled above by
+            # npc_key). Kills the recurring "newer tables left behind" bug — any future save-scoped
+            # table is auto-covered instead of needing this list maintained by hand.
+            handled = {"npcs", "turns", "facts"}
+            for (table,) in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+                if table in handled or table.startswith("sqlite_"):
+                    continue
+                cols = [c[1] for c in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+                if "save_id" in cols:
+                    conn.execute(f"DELETE FROM {table} WHERE save_id = ?", (save_id,))
             conn.commit()
         return {"ok": True, "cleared_npcs": n, "save_id": save_id}
+
+    def reap_selftest_saves(self) -> dict:
+        """A2 (IG-3): delete every selftest-generated save across ALL save_id-scoped tables.
+        Selftests use deterministic '__<name>_selftest__<ms>' save_ids (always contain 'selftest'),
+        so they leave rows that pollute the live dashboard (inflated NPC/save counts). This reaps
+        them. Legacy MANUAL saves (cctest/octest, no 'selftest' token) are deliberately NOT touched."""
+        saves: set[str] = set()
+        with self._lock, self._connect() as conn:
+            for (table,) in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+                if table.startswith("sqlite_"):
+                    continue
+                cols = [c[1] for c in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+                if "save_id" in cols:
+                    for (sid,) in conn.execute(
+                            f"SELECT DISTINCT save_id FROM {table} WHERE save_id LIKE '%selftest%'").fetchall():
+                        if sid:
+                            saves.add(sid)
+        reaped = sorted(saves)
+        for s in reaped:  # clear_save takes its own lock — call OUTSIDE the gather block
+            self.clear_save(s)
+        return {"ok": True, "count": len(reaped), "reaped": reaped}
 
     def clear_substrate(self, save_id: str) -> dict:
         """Wipe only the universe substrate for a save (NOT npc memory). Lets the

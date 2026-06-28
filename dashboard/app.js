@@ -499,11 +499,81 @@ async function startP2(calls, threads) {
   } catch (e) { enableP2Btns(true); }
 }
 
+const pct01 = (v) => (v == null || v === "") ? "" : Math.round(Number(v) * 100) + "%";
+
+function renderSocial(resp, saveId) {
+  const t = document.getElementById("socialTitle");
+  if (t) t.textContent = "NPC Social Graph — " + saveId;
+  const rows = (resp && resp.relations) || [];
+  document.getElementById("socialBody").innerHTML = rows.map((r) => `
+    <tr>
+      ${td(r.subject_npc, "mono")}
+      ${td(r.object_npc, "mono")}
+      ${td(r.status, "ok")}
+      ${td(r.relationship_type)}
+      ${td(pct01(r.trust))}
+      ${td(pct01(r.affection))}
+      ${td(pct01(r.resentment))}
+      ${td(pct01(r.loyalty))}
+      ${td(pct01(r.rivalry))}
+    </tr>
+  `).join("") || `<tr><td colspan="9" class="dim">No NPC↔NPC social ties for ${esc(saveId)} yet.</td></tr>`;
+}
+
+function renderRumors(resp, saveId) {
+  const t = document.getElementById("rumorTitle");
+  if (t) t.textContent = "Rumors — " + saveId;
+  const rows = (resp && resp.rumors) || [];
+  document.getElementById("rumorBody").innerHTML = rows.map((r) => `
+    <tr>
+      ${td(r.text)}
+      ${td(r.category)}
+      ${td(r.origin_npc, "mono")}
+      ${td(r.npc_key, "mono")}
+      ${td(pct01(r.confidence))}
+      ${td(r.hops)}
+    </tr>
+  `).join("") || `<tr><td colspan="6" class="dim">No rumors propagating in ${esc(saveId)} yet.</td></tr>`;
+}
+
+function renderPlayerRole(resp, saveId) {
+  const t = document.getElementById("playerRoleTitle");
+  if (t) t.textContent = "Player Role — " + saveId;
+  const el = document.getElementById("playerRoleBody");
+  if (!resp || resp.ok === false) { el.innerHTML = `<span class="dim">No role data for ${esc(saveId)}.</span>`; return; }
+  const tags = (resp.role_tags || []).map((x) => `<span class="chip ok">${esc(x)}</span>`).join(" ") || "—";
+  el.innerHTML = `
+    <div><strong>Primary role:</strong> ${esc(resp.primary_role || "—")}</div>
+    <div><strong>Tags:</strong> ${tags}</div>
+    <div><strong>Faction friends:</strong> ${esc((resp.friends || []).join(", ") || "—")}</div>
+    <div><strong>Faction threats:</strong> ${esc((resp.threats || []).join(", ") || "—")}</div>
+    <div><strong>High economic dependency on player:</strong> ${esc((resp.high_dependency_factions || []).join(", ") || "—")}</div>
+    <div><strong>Supplies enemies:</strong> ${resp.supplies_enemies ? "yes" : "no"} · <strong>Brokered deals:</strong> ${esc(resp.brokered_count || 0)}</div>
+  `;
+}
+
+function renderBudgets(resp, saveId) {
+  const t = document.getElementById("budgetTitle");
+  if (t) t.textContent = "Faction Budgets — earned economy — " + saveId;
+  const rows = (resp && resp.budgets) || [];
+  const money = (v) => (v == null) ? "" : Math.round(Number(v)).toLocaleString();
+  document.getElementById("budgetBody").innerHTML = rows.map((b) => `
+    <tr>
+      ${td(b.faction_id, "mono")}
+      ${td(money(b.capacity))}
+      ${td(money(b.spent), b.spent ? "warn" : "")}
+      ${td(money(b.remaining), "ok")}
+    </tr>
+  `).join("") || `<tr><td colspan="4" class="dim">No economy-bearing factions for ${esc(saveId)} yet.</td></tr>`;
+}
+
 async function refresh() {
   const uSave = universeSave();
+  const post = (p) => getJson(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ save_id: uSave }) });
   const u = (p) => getJson(p + (p.includes("?") ? "&" : "?") + "save_id=" + encodeURIComponent(uSave));
   const [health, telemetry, memNpcs, memMetrics, evtState, saves, factions, rels,
-         strategic, incidents, economy, conflicts, sectors, fleets, agreements, worldEvents, conversations, influenceLog, p2status] = await Promise.all([
+         strategic, incidents, economy, conflicts, sectors, fleets, agreements, worldEvents, conversations, influenceLog, p2status,
+         social, rumors, playerRole, budgets] = await Promise.all([
     getJson("/health"),
     getJson("/api/telemetry?limit=100"),
     getJson("/api/memory/npcs").catch(() => ({ npcs: [] })),
@@ -523,6 +593,10 @@ async function refresh() {
     getJson("/api/conversations?limit=100").catch(() => ({ conversations: [] })),
     u("/api/influence_log?limit=50").catch(() => ({ entries: [] })),
     getJson("/api/player2/stress_status").catch(() => ({})),
+    post("/v1/social/list").catch(() => ({ relations: [] })),
+    post("/v1/rumor/list").catch(() => ({ rumors: [] })),
+    post("/v1/player/role").catch(() => ({ ok: false })),
+    post("/v1/economy/budget_list").catch(() => ({ budgets: [] })),
   ]);
   renderSaves(saves);
   renderMemory(memNpcs, memMetrics);
@@ -538,6 +612,10 @@ async function refresh() {
   renderAgreements(agreements);
   renderWorldEvents(worldEvents);
   renderConversations(conversations);
+  renderSocial(social, uSave);
+  renderRumors(rumors, uSave);
+  renderPlayerRole(playerRole, uSave);
+  renderBudgets(budgets, uSave);
   if (!p2Poll && p2status && (p2status.ok !== undefined)) renderP2(p2status);
   if (selectedNpcKey) showNpc(selectedNpcKey).catch(() => {});
   if (!catalogCache) catalogCache = await getJson("/api/player2/catalog");

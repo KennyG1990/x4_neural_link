@@ -91,12 +91,45 @@ validation (Forge diag where relevant · `:8713` selftest/endpoint + dashboard r
   (`/v1/offers/*`), war-phase actuation, gameplay-tick. (Persona already surfaced via `renderPersonaCard` — skip.)
   All tracked via endpoints, ZERO panels → the dashboard (blueprint's proof surface) is blind to everything built
   since the economy panel. **Validate:** each panel renders live rows (Chrome) against its `/api/*|/v1/*` source.
-- **A2 — Selftest-save reaper + `dry_run` for stateful selftests [IG-3, MED, cheap].** `__rumor_selftest__`,
-  `__social_brief_selftest__`, `cctest`, `octest` persist in the live DB and inflate counts (85 NPCs shown vs 23
-  in the real `game_301276512`). Unique save-ids stop collision but nothing reaps them. Add a reaper (prefix
-  `__…selftest__`) + `dry_run` so stateful selftests don't write live rows. **Validate:** `/api/memory/saves`
-  shows only real saves post-reap; selftests still green.
-- **A3 — Surface classified persona role + fix NPC↔entity binding on the dashboard NPC list [IG-4, MED].**
+    - **A1a ✅ DONE+VERIFIED 2026-06-27 (browser/live):** 3 panels added — NPC Social Graph (`/v1/social/list`),
+      Rumors (`/v1/rumor/list`), Player Role (`/v1/player/role`) — in `dashboard/index.html` + `dashboard/app.js`
+      (render fns + `post()` helper wired into `refresh()`, save-scoped). Verified on `game_301276512`: Player
+      Role renders REAL data (primary_role "faction threat", threats alliance/argon, high-dependency alliance);
+      Social + Rumors render correct empty-state (no in-game social events captured yet — gated on #39 population,
+      NOT a panel defect). Rest of dashboard unaffected (app.js parses). NOTE: social/rumor panels stay empty until
+      in-game social events feed them — expected, not broken.
+    - **A1b ✅ DONE+VERIFIED 2026-06-27 (browser/live).** Reconcile reshaped it: agreements ALREADY surfaced
+      (`renderAgreements`/"Agreements / Deals") → dropped; offers are generators (not persisted) → deferred
+      (surface when offers become a stored contract, ties M5). DELIVERED: Faction Budgets panel
+      (`dashboard/index.html`+`app.js` `renderBudgets`) + new `router.budget_list` + `/v1/economy/budget_list`
+      (iterates economy factions → derived capacity vs spent; surfaces the #63 anti-cheat substrate). VERIFIED on
+      `game_301276512`: endpoint 200 with 12 factions (teladi 21.2M, paranid 14.5M, argon 7.7M … ministry 250K,
+      spent=0); panel renders 12 money-formatted rows. (Gotcha: a new server.py route 404'd until the file was
+      re-saved once — rapid successive .py edits coalesced in the watcher; re-save re-triggers the restart.)
+    - **A1c ◐ TODO:** memory-audit candidates (`/v1/memory/audit`), war-phase actuation, gameplay-tick.
+- **A2 — Selftest-save reaper + selftest teardown [IG-3, MED, cheap]. ✅ DONE+VERIFIED 2026-06-27 (browser/live).**
+  RESULT: `memory.reap_selftest_saves()` + dynamic `clear_save` (deletes from every `save_id`-scoped table) +
+  ONE dispatch hook in `server.py` (after any POST `*selftest*` route, reap) — covers all 14 selftests + future
+  ones with no per-method edits. VERIFIED live: `/v1/memory/reap_selftests` reaped 24 saves (4 npc-visible + 20
+  substrate-only — proves the cross-table sweep); `/api/memory/saves` selftest 4→0, all 9 real saves kept
+  (cctest/grounded/game_* untouched); `rumor/selftest` 5/5 + `social/selftest` 10/10 still green AND now leave 0
+  rows; NPC metric 85→75. Files: `memory.py`, `router.py`, `server.py`. (Boundary: GET-style selftests not hooked
+  — weren't polluting.)
+  `__*_selftest__*` saves (14 patterns: rumor/social/social_brief/promote/mem_audit/player_role/patrol_offer/
+  earned_validate/agreements/hostile_ledger/warphase/econ_rollup/supply_offer/gameplay_tick) persist in the live
+  DB and inflate counts (85 NPCs shown vs 23 in the real `game_301276512`). (`cctest`/`octest` are legacy MANUAL
+  saves — NOT auto-reaped.) **Design refined during reconcile:** (a) `dry_run` doesn't fit write→read selftests
+  (they must write rows to test reads) → use **teardown** (`clear_save(save)` at end) for the row-creating ones
+  instead; (b) reuse the existing `memory.clear_save(save_id)` (don't rebuild); (c) **fix `clear_save` to be
+  dynamic** — delete from EVERY table that has a `save_id` column, killing the recurring "newer tables left
+  behind" bug (it currently misses `faction_budget`/`social_relations`/`rumors`). Add `memory.reap_selftest_saves()`
+  (sweep `%selftest%` save_ids → `clear_save` each) + router handler + `/v1/memory/reap_selftests` route.
+  **Validate:** `/api/memory/saves` shows only real saves post-reap; selftests still green AND leave no rows.
+- **A3 — Surface classified persona role + fix NPC↔entity binding [IG-4, MED]. ◐ A3a ✅ DONE+VERIFIED 2026-06-27
+  (role surfacing); A3b (real entity binding) GATED on in-game Lua + X4.** A3a result: `router.memory_npcs` now
+  fills BLANK roles via `persona.classify_archetype` (maps the row's `name`→`npc_name` the classifier expects);
+  verified live — 0 blank roles, all "X High Command" → `high_command`, real roles (marine/service crew) preserved,
+  News Desk → civilian (benign). Ids still `(unbound)` → that's A3b (capture the component id in Lua; details below).
   Roles render "—" and ids "(unbound)" though `persona.classify_archetype` exists and blueprint §13 has
   `bound_entity_id`/`npc_id`. **Root cause GROUNDED (2026-06-27):** real embodied NPCs (e.g. Rina Bekker/marine,
   Rylan Dehaan/service crew, save tag `/ chat`) are unbound NOT because the game lacks ids — the NPC component is
@@ -113,11 +146,17 @@ validation (Forge diag where relevant · `:8713` selftest/endpoint + dashboard r
   "abstract" so only real NPCs are expected to bind). **Enables:** A4 (facts stick to a real person), #39 (real
   NPC↔NPC edges), M5 (targeted hail), M9 (succession). **Validate:** NPC sheet shows real roles + bound ids; the
   same NPC is recognized across two separate conversations after a reload (Chrome + in-game).
-- **A4 — Fact-promotion tuning [IG-2, HIGH, bridge-now / full fix partly gated].** Active save = 1516 turns → 11
-  facts (~0.7%); G4 moved it off zero but the gap persists (Codex's central criticism). Tune `promote_durable_*`
-  thresholds + expose the memory-audit candidate view (pairs with A1). **Validate:** facts/turns ratio rises on
-  the live save; `memory_audit_selftest` green. **Gated piece:** richer promotion of in-game promises depends on
-  conversational capture (not this task).
+- **A4 — Fact-promotion tuning [IG-2, HIGH]. ✅ DONE+VERIFIED 2026-06-27 (live).** Root cause (reconcile):
+  condensation is DELIBERATELY disabled (raw turns kept full-fidelity for retrieval — Codex's accuracy choice)
+  and `promote_durable_facts` was ON-DEMAND only (ran once via #77 → 11 facts). FIX: auto-wire promotion into
+  `memory.record_turn` on a cadence (every 6 turns → `promote_durable_facts(max_promote=6)`) — ADDITIVE (copies
+  high-value turns to facts, keeps raw turns) + DETERMINISTIC (regex classify, no LLM), so it's NOT the lossy
+  condensation that was disabled; guarded so a promotion error can't break turn recording. Added
+  `record_turn_promote_selftest` + `/v1/memory/promote_cadence_selftest`. VERIFIED: cadence selftest allPassed
+  (6 high-value turns → 6 facts); `promote_selftest` 5/5 (no regression); LIVE BACKFILL of `game_301276512`
+  promoted **174 facts across 23 NPCs** (total 24→198; core 102, significant 96) — the central "talks a lot,
+  remembers little" gap is now closed. Files: `memory.py`, `router.py`, `server.py`. (Deferred: memory-audit
+  candidate panel — with auto-promotion live the candidate backlog stays small + facts already show in NPC detail.)
 - **A5 — Bake "surface it" into the per-feature definition-of-done [PG-1, process].** Add to the bridge-feature
   recipe (StarForge canon `bridge-feature-pattern.md` step 5): every new feature ships a dashboard panel OR is
   logged ◐ "endpoint-only, deferred" with a reason. This is why IG-1 silently accumulated. **Validate:** canon

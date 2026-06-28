@@ -91,6 +91,55 @@
         <div id="npcTurnsHead" class="turnsHead" style="display:none">Recent conversation</div>
         <div id="npcTurns" class="turns"></div>
       </div>
+
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="socialTitle">NPC Social Graph</h2>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr><th>Subject</th><th>Object</th><th>Status</th><th>Type</th><th>Trust</th><th>Affection</th><th>Resentment</th><th>Loyalty</th><th>Rivalry</th></tr>
+            </thead>
+            <tbody id="socialBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="rumorTitle">Rumors</h2>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr><th>Rumor</th><th>Category</th><th>Origin</th><th>Heard by</th><th>Conf.</th><th>Hops</th></tr>
+            </thead>
+            <tbody id="rumorBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="playerRoleTitle">Player Role</h2>
+        </div>
+        <div id="playerRoleBody" class="npcSummary"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panelHead">
+          <h2 id="budgetTitle">Faction Budgets — earned economy</h2>
+        </div>
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr><th>Faction</th><th>Capacity (owned)</th><th>Spent</th><th>Remaining</th></tr>
+            </thead>
+            <tbody id="budgetBody"></tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <section class="panel">

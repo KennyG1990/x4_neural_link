@@ -210,7 +210,19 @@ class NeuralRouter:
         return self.memory.metrics(npc_key)
 
     def memory_npcs(self) -> dict[str, Any]:
-        return {"ok": True, "npcs": self.memory.list_npcs()}
+        # A3a: fill BLANK roles with the classified persona archetype so the dashboard never shows "—".
+        # Real stored roles (marine/service crew) are preserved; abstract faction voices (High Command) →
+        # "high_command". classify_archetype reads npc_name, so map the row's `name` onto it.
+        try:
+            from .persona import classify_archetype
+        except ImportError:  # non-package/test import
+            from persona import classify_archetype
+        npcs = self.memory.list_npcs()
+        for n in npcs:
+            if not str(n.get("role") or "").strip():
+                n["role"] = classify_archetype({"npc_name": n.get("name"), "role": n.get("role"),
+                                                "faction_id": n.get("faction_id")})
+        return {"ok": True, "npcs": npcs}
 
     def memory_npc_detail(self, npc_key: str) -> dict[str, Any] | None:
         detail = self.memory.npc_detail(npc_key)
@@ -233,6 +245,36 @@ class NeuralRouter:
                    npc_key: str | None = None) -> dict[str, Any]:
         """Purge a dead NPC (by npc_id or npc_key) + its memory. X4 calls this on death."""
         return self.memory.delete_npc(save_id=save_id, npc_id=npc_id or None, npc_key=npc_key or None)
+
+    def memory_reap_selftests(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """A2 (IG-3): purge selftest-generated saves so they don't pollute the live dashboard."""
+        return self.memory.reap_selftest_saves()
+
+    def record_turn_promote_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """A4 (IG-2): prove durable facts GROW during play — record_turn auto-promotes high-value turns on a
+        cadence (additive, deterministic). Uses a __selftest__ save (auto-reaped by the dispatch hook)."""
+        m = self.memory
+        save = "__a4_promote_selftest__" + str(int(time.time() * 1000))
+        nk = save + "|g|Marine"
+        checks: list[dict] = []
+        ok = lambda n, p, d=None: checks.append({"name": n, "pass": bool(p), "detail": d})
+        try:
+            m.index_npcs(save, [{"npc_key": nk, "name": "Test Marine", "faction_id": "argon"}], game_id="g")
+            ok("starts_with_no_facts", len(m.get_facts(nk)) == 0)
+            hi = ["I promise to escort your convoy to Argon Prime.",
+                  "You betrayed our deal and I will not forget it.",
+                  "I pledge two destroyers to the defense of Hatikvah.",
+                  "We have an agreement: hull parts for protection.",
+                  "I threaten to blockade your trade lanes if you refuse.",
+                  "I refuse to pay reparations for a war you started."]
+            for i, txt in enumerate(hi):
+                m.record_turn(nk, "user" if i % 2 == 0 else "assistant", txt)
+            facts_after = len(m.get_facts(nk))
+            ok("facts_grew_during_play", facts_after > 0, {"facts": facts_after, "turns": len(hi)})
+        except Exception as e:
+            ok("no_exception", False, str(e))
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
 
     # --- Universe state: factions + relationships ----------------------------
 
@@ -2459,6 +2501,22 @@ class NeuralRouter:
         spent = self.memory.budget_spent(save_id, fid)
         return {"ok": True, "faction_id": fid, "capacity": cap, "spent": round(spent, 2),
                 "remaining": round(cap - spent, 2)}
+
+    def budget_list(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """A1b: every economy-bearing faction's earned spend-capacity vs drawn — surfaces the anti-cheat
+        budget substrate (#63). Capacity is DERIVED from real owned stations, so this has data even at spent=0."""
+        save_id = str(payload.get("save_id") or "unindexed")
+        rows = []
+        for e in self.memory.list_economy(save_id):
+            fid = e.get("faction_id")
+            if not fid:
+                continue
+            cap = self.memory.budget_capacity(save_id, fid)
+            spent = self.memory.budget_spent(save_id, fid)
+            rows.append({"faction_id": fid, "capacity": cap, "spent": round(spent, 2),
+                         "remaining": round(cap - spent, 2)})
+        rows.sort(key=lambda r: r["capacity"], reverse=True)
+        return {"ok": True, "budgets": rows}
 
     def earned_validate(self, payload: dict[str, Any]) -> dict[str, Any]:
         """#63 anti-cheat gate: is an 'earned' transfer of `cost` legitimate for this faction? Server-set, never

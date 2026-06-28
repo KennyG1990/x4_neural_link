@@ -440,6 +440,7 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
             "/v1/offers/patrol": self.router.sector_patrol_offer,
             "/v1/offers/patrol_selftest": self.router.sector_patrol_offer_selftest,
             "/v1/economy/budget_status": self.router.budget_status,
+            "/v1/economy/budget_list": self.router.budget_list,  # A1b: faction budgets panel (earned economy)
             "/v1/economy/earned_validate": self.router.earned_validate,
             "/v1/economy/earned_validate_selftest": self.router.earned_validate_selftest,
             "/v1/player/role": self.router.player_role,
@@ -448,6 +449,8 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
             "/v1/memory/audit_selftest": self.router.memory_audit_selftest,
             "/v1/memory/promote_facts": self.router.memory_promote_facts,
             "/v1/memory/promote_selftest": self.router.memory_promote_selftest,
+            "/v1/memory/reap_selftests": self.router.memory_reap_selftests,
+            "/v1/memory/promote_cadence_selftest": self.router.record_turn_promote_selftest,
             "/v1/agreements/generate": self.router.agreements_generate,
             "/v1/agreements/generate_selftest": self.router.agreements_generate_selftest,
             "/v1/gameplay/tick": self.router.gameplay_tick,
@@ -468,6 +471,14 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
                 self._send_json(200, substrate_post[parsed.path](payload))
+                # A2 (IG-3): a selftest leaves deterministic '__*selftest__*' rows. Reap them AFTER the
+                # response is sent (so a reap error can never affect the result), so they never
+                # accumulate on the live dashboard. One hook covers every selftest, now and future.
+                if "selftest" in parsed.path and parsed.path != "/v1/memory/reap_selftests":
+                    try:
+                        self.router.memory.reap_selftest_saves()
+                    except Exception:
+                        pass
             except json.JSONDecodeError:
                 self._send_json(400, {"ok": False, "error": "invalid json"})
             except Exception as exc:
