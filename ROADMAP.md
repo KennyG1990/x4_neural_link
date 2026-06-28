@@ -146,6 +146,14 @@ validation (Forge diag where relevant · `:8713` selftest/endpoint + dashboard r
   "abstract" so only real NPCs are expected to bind). **Enables:** A4 (facts stick to a real person), #39 (real
   NPC↔NPC edges), M5 (targeted hail), M9 (succession). **Validate:** NPC sheet shows real roles + bound ids; the
   same NPC is recognized across two separate conversations after a reload (Chrome + in-game).
+    - **A3b ◐ RECONCILE FINDING 2026-06-27 — plan likely UNSOUND, probe deployed.** The "capture the component
+      UniverseID → persist as the binding key" plan probably fails the actual goal (recognize the SAME NPC across
+      save/reload): X4 component UniverseIDs are RUNTIME handles, not save-persistent — relations-sync re-reads them
+      every tick precisely because they don't persist. A stored key on the id would change on reload. Did NOT build
+      the full chain on that assumption. **Probe deployed:** `aic_uix.lua ReadNpcSkills` now logs `A3b npc_id probe
+      =>`; next = in-game chat → save/reload → chat again, compare the logged id (needs a UI reload to take effect).
+      If unstable (expected), re-scope the key to a STABLE identifier (person idcode if it exists, else a composite
+      name+faction+ship+role) or accept session-only binding. Resolve BEFORE building the capture→persist chain.
 - **A4 — Fact-promotion tuning [IG-2, HIGH]. ✅ DONE+VERIFIED 2026-06-27 (live).** Root cause (reconcile):
   condensation is DELIBERATELY disabled (raw turns kept full-fidelity for retrieval — Codex's accuracy choice)
   and `promote_durable_facts` was ON-DEMAND only (ran once via #77 → 11 facts). FIX: auto-wire promotion into
@@ -169,9 +177,17 @@ validation (Forge diag where relevant · `:8713` selftest/endpoint + dashboard r
   `F:\DEV_ENV\{CLAUDE,AGENTS,GEMINI}.md` (agent API allowed, 2026-06-24); scratch also marked ⚠️ DEPRECATED →
   use `F:\DEV_ENV\X4_Forge`. VERIFIED: old `## ⛔ HARD RULE … ONLY through this Forge's UI` header = 0 matches in
   X4_Forge; new "agent API allowed (UI-only LIFTED)" header present; all trees agree.
-- **A7 — Joule budget + kill switch [PG-4, MED, buildable-now].** Blueprint §19 + §1.5 require per-session joule
-  budgeting + a kill switch (save-safety + cost); not implemented, not previously on the roadmap. **Validate:**
-  budget enforced + a config kill switch halts LLM calls; selftest.
+- **A7 — Joule budget + kill switch [PG-4, MED]. ✅ DONE+VERIFIED 2026-06-27 (live).** Per-session LLM-call
+  budget + kill switch gating BOTH Player2 chokepoints (`complete` + `npc_complete`, confirmed independent — no
+  double-count) via one `_llm_gate()` on `Player2Client`; blocked calls return `NeuralResponse.safe_error`
+  (graceful, no crash). Status + control endpoints (`/v1/llm/budget_status`, `/v1/llm/budget_set` {budget,killed,
+  reset}, `/v1/llm/budget_selftest`) + dashboard "AI Power" panel (A5 DoD). VERIFIED: selftest allPassed
+  (kill_switch_blocks, unlimited_allows, budget_allows_then_blocks); live status active/unlimited; `health.
+  player2.ok` + `social_selftest` green (no break to the chat path — `unlimited_allows` IS the live default, proving
+  chat isn't gated); panel renders. Files: `player2_client.py`, `router.py`, `server.py`, `dashboard/*`.
+  BOUNDARIES (honest): caps CALLS not raw joule values (bridge can't see per-call cost — but Player2 exposes
+  `/v1/joules`, already probed in `health`: FUTURE = joule-aware budget); budget defaults 0/unlimited (opt-in cap;
+  kill switch is the always-on lever); per-profile config-file budgets (blueprint §19) deferred to runtime control.
 - **Gated (sequence behind in-game capture / not for this pass):** rumor auto-origination + multi-hop [IG-7];
   memorials / death & succession [IG-8, blueprint §5.9, needs capital-ship-death capture]; #67 (raid→located loss)
   already tracked.
@@ -197,10 +213,14 @@ L=heavy in-game UI/gated. Each closes with named validation (`:8713` selftest/en
   standing delta ("Nerra's regard ↑ slightly") and nudge the relation within guard-rails (#21). The core
   Bannerlord interaction hook — words have consequences. **Validate:** chat turn shows delta; relation moves
   within bounds (dashboard + in-game notification).
-- **M3 — Per-NPC quirks + one-time backstory [S, observed, doc I].** Add a deterministic-seeded speech-quirk
-  layer + a once-generated, persisted backstory fact to the PersonaCard (#37) so a Teladi trader ≠ an Argon
-  marine. Hits the "every NPC has lore RP" bar. **Validate:** two NPCs of different archetype/faction produce
-  distinct voice; persona selftest green.
+- **M3 — Per-NPC quirks + one-time backstory [S, observed, doc I]. ✅ DONE+VERIFIED 2026-06-27 (bridge/live).**
+  Reconcile: the quirk/tone + archetype-specialization layer ALREADY existed (seeded per NPC key) — did NOT rebuild.
+  Added the missing piece: a seeded one-time BACKSTORY (origin + formative event, `_ORIGINS`×`_FORMATIVE_EVENTS`,
+  independent seed) in `persona.py` `build()` + a "Your history:" line in `card_to_prompt`. Stable-by-construction
+  (same NPC-key seed → same history every turn; no DB, no LLM → no joule cost). VERIFIED: `persona/selftest`
+  22/22 (4 new backstory checks); live persona cards — Rina vs Rylan get DISTINCT backstories, both in the prompt
+  `npc_complete` sends in-game. Boundary: in-game "feel" is wired into every chat prompt but not separately A/B'd
+  (qualitative — confirm in play).
 - **M4 — Relationship-arc + ambient-rumor beats [S, inferred].** Emit a one-line beat when a social edge (#39)
   crosses a narrative threshold (rivals→comrades, courting→partners) and occasionally surface a low-stakes rumor
   (#76) as sector-tied ambient comms. Makes the social/rumor graphs FELT. Must ride the priority gates (#40) to

@@ -47,6 +47,13 @@ class Player2Client:
         # may have a max-concurrent/rate ceiling; validate live and tune (revert to 1 if it 429s/destabilises).
         self._chat_concurrency = max(1, int(chat_concurrency))
         self._chat_lock = threading.BoundedSemaphore(self._chat_concurrency)
+        # A7 (blueprint §19/§20): per-session LLM-call budget + kill switch so the mod can never silently drain
+        # the user's Player2 AI power ("joules"). The bridge can't see per-call joule cost, so it caps CALLS.
+        # budget=0 → unlimited (opt-in cap, default); killed=True → all generation returns a graceful fallback.
+        self._llm_lock = threading.Lock()
+        self._llm_calls = 0
+        self._llm_budget = 0
+        self._llm_killed = False
         # NPC API state: a cache of spawned NPCs keyed by persona, plus a resolved
         # default voice id. The NPC API (/v1/npc/...) is the supported path for game
         # characters and, unlike raw /v1/chat/completions, returns clean message +
@@ -328,8 +335,37 @@ class Player2Client:
             "reason": summary or "no classification rule matched",
         }
 
+    def _llm_gate(self) -> "str | None":
+        """A7: return a block-reason if generation must be refused (kill switch on, or call budget exhausted),
+        else None — and count the call when allowed. Thread-safe. The ONE chokepoint for both complete paths."""
+        with self._llm_lock:
+            if self._llm_killed:
+                return "AI Influence is paused (kill switch on) — no AI power is being used."
+            if self._llm_budget and self._llm_calls >= self._llm_budget:
+                return "AI power budget for this session is exhausted."
+            self._llm_calls += 1
+            return None
+
+    def llm_status(self) -> dict[str, Any]:
+        with self._llm_lock:
+            return {"calls": self._llm_calls, "budget": self._llm_budget, "killed": self._llm_killed,
+                    "remaining": (max(0, self._llm_budget - self._llm_calls) if self._llm_budget else None)}
+
+    def set_llm_controls(self, budget: Any = None, killed: Any = None, reset: bool = False) -> dict[str, Any]:
+        with self._llm_lock:
+            if reset:
+                self._llm_calls = 0
+            if budget is not None:
+                self._llm_budget = max(0, int(budget))
+            if killed is not None:
+                self._llm_killed = bool(killed)
+        return self.llm_status()
+
     def complete(self, request: NeuralRequest) -> NeuralResponse:
         start = time.time()
+        _blocked = self._llm_gate()
+        if _blocked:
+            return NeuralResponse.safe_error(request, _blocked, latency_ms=0)
         # Player2's default chat model (GLM-4.7-Flash) is a reasoning model: it spends
         # a large, variable number of completion tokens on hidden reasoning before
         # emitting visible content. If max_tokens is hit mid-reasoning, message.content
@@ -743,6 +779,9 @@ class Player2Client:
 
     def npc_complete(self, request: NeuralRequest) -> NeuralResponse:
         start = time.time()
+        _blocked = self._llm_gate()
+        if _blocked:
+            return NeuralResponse.safe_error(request, _blocked, latency_ms=0)
         game_id = str(request.target.get("game_id") or request.metadata.get("game_id") or "x4_neural_link")
         save_id = str(request.target.get("save_id") or request.metadata.get("save_id") or "")
         system_prompt = self._system_prompt_from(request)

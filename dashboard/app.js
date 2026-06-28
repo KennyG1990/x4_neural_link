@@ -567,13 +567,27 @@ function renderBudgets(resp, saveId) {
   `).join("") || `<tr><td colspan="4" class="dim">No economy-bearing factions for ${esc(saveId)} yet.</td></tr>`;
 }
 
+function renderLlmBudget(resp) {
+  const el = document.getElementById("llmBudgetBody");
+  if (!el) return;
+  if (!resp || resp.ok === false) { el.innerHTML = `<span class="dim">No AI-power data.</span>`; return; }
+  const budget = resp.budget ? esc(resp.budget) : "unlimited";
+  const remaining = resp.remaining == null ? "—" : esc(resp.remaining);
+  el.innerHTML = `
+    <div><strong>Status:</strong> ${resp.killed ? '<span class="chip bad">PAUSED (kill switch on)</span>' : '<span class="chip ok">active</span>'}</div>
+    <div><strong>Calls this session:</strong> ${esc(resp.calls || 0)}</div>
+    <div><strong>Budget:</strong> ${budget} · <strong>Remaining:</strong> ${remaining}</div>
+    <div class="dim">Controls: POST /v1/llm/budget_set {budget, killed, reset}</div>
+  `;
+}
+
 async function refresh() {
   const uSave = universeSave();
   const post = (p) => getJson(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ save_id: uSave }) });
   const u = (p) => getJson(p + (p.includes("?") ? "&" : "?") + "save_id=" + encodeURIComponent(uSave));
   const [health, telemetry, memNpcs, memMetrics, evtState, saves, factions, rels,
          strategic, incidents, economy, conflicts, sectors, fleets, agreements, worldEvents, conversations, influenceLog, p2status,
-         social, rumors, playerRole, budgets] = await Promise.all([
+         social, rumors, playerRole, budgets, llmBudget] = await Promise.all([
     getJson("/health"),
     getJson("/api/telemetry?limit=100"),
     getJson("/api/memory/npcs").catch(() => ({ npcs: [] })),
@@ -597,6 +611,7 @@ async function refresh() {
     post("/v1/rumor/list").catch(() => ({ rumors: [] })),
     post("/v1/player/role").catch(() => ({ ok: false })),
     post("/v1/economy/budget_list").catch(() => ({ budgets: [] })),
+    post("/v1/llm/budget_status").catch(() => ({ ok: false })),
   ]);
   renderSaves(saves);
   renderMemory(memNpcs, memMetrics);
@@ -616,6 +631,7 @@ async function refresh() {
   renderRumors(rumors, uSave);
   renderPlayerRole(playerRole, uSave);
   renderBudgets(budgets, uSave);
+  renderLlmBudget(llmBudget);
   if (!p2Poll && p2status && (p2status.ok !== undefined)) renderP2(p2status);
   if (selectedNpcKey) showNpc(selectedNpcKey).catch(() => {});
   if (!catalogCache) catalogCache = await getJson("/api/player2/catalog");

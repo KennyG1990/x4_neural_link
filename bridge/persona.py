@@ -157,6 +157,30 @@ ARCH_REDIRECT: dict[str, str] = {
 # Persona flavor seeded by NPC key so the SAME NPC stays consistent but different NPCs vary.
 _FLAVOR_TONES = ["weary", "wry", "guarded", "earnest", "brusque", "watchful", "proud", "restless", "dry", "blunt"]
 
+# M3: a once-fixed, seeded BACKSTORY per NPC (origin + a formative event) so each NPC carries a personal history,
+# not just a current posting. Deterministic from the NPC key (same NPC -> same history every turn; no DB, no LLM
+# call -> no joule cost). Origin and event use independent seeds so two NPCs rarely share both.
+_ORIGINS = [
+    "born on a frontier mining station",
+    "raised in the shipyards of the core worlds",
+    "a war orphan taken in by the fleet",
+    "came up running merchant convoys",
+    "grew up dockside, hustling for any berth",
+    "second-generation station crew",
+    "left a failing colony for a posting out here",
+    "conscripted young and never left the service",
+]
+_FORMATIVE_EVENTS = [
+    "survived a Xenon incursion that wiped your first posting",
+    "lost someone close to a pirate raid you couldn't stop",
+    "were the only watch-stander awake when things went wrong",
+    "made your name salvaging a derelict everyone had written off",
+    "were passed over for a promotion you'd earned",
+    "carry a debt you can never quite clear",
+    "watched a captain you trusted make a ruinous call",
+    "once saved a ship by breaking protocol — and paid for it",
+]
+
 
 def classify_archetype(npc: dict) -> str:
     """Map raw X4 NPC data (role / faction / persona name) to one of the V1 archetypes."""
@@ -289,6 +313,10 @@ class PersonaCardBuilder:
         tone = _FLAVOR_TONES[seed % len(_FLAVOR_TONES)]
         specs = ARCH_SPECIALIZATIONS.get(arch_key) or [arch_key.replace("_", " ")]
         specialization = specs[seed % len(specs)]   # Codex 2nd-review: a specific posting, stable per NPC
+        # M3: seeded personal backstory (origin + formative event). seed2 is position-weighted so it varies
+        # independently of `seed`, so history and tone/posting don't move in lockstep across NPCs.
+        seed2 = sum((i + 1) * ord(c) for i, c in enumerate(key))
+        backstory = _ORIGINS[seed % len(_ORIGINS)] + "; you " + _FORMATIVE_EVENTS[seed2 % len(_FORMATIVE_EVENTS)]
         sector = str(npc.get("sector") or "")
         traits = self._persona_traits(fid)
         sk = npc.get("npc_skill")
@@ -318,6 +346,7 @@ class PersonaCardBuilder:
             "authority_level": arch["authority"],
             "knowledge_scope": arch["knowledge"],
             "personality": (", ".join([tone] + traits)).strip(", "),
+            "backstory": backstory,
             "veterancy": veterancy,
             "ship": str(npc.get("ship_name") or "") or None,
             "sector": sector or None,
@@ -343,6 +372,8 @@ class PersonaCardBuilder:
             lines.append((" ; ".join(b.capitalize() if i == 0 else b for i, b in enumerate(bits))) + ".")
         if card.get("personality"):
             lines.append("Temperament: " + card["personality"] + ".")
+        if card.get("backstory"):
+            lines.append("Your history: " + card["backstory"] + " — let it shade who you are, not dominate the talk.")
         if card.get("current_concerns"):
             lines.append("What weighs on you right now: " + "; ".join(card["current_concerns"]) + ".")
         lines.append("You KNOW: " + card["knowledge_scope"] + ".")
@@ -403,6 +434,11 @@ def run_persona_selftest() -> dict:
     ok("concerns_grounded", any("Kha'ak" in c or "Hatikvah" in c or "losses" in c for c in card_hc["current_concerns"]), card_hc["current_concerns"])
     ok("stable_flavor", b.build("s", {"npc_name": "Rina Bekker", "role": "marine", "faction_id": "argon"})["personality"]
        == card_mar["personality"], None)
+    # M3: seeded one-time backstory - present, stable per NPC, distinct across NPCs.
+    ok("card_has_backstory", bool(card_mar.get("backstory")) and "; you " in card_mar["backstory"], card_mar.get("backstory"))
+    ok("backstory_stable", b.build("s", {"npc_name": "Rina Bekker", "role": "marine", "faction_id": "argon"})["backstory"]
+       == card_mar["backstory"], None)
+    ok("backstory_varies_by_npc", card_hc["backstory"] != card_mar["backstory"], {"hc": card_hc["backstory"], "mar": card_mar["backstory"]})
 
     # 2nd-pass fields: wants (motivation) + conversation consequence (routing).
     ok("card_has_wants", bool(card_hc.get("wants")) and bool(card_mar.get("wants")), card_mar.get("wants"))
@@ -421,6 +457,7 @@ def run_persona_selftest() -> dict:
     ok("prompt_has_want_and_consequence", "What you WANT" in prompt and "Where this can lead" in prompt)
     ok("prompt_physical_beat_default", "START with ONE short physical beat" in prompt)
     ok("prompt_specific_redirect", "squad leader" in prompt)
+    ok("prompt_has_history", "Your history:" in prompt)
 
     passed = sum(1 for c in checks if c["pass"])
     return {"allPassed": passed == len(checks), "pass": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}

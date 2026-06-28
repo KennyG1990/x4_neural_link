@@ -250,6 +250,35 @@ class NeuralRouter:
         """A2 (IG-3): purge selftest-generated saves so they don't pollute the live dashboard."""
         return self.memory.reap_selftest_saves()
 
+    def llm_budget_status(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """A7: current per-session LLM-call budget / kill-switch state."""
+        return {"ok": True, **self.player2.llm_status()}
+
+    def llm_budget_set(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """A7: set the call budget (0=unlimited), toggle the kill switch, and/or reset the counter."""
+        return {"ok": True, **self.player2.set_llm_controls(
+            budget=payload.get("budget"), killed=payload.get("killed"), reset=bool(payload.get("reset")))}
+
+    def llm_budget_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """A7: prove the gate blocks when killed / over-budget and allows otherwise. Restores prior live state."""
+        p2 = self.player2
+        before = p2.llm_status()
+        checks: list[dict] = []
+        ok = lambda n, c, d=None: checks.append({"name": n, "pass": bool(c), "detail": d})
+        try:
+            p2.set_llm_controls(killed=True, reset=True)
+            ok("kill_switch_blocks", p2._llm_gate() is not None)
+            p2.set_llm_controls(killed=False, budget=0, reset=True)
+            ok("unlimited_allows", p2._llm_gate() is None)
+            p2.set_llm_controls(budget=1, reset=True)
+            g1, g2 = p2._llm_gate(), p2._llm_gate()
+            ok("budget_allows_then_blocks", g1 is None and g2 is not None, {"g1": g1, "g2": g2})
+        finally:
+            p2.set_llm_controls(budget=before["budget"], killed=before["killed"], reset=True)
+            p2._llm_calls = before["calls"]
+        passed = sum(1 for c in checks if c["pass"])
+        return {"allPassed": passed == len(checks), "passed": passed, "total": len(checks), "checks": checks}
+
     def record_turn_promote_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """A4 (IG-2): prove durable facts GROW during play — record_turn auto-promotes high-value turns on a
         cadence (additive, deterministic). Uses a __selftest__ save (auto-reaped by the dispatch hook)."""
