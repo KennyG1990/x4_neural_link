@@ -157,14 +157,18 @@ validation (Forge diag where relevant · `:8713` selftest/endpoint + dashboard r
   promoted **174 facts across 23 NPCs** (total 24→198; core 102, significant 96) — the central "talks a lot,
   remembers little" gap is now closed. Files: `memory.py`, `router.py`, `server.py`. (Deferred: memory-audit
   candidate panel — with auto-promotion live the candidate backlog stays small + facts already show in NPC detail.)
-- **A5 — Bake "surface it" into the per-feature definition-of-done [PG-1, process].** Add to the bridge-feature
-  recipe (StarForge canon `bridge-feature-pattern.md` step 5): every new feature ships a dashboard panel OR is
-  logged ◐ "endpoint-only, deferred" with a reason. This is why IG-1 silently accumulated. **Validate:** canon
-  note updated; applied to A1.
-- **A6 — Reconcile contradictory build-method instructions [PG-3, cheap doc].** `F:\DEV_ENV\CLAUDE.md` reversed
-  the rule (2026-06-24, agent API allowed) but the Forge-side `X4-Foundations-Mod-Studio\CLAUDE.md` still says
-  "build the mod ONLY through the Forge UI." Two checked-in files contradict on the core method → misleads a fresh
-  agent. Pick one, mirror it. **Validate:** both files agree.
+- **A5 — Bake "surface it" into the per-feature definition-of-done [PG-1, process]. ✅ DONE 2026-06-27.** Added
+  the DoD clause to StarForge canon `bridge-feature-pattern.md` step 5 (every player/sim-facing feature ships a
+  dashboard panel OR is logged ◐ "endpoint-only, deferred" with a reason, + the panel pattern) — this is why IG-1
+  accumulated. Also added during this session's AARs: the selftest auto-reap convention (A2) + the "new server.py
+  route 404 → re-save" gotcha (A1b). Applied live in A1a/A1b.
+- **A6 — Reconcile contradictory build-method instructions [PG-3, cheap doc]. ✅ DONE+VERIFIED 2026-06-27.**
+  Reconcile found the stale "build ONLY through the Forge UI" HARD RULE in TWO files (not just the scratch one the
+  audit named): the CANONICAL `F:\DEV_ENV\X4_Forge\CLAUDE.md` (the live GitHub repo — the important one) AND the
+  deprecated scratch `X4-Foundations-Mod-Studio\CLAUDE.md`. Both reversed to match the authoritative
+  `F:\DEV_ENV\{CLAUDE,AGENTS,GEMINI}.md` (agent API allowed, 2026-06-24); scratch also marked ⚠️ DEPRECATED →
+  use `F:\DEV_ENV\X4_Forge`. VERIFIED: old `## ⛔ HARD RULE … ONLY through this Forge's UI` header = 0 matches in
+  X4_Forge; new "agent API allowed (UI-only LIFTED)" header present; all trees agree.
 - **A7 — Joule budget + kill switch [PG-4, MED, buildable-now].** Blueprint §19 + §1.5 require per-session joule
   budgeting + a kill switch (save-safety + cost); not implemented, not previously on the roadmap. **Validate:**
   budget enforced + a config kill switch halts LLM calls; selftest.
