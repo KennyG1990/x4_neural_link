@@ -100,6 +100,24 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/comms/sender_selftest":
             self._send_json(200, self.router.comms_sender_selftest())
             return
+        if parsed.path == "/api/social/beat_selftest":
+            self._send_json(200, self.router.relationship_beat_selftest())
+            return
+        if parsed.path == "/api/social/tone_selftest":
+            self._send_json(200, self.router.tone_reaction_selftest())
+            return
+        if parsed.path == "/api/blackboard_probe/selftest":
+            self._send_json(200, self.router.blackboard_probe_selftest())
+            return
+        if parsed.path == "/api/blackboard_bind/selftest":
+            self._send_json(200, self.router.blackboard_bind_selftest())
+            return
+        if parsed.path == "/v1/npc_identity_probe/blackboard/latest":
+            self._send_json(200, self.router.blackboard_probe_latest(query.get("save_id", [""])[0]))
+            return
+        if parsed.path == "/v1/npc_identity_probe/blackboard/verdict":
+            self._send_json(200, self.router.blackboard_probe_verdict(query.get("save_id", [""])[0]))
+            return
         if parsed.path == "/api/identity/selftest":
             self._send_json(200, self.router.npc_identity_selftest())
             return
@@ -513,6 +531,8 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
             "/api/identity/promote": self.router.identity_promote,
             "/v1/identity/soft_confirm": self.router.identity_soft_confirm,
             "/api/identity/soft_confirm": self.router.identity_soft_confirm,
+            "/v1/npc_identity_probe/blackboard": self.router.blackboard_probe_record,
+            "/v1/identity/bind_blackboard": self.router.identity_bind_blackboard,
         }
         if parsed.path in substrate_post:
             try:

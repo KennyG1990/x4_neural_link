@@ -21,6 +21,11 @@ try:
 except ImportError:
     from persona import PersonaCardBuilder
 
+try:
+    from .memory import classify_tone  # M2: pure tone→reaction classifier
+except ImportError:
+    from memory import classify_tone
+
 
 class Player2Client:
     """Small stdlib-only Player2 client for Neural Link."""
@@ -844,7 +849,11 @@ class Player2Client:
         # memory is injected into this turn's context and the exchange is recorded.
         npc_key = None
         if self.memory is not None:
-            npc_key = self.memory.make_key(save_id, game_id, persona.get("name") or system_prompt[:64])
+            # Conversations are keyed by the NPC's durable Blackboard token when present (per-ID memory: same-name
+            # crew no longer share a key, and memory follows the bound NPC across reload). Falls back to the
+            # name-based key for unbound NPCs / non-chat flows — so existing behavior is unchanged without a token.
+            _bbtok = str(request.target.get("blackboard_key") or request.metadata.get("blackboard_key") or "")
+            npc_key = self.memory.chat_npc_key(save_id, game_id, persona.get("name") or system_prompt[:64], _bbtok)
             # Grounded injection: personal memory + faction/relationship/war/sector/
             # world-event context, so replies reference the real, specific universe.
             mem_ctx = self.memory.build_situation_briefing(npc_key)
@@ -1085,6 +1094,17 @@ class Player2Client:
                         # history that MATCHES stored memory, soft-confirm it to BOUND. Anti-abuse: a no-op
                         # unless the claim overlaps a real fact/turn (never promotes on an unsupported claim).
                         self.memory.soft_confirm_identity(npc_key, sender_message)
+                    except Exception:
+                        pass
+                    # M2: the player's TONE moves how this faction FEELS about them (bounded via apply_reaction
+                    # caps; words≠resources, but words DO move relations/attitude). Feeds the reaction substrate →
+                    # persona recall + the autonomous influence loop (which can escalate). Neutral = no-op.
+                    try:
+                        _tone = classify_tone(sender_message)
+                        if _tone.get("label") != "neutral":
+                            self.memory.apply_reaction(save_id or "live", fac, "player",
+                                                       {k: _tone[k] for k in ("resentment", "fear", "trust")},
+                                                       mood="", rationale="player tone: " + str(_tone.get("label")))
                     except Exception:
                         pass
                 # Rolling TOPIC summary for long-range continuity. Every 4 turns (to bound LLM calls):

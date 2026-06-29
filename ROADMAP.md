@@ -2,6 +2,87 @@
 
 ## ★★★ EPIC I — SYNTHETIC PERSISTENT NPC IDENTITY LAYER (spec'd 2026-06-28, Ken) — Neural Link becomes the identity authority
 
+### ★ NPC BLACKBOARD PERSISTENT-IDENTITY PROBE (Ken 2026-06-29) — could make identity SIMPLER than evidence-scoring
+**Question:** can we attach our OWN durable key to an NPC via X4's Blackboard (`SetNPCBlackboard`/`GetNPCBlackboard`)
+that survives save/reload even though the runtime UniverseID regenerates? If yes → `blackboard_persistent_key`
+becomes the PRIMARY identity (runtime id = session-only, evidence = fallback), upgrading EPIC I.
+- **RECONCILE (done):** `GetNPCBlackboard(entity,"$key")` / `SetNPCBlackboard(entity,"$key",val)` are REAL X4 Lua
+  funcs, used in vanilla on NPC/person entities (`$TradeDone` on traders, `$HiringFee` on hireable crew,
+  `$diplomacy_exp_*`/`$injury_endtime` on diplomacy agents — the stat-like ones persisting hints Blackboard
+  serializes into the save). No prior bridge probe → built fresh.
+- **✅ BRIDGE PROBE DONE + selftest/live-verified 2026-06-29 (incl. ChemODun object-ref + template tiers).** Table
+  `npc_blackboard_probe` (+ `payload_type` object|string, `npctemplate`, `restored_match`; ALTER-migrated on the live
+  DB); endpoints POST `/v1/npc_identity_probe/blackboard`, GET `…/latest`, GET `…/verdict`. KEY DESIGN: the Lua probe
+  stays dumb (record a read each encounter); the bridge DERIVES the proof — a correlation token read under ≥2 distinct
+  runtime ids = "survived a reload" (object refs additionally require `restored_match` = resolved to the SAME person).
+  **Tiered verdict (revised spec): OBJECT_REF** (object-ref handle survives + matches; the strong, X4-native path) ·
+  **HYBRID_TEMPLATE** (object works for live NPCs, `npctemplate`+context fallback for despawned) · **SYNTHETIC**
+  (EPIC I evidence layer — last resort); plus `legacy_verdict` (string-key USE_BLACKBOARD/HYBRID/REJECT).
+  VALIDATE: `run_blackboard_probe_selftest` **8/8** (all four tiers) + memory 15/15; **live: object-ref write(id
+  134465819)+read(id 236456014, same token, matched) → verdict OBJECT_REF, object_ref_survived true** (the revised
+  spec's exact success case). GET `/api/blackboard_probe/selftest`.
+- **✅ LUA COLLECTOR BUILT + contract-verified 2026-06-29; ◐ in-game behaviour unproven (= the probe's purpose).**
+  `AI_Influence.BlackboardProbe(ctx)` in `aic_uix.lua`, called from `onOpenCommLink` on every conversation open
+  (guarded pcall throughout — can't crash the chat). PRIMARY: store the NPC object ref via `SetNPCBlackboard(player,
+  "$aic_obj_<name|faction>", npc)` on the durable PLAYER scope (`C.GetPlayerID()`), readback + name-match.
+  SECONDARY: string key `$aic_persistent_npc_key` on the NPC itself. Captures `npctemplate`
+  (`GetComponentData(npc,"npctemplate")`). POSTs both rows to `/v1/npc_identity_probe/blackboard`. Reconcile
+  confirmed every API against vanilla (`ConvertStringToLuaID`, `C.GetPlayerID`, `GetComponentData`, `newRequest
+  POST`). VALIDATE: Lua→bridge **contract verified** (posted the collector's exact object-row shape → recorded with
+  payload_type/npctemplate/restored_match intact). **◐ IN-GAME (the actual proof — not yet run):** Phase 1
+  same-session write→read; Phase 3 save/reload (runtime id changes, handle still resolves to same person); then
+  matrix / duplicate / despawn→template. Phase 5: grep the decompressed save for the token.
+- **★★ IN-GAME PROVEN 2026-06-29 (Phase 1 + Phase 3 PASS, REAL data) ★★** Ken talked to Manda Smitt, saved BEFORE,
+  reloaded, talked again (AFTER). The collector fired both times; the bridge verdict for `game_301276512` is
+  **`OBJECT_REF`** — `object_ref_survived:true`, `string_key_survived:true`, `survived_runtime_id_change:true`,
+  Manda's runtime id **369722098 → 201804655** across the reload. The minted string key written at 369722098 was
+  read back at 201804655, and the object ref resolved + **name-matched** at both ids. **CONCLUSION: X4 Blackboard
+  durably binds NPC identity across save/reload (both object-ref AND string-key) for a live/active NPC — runtime ID
+  is now session-only; the Blackboard handle is the persistent key.** SCOPE/HONESTY: proven for a LIVE recent NPC
+  (conversation_person). NOT yet tested: Phase 4 entity matrix, Phase 6 duplicate-collision, Phase 7 despawn→
+  template lifecycle, Phase 5 save-XML grep — so keep the tiered fallback (OBJECT_REF → HYBRID_TEMPLATE → SYNTHETIC)
+  for dormant/despawned/duplicate cases.
+- **✅ DUPLICATE-SAFE BY DESIGN 2026-06-29.** Collector hardened: the persistent token is now MINTED UNIQUE per NPC
+  (`aic_<runtime_id>_<rand>` on first encounter, stored on that NPC's OWN blackboard; never re-minted once present),
+  and the object-ref slot is keyed by that unique token — so two same-name crew get DIFFERENT tokens on DIFFERENT
+  blackboards (no shared name|faction slot to collide). VALIDATE: bridge tracks two same-name "Manda" NPCs with
+  distinct tokens as SEPARATE identities (no merge), each survives independently → OBJECT_REF; bb_selftest 8/8.
+  Phase 6 in-game (two real same-name crew) is the final confirm; mechanism is sound.
+- **✅ WIRED 2026-06-29 — Blackboard token is now the PRIMARY identity key (bridge+selftest verified; in-game BOUND
+  pending).** Dedicated path (chosen over threading through rebind_session — lower blast radius):
+  `memory.bind_blackboard_identity(save_id,name,faction,role,blackboard_key,runtime_id)` → links the chat npc_key to
+  an identity keyed **`bb:<token>`**, `status=bound`, confidence 1.0 (evidence-derivation stays Tier-3 fallback for
+  no-token/despawned). Endpoint POST `/v1/identity/bind_blackboard`; the Lua collector calls it on every conversation
+  open after minting the token. VALIDATE: `blackboard_bind_selftest` **6/6**; **live bind → persistent_npc_key
+  `bb:aic_test_555`, status bound, npc row linked**; identity 13/13 / rebind 7/7 / memory 15/15 (no regression). GET
+  `/api/blackboard_bind/selftest`. **◐ in-game:** talk to an NPC → dashboard "Active NPC id" should now show BOUND
+  (was unbound).
+  - **✅ PER-ID CONVERSATION MEMORY 2026-06-29 (resolves the name-key limitation).** Conversations are now keyed by
+    the durable token: `memory.chat_npc_key(save,game,name,token)` → `save|chat|bb:<token>` when a token is present,
+    else the name-based key (fallback — unbound NPCs / non-chat flows unchanged). `npc_complete` reads the token
+    from `request.metadata.blackboard_key` (the Lua puts it in the chat context → `prompt_vars` → contracts merges
+    into metadata) and keys the conversation by it; `bind_blackboard_identity` keys by the token AND unions the
+    LEGACY name-keyed memory into the identity (continuity), guarded so it never steals a different same-name NPC's
+    history. Result: same-name crew get ISOLATED, persistent per-NPC memory that follows the bound NPC across
+    reload. VALIDATE: `blackboard_bind_selftest` **9/9** (chat_npc_key token+fallback, token-keyed result, linked,
+    bound, idempotent, distinct-token-distinct-identity, guard); identity 13/13 / rebind 7/7 / recall 6/6 /
+    soft_confirm 6/6 / memory 15/15 — no regression. ◐ in-game: confirm two same-name crew keep separate memory.
+  - **✅ DASHBOARD BINDING BADGE FIXED 2026-06-29 (was a FALSE ALARM, not a binding failure).** Ken's screenshot
+    showed Daron Naser as `(unbound)`, but the bridge had him correctly bound (`persistent_key=bb:aic_1377253384_314064`,
+    identity status `bound`). ROOT CAUSE: the dashboard's last column rendered `n.npc_id` (the SESSION-ONLY runtime
+    component id) with a `(unbound)` fallback — it was never binding status, just a mislabeled runtime-id column that
+    reads empty for chat rows. FIX: `list_npcs()` now SELECTs `n.persistent_key`; `app.js` `bindBadge()` renders true
+    status — **🔒 bound** (`bb:` token), **bound\*** (synthetic/evidence), **unbound** (no identity, e.g. faction
+    senders), with the runtime id as a `· rt xxxxxxxx` suffix. Two passes: first cut returned HTML spans but `td()`
+    HTML-escapes its input, so tags rendered literally → rewrote `bindBadge` to return PLAIN TEXT. VALIDATE
+    (Claude-in-Chrome, live `:8713`): `/api/memory/npcs` now carries `persistent_key`; Daron renders **🔒 bound**;
+    0 literal-tag cells; 5 bb-bound rows. Also CONFIRMED the per-ID keying is LIVE — Manda Smitt & Rina Bekker each
+    now show a separate `🔒 bound` token-keyed row alongside their legacy `bound*` name-keyed row. memory 15/15,
+    bind 9/9 — no regression. ◐ residual (cosmetic): two rows per NPC (legacy name-key + new token-key) — could be
+    grouped by `persistent_key` in the list view later; both link to the same identity so recall is unaffected.
+- **◐ NEXT:** in-game confirm the BOUND flip; then characterization (despawn→template, entity matrix, Phase 5
+  save-XML grep); then (optional) re-key chat memory by the token for full duplicate isolation.
+
 **Why:** the NPC-identity investigation (#99/#102) PROVED X4 exposes no stable cross-reload identity for generic
 crew — runtime `raw` and save `<component id>` are the same volatile UniverseID in hex (Manda: 134465819→236456014
 across one reload), idcode empty. **Decision (Ken): do NOT downgrade richness — make the MOD the identity authority.**
@@ -411,10 +492,18 @@ L=heavy in-game UI/gated. Each closes with named validation (`:8713` selftest/en
   bulletins; debuglog clean.
 - **(= A1) Dashboard panels for the 9 endpoint-only families** — already scoped in AUDIT REMEDIATION (IG-1). Same
   task; serves both the audit and immersion. Don't double-build.
-- **M2 — Tone → relation feedback [M, observed, doc D].** Expose the per-turn persona-reaction (#17) as a visible
-  standing delta ("Nerra's regard ↑ slightly") and nudge the relation within guard-rails (#21). The core
-  Bannerlord interaction hook — words have consequences. **Validate:** chat turn shows delta; relation moves
-  within bounds (dashboard + in-game notification).
+- **M2 — Tone → relation feedback [M, observed, doc D]. ◐ BRIDGE CORE DONE + selftest-verified 2026-06-29;
+  in-game standing-delta ◐.** ANTI-CHEAT BOUNDARY CORRECTED (Ken 2026-06-29): "words≠resources" is ONLY about
+  resources (ships/money/wares) — **conversation tone/content SHOULD move relations + attitude** (that's the core
+  "build the world by talking" mechanic). Build: pure `classify_tone(text)` → bounded reaction (hostile/threat →
+  resentment+8..15/fear/−trust; insult → resentment; warm → +trust; neutral → no-op), within the existing SPEC 1f
+  `apply_reaction` caps (REACTION_CAPS). Wired into `npc_complete` (chat path, gated game_id=='chat', guarded): the
+  player's tone writes a bounded reaction the NPC's FACTION holds toward the player → feeds persona recall + the
+  autonomous influence loop (which can escalate to phase actions). Words still can't mint resources. VALIDATE:
+  `tone_reaction_selftest` **7/7** (threat/insult/warm/neutral + apply_reaction within caps); full suite green (beat
+  7/7, comms_sender 9/9, memory 15/15, identity 13/13). Endpoint GET `/api/social/tone_selftest`. **◐ in-game:** see
+  the standing/behaviour shift after a hostile vs warm conversation. **Follow-up:** extend tone→relation to
+  NPC↔NPC / faction-commander↔faction-commander generated dialogue (Ken's broader intent), not just player↔NPC.
 - **M3 — Per-NPC quirks + one-time backstory [S, observed, doc I]. ✅ DONE+VERIFIED 2026-06-27 (bridge/live).**
   Reconcile: the quirk/tone + archetype-specialization layer ALREADY existed (seeded per NPC key) — did NOT rebuild.
   Added the missing piece: a seeded one-time BACKSTORY (origin + formative event, `_ORIGINS`×`_FORMATIVE_EVENTS`,
@@ -423,10 +512,17 @@ L=heavy in-game UI/gated. Each closes with named validation (`:8713` selftest/en
   22/22 (4 new backstory checks); live persona cards — Rina vs Rylan get DISTINCT backstories, both in the prompt
   `npc_complete` sends in-game. Boundary: in-game "feel" is wired into every chat prompt but not separately A/B'd
   (qualitative — confirm in play).
-- **M4 — Relationship-arc + ambient-rumor beats [S, inferred].** Emit a one-line beat when a social edge (#39)
-  crosses a narrative threshold (rivals→comrades, courting→partners) and occasionally surface a low-stakes rumor
-  (#76) as sector-tied ambient comms. Makes the social/rumor graphs FELT. Must ride the priority gates (#40) to
-  avoid spam. **Validate:** beats fire on real transitions, throttled; comms queue not flooded.
+- **M4 — Relationship-arc + ambient-rumor beats [S, inferred]. ◐ BRIDGE DONE + live-verified 2026-06-28; in-game
+  surfacing ◐.** Reconcile found the social-graph (#39: `apply_social_event`/`_advance_social_status`/social_edge) +
+  rumor (#76) infra already built — so M4 = *emit a player beat on a status transition*, not new infra.
+  `apply_social_event` now returns `status_before`; pure `relationship_beat_line(a,b,before,after)` emits a one-line
+  gossip beat ONLY for notable transitions (partners/courting/flirtation/friends/close friends/mentor/rivals/
+  enemies/grieving; silent for strangers/acquaintances/crewmates + the private romance pre-stages, so no spam);
+  `social_event` enqueues it via `_enqueue_relationship_beat` as a low-priority "Crew Affairs" comm (From: Station
+  Gossip) → surfaces through the M5b-1 `write_incoming_message` path. VALIDATE: `relationship_beat_selftest` **7/7**;
+  social 10/10 (no regression); **live: 6× saved_life drove crewmates→friends → beat emitted + enqueued** (seen in
+  the comms drain). Endpoint GET `/api/social/beat_selftest`. In-game eyeball of the beat appearing ◐ (rides the next
+  in-game pass; same proven surfacing as M5b-1).
 
 **Tier 2 — plan-next (heavier or one confirmation away):**
 - **M5 — NPC-initiated → openable chat [M, observed, doc B]. ◐ SPEC'D 2026-06-28 (Ken) — full spec:
@@ -450,8 +546,23 @@ L=heavy in-game UI/gated. Each closes with named validation (`:8713` selftest/en
     and **live `POST /v1/player_comms/prove` (argon) → comm carries tx_id + sender "Melissa Mettel" +
     sender_npc_key `game_301276512|chat|Melissa Mettel` + priority high.** Endpoint: GET
     `/api/comms/sender_selftest`. CAUGHT BY SELFTEST: first cut minted `tx_id` from `time.time_ns()` → collided on
-    rapid calls (coarse Windows ns granularity) → switched to `uuid4`. **M5b/M5c pending** (MD/Lua Messages-post +
-    Reply menu-patch; in-game).
+    rapid calls (coarse Windows ns granularity) → switched to `uuid4`.
+  - **M5b-1 ✅ DONE + IN-GAME CONFIRMED 2026-06-28.** Transmissions now post as REAL native player Messages via MD
+    `<write_incoming_message source=$sender title text highpriority result>` in `ai_influence_galaxynews.xml`
+    (CommsIncoming cue), fed by the Lua drain (`aic_uix.lua` → `comms_incoming` table w/ sender+priority). Confirmed
+    in-game: entries appear in the Messages menu **From:&lt;NPC&gt;** with the LLM body (e.g. "ARGON WARNING" From
+    Melissa Mettel; "ALLIANCE SUPPLY REQUEST" From Tupmanckulot). TWO bugs found+fixed during validation: (a)
+    **`highpriority` is XSD type `boolean` = LITERAL** — passing the expression `"$high"` defaulted everything to the
+    Low tab; fixed by branching `do_if $high` → `highpriority="true"` / `do_else` → `"false"`. (b) Only `_build_comms`
+    (faction decisions) set sender/priority — the **other generators** (patrol/supply/diplomacy at router.py
+    1229/2627/2896) did not, so those showed "Faction Command"/low; fixed by **centralizing** enrichment in
+    `drain_player_comms` via `_ensure_comm_sender` (fills sender/priority/tx_id from the faction rep for ANY comm
+    missing them). VALIDATE: Forge `project/validate` ok=true; bridge `comms_sender_selftest` 9/9; in-game eyeball.
+    RELOAD NOTE: `/refreshmd` was flaky picking up the MD edit (a save reload was the reliable recompile); the
+    deploy-watch only covers the bridge (`x4_neural_link`), not the mod (`x4_ai_influence`).
+  - **M5b-2 ◐ PENDING (visual-gated):** the per-message **Reply button** (UIX `menu_playerinfo` injection on our
+    tx, → `Open_chat` targeted at sender_npc_key). Needs in-game UIX work + eyeball — deferred to an in-game pass.
+  - **M5c ◐ PENDING:** in-game verification sweep.
 - **M6 — Player2 voice/TTS [M, observed-with-caveat, doc C].** Route NPC lines through Player2 TTS; play on
   desktop audio + a TTS on/off toggle. **Honest caveat:** audio is desktop-companion, NOT in-engine X4 audio
   (true in-world voice is L/gated). **Validate:** spoken line plays; toggle works.

@@ -163,6 +163,16 @@ function renderMemory(memNpcs, memMetrics) {
     ["routine", byTier.routine || 0, ""],
   ].map(([k, v, cls]) => `<span class="chip ${cls}"><span>${esc(k)}</span><strong>${esc(v)}</strong></span>`).join("");
 
+  // Binding column: the durable IDENTITY status, not the (session-only) runtime component id.
+  // bb:<token> = X4 Blackboard-bound (survives save/reload, proven 2026-06-29); other persistent_key =
+  // synthetic/evidence-bound; neither = not yet bound. Runtime id shown as a dim suffix when present.
+  const bindBadge = (n) => {
+    const pk = n.persistent_key || "";
+    const rt = n.npc_id ? ` · rt ${String(n.npc_id).slice(0, 8)}` : "";
+    if (pk.includes("bb:")) return `🔒 bound${rt}`;
+    if (pk) return `bound*${rt}`;
+    return n.npc_id ? `rt ${String(n.npc_id).slice(0, 8)}` : "unbound";
+  };
   document.getElementById("npcsBody").innerHTML = npcs.map((n) => `
     <tr class="rowBtn ${n.npc_key === selectedNpcKey ? "rowSel" : ""}" data-npc="${esc(n.npc_key)}">
       ${td(n.name || "(unnamed)")}
@@ -172,7 +182,7 @@ function renderMemory(memNpcs, memMetrics) {
       ${td(n.turns)}
       ${td(n.facts)}
       ${td(n.core_facts, n.core_facts ? "ok" : "")}
-      ${td(n.npc_id || "(unbound)", "mono")}
+      ${td(bindBadge(n), "mono")}
     </tr>
   `).join("") || `<tr><td colspan="8" class="dim">No NPCs yet — send an NPC request to populate memory.</td></tr>`;
 }

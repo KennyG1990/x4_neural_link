@@ -599,6 +599,36 @@ class MemoryStore:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_bindings_persistent ON npc_runtime_bindings(persistent_npc_key)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS npc_blackboard_probe (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    save_id TEXT,
+                    phase TEXT,                  -- write|same_session|after_reload|matrix|duplicate|lifecycle
+                    target_type TEXT,            -- conversation_person|control|ship|station|player
+                    runtime_component_id TEXT,
+                    npc_name TEXT,
+                    faction TEXT,
+                    role TEXT,
+                    ship_or_station TEXT,
+                    sector TEXT,
+                    blackboard_key TEXT,
+                    blackboard_value TEXT,        -- correlation token (string key, or "objref_<id>" for object refs)
+                    payload_type TEXT DEFAULT 'string',  -- string | object (ChemODun: object-ref handle is the strong path)
+                    npctemplate TEXT,             -- npctemplate id (Tier-2 fallback when the live object despawns)
+                    restored_match INTEGER DEFAULT 0,    -- 1 if the restored object/template matches name/faction/role
+                    write_success INTEGER,
+                    read_success INTEGER,
+                    created_at REAL
+                )
+            """)
+            # Migrate existing DBs (table predates the object-ref/template columns).
+            for _col, _decl in (("payload_type", "TEXT DEFAULT 'string'"), ("npctemplate", "TEXT"),
+                                ("restored_match", "INTEGER DEFAULT 0")):
+                try:
+                    conn.execute(f"ALTER TABLE npc_blackboard_probe ADD COLUMN {_col} {_decl}")
+                except Exception:
+                    pass
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_bbprobe_save ON npc_blackboard_probe(save_id, blackboard_value)")
             conn.commit()
 
     # --- NPC binding / retrieval ---------------------------------------------
@@ -606,6 +636,14 @@ class MemoryStore:
     @staticmethod
     def make_key(save_id: str, game_id: str, persona: str) -> str:
         return f"{save_id or 'nosave'}|{game_id or 'nogame'}|{persona or 'default'}"
+
+    def chat_npc_key(self, save_id: str, game_id: str, name: str, blackboard_token: str = "") -> str:
+        """The conversation memory key. When the NPC carries a durable Blackboard token (now proven to survive
+        save/reload), key the conversation by `bb:<token>` so each unique NPC gets ISOLATED, persistent memory
+        (two same-name crew no longer share a key). Falls back to the name-based key for unbound NPCs — so all
+        existing/non-chat flows are unchanged."""
+        tok = str(blackboard_token or "").strip()
+        return self.make_key(save_id, game_id, ("bb:" + tok) if tok else (name or ""))
 
     # X4 crew skills (0..15 internal = 0..5 stars). morale is universal.
     X4_SKILLS = ("piloting", "management", "engineering", "boarding", "morale")
@@ -1431,6 +1469,155 @@ class MemoryStore:
         except Exception:
             return {"promoted": False, "reason": "error"}
 
+    # --- EPIC I probe: NPC Blackboard persistent-identity test -----------------
+    def record_blackboard_probe(self, row: dict) -> int:
+        """Store ONE Blackboard-probe observation (phase/target/runtime id/bb key+value/write+read success)."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("""
+                INSERT INTO npc_blackboard_probe
+                    (save_id, phase, target_type, runtime_component_id, npc_name, faction, role,
+                     ship_or_station, sector, blackboard_key, blackboard_value, payload_type, npctemplate,
+                     restored_match, write_success, read_success, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                str(row.get("save_id") or ""), str(row.get("phase") or ""),
+                str(row.get("target_type") or "conversation_person"), str(row.get("runtime_component_id") or ""),
+                str(row.get("npc_name") or ""), str(row.get("faction") or ""), str(row.get("role") or ""),
+                str(row.get("ship_or_station") or ""), str(row.get("sector") or ""),
+                str(row.get("blackboard_key") or ""), str(row.get("blackboard_value") or ""),
+                str(row.get("payload_type") or "string"), str(row.get("npctemplate") or ""),
+                1 if row.get("restored_match") else 0,
+                1 if row.get("write_success") else 0, 1 if row.get("read_success") else 0, now,
+            ))
+            conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def latest_blackboard_probe(self, save_id: str = "", limit: int = 50) -> list[dict]:
+        with self._connect() as conn:
+            if save_id:
+                rows = conn.execute("SELECT * FROM npc_blackboard_probe WHERE save_id=? ORDER BY id DESC LIMIT ?",
+                                    (save_id, int(limit))).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM npc_blackboard_probe ORDER BY id DESC LIMIT ?",
+                                    (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def blackboard_verdict(self, save_id: str = "") -> dict:
+        """Compute the probe verdict from recorded rows (the spec's Final Verdict Rules). USE_BLACKBOARD when a
+        minted key was written, read SAME-session AND AFTER-reload, survived a runtime-id change (same bb value
+        seen under ≥2 distinct runtime ids across an after_reload read), duplicates kept distinct values, and the
+        conversation_person target read back after reload. HYBRID if it works only partially; REJECT otherwise."""
+        rows = self.latest_blackboard_probe(save_id, limit=2000)
+        by_val: dict[str, list] = {}
+        for r in rows:
+            v = r.get("blackboard_value")
+            if v:
+                by_val.setdefault(v, []).append(r)
+        write_ok = any(r.get("write_success") for r in rows)
+        same_session = any(r.get("phase") in ("write", "same_session") and r.get("read_success") for r in rows)
+        # The Lua probe just records a read on every encounter; a successful read of the SAME minted key under
+        # ≥2 distinct runtime ids IS the after-reload proof (the runtime id only changes across a reload), so we
+        # derive it here rather than trust an explicit "after_reload" label.
+        survived_id_change = False
+        for rs in by_val.values():
+            ids = {r.get("runtime_component_id") for r in rs if r.get("read_success")}
+            if len(ids) >= 2:
+                survived_id_change = True
+                break
+        after_reload = (survived_id_change
+                        or any(r.get("phase") == "after_reload" and r.get("read_success") for r in rows))
+        dup_rows = [r for r in rows if r.get("phase") == "duplicate"]
+        dup_ok = True
+        seen: dict[str, str] = {}
+        for r in dup_rows:
+            v = r.get("blackboard_value") or ""
+            who = (r.get("npc_name") or "") + "|" + (r.get("runtime_component_id") or "")
+            if v and v in seen and seen[v] != who:
+                dup_ok = False
+            seen.setdefault(v, who)
+        matrix: dict[str, dict] = {}
+        for r in rows:
+            tt = r.get("target_type") or "conversation_person"
+            m = matrix.setdefault(tt, {"write": False, "after_reload_read": False})
+            if r.get("write_success"):
+                m["write"] = True
+            if r.get("phase") == "after_reload" and r.get("read_success"):
+                m["after_reload_read"] = True
+        person_ok = matrix.get("conversation_person", {}).get("after_reload_read", False)
+
+        # Per-payload survival (ChemODun's revised spec): a correlation token read under ≥2 distinct runtime ids
+        # = the handle bridged a reload. Object refs additionally require restored_match (resolved to the SAME
+        # person), since X4 itself remaps the pointer.
+        def _grouped(predicate):
+            g: dict[str, dict] = {}
+            for r in rows:
+                if predicate(r) and r.get("read_success") and r.get("blackboard_value"):
+                    e = g.setdefault(r["blackboard_value"], {"ids": set(), "matched": False})
+                    e["ids"].add(r.get("runtime_component_id"))
+                    if r.get("restored_match"):
+                        e["matched"] = True
+            return g
+        obj_groups = _grouped(lambda r: (r.get("payload_type") == "object"))
+        str_groups = _grouped(lambda r: (r.get("payload_type") or "string") == "string")
+        object_ref_survived = any(len(e["ids"]) >= 2 and e["matched"] for e in obj_groups.values())
+        string_key_survived = any(len(e["ids"]) >= 2 for e in str_groups.values())
+        template_fallback_ok = any("template" in str(r.get("phase") or "") and r.get("restored_match") for r in rows)
+
+        if object_ref_survived and dup_ok and not template_fallback_ok:
+            tier_verdict = "OBJECT_REF"
+        elif object_ref_survived and template_fallback_ok:
+            tier_verdict = "HYBRID_TEMPLATE"   # object ref for live NPCs, template fallback for despawned
+        elif template_fallback_ok or string_key_survived:
+            tier_verdict = "HYBRID_TEMPLATE"
+        else:
+            tier_verdict = "SYNTHETIC"
+
+        # Legacy string-key verdict (retained for back-compat with the first probe build).
+        if write_ok and same_session and after_reload and survived_id_change and dup_ok and person_ok:
+            legacy = "USE_BLACKBOARD"
+        elif write_ok and same_session and after_reload:
+            legacy = "HYBRID"
+        else:
+            legacy = "REJECT"
+        return {"verdict": tier_verdict, "legacy_verdict": legacy,
+                "object_ref_survived": object_ref_survived, "string_key_survived": string_key_survived,
+                "template_fallback_ok": template_fallback_ok, "write_ok": write_ok,
+                "same_session_read": same_session, "after_reload_read": after_reload,
+                "survived_runtime_id_change": survived_id_change, "duplicate_separation_ok": dup_ok,
+                "person_after_reload": person_ok, "target_matrix": matrix, "rows": len(rows)}
+
+    def bind_blackboard_identity(self, save_id: str, name: str, faction: str = "", role: str = "",
+                                blackboard_key: str = "", runtime_id: str = "") -> dict:
+        """Make the NPC's durable Blackboard token the PRIMARY identity key (proven to survive save/reload). Links
+        the chat npc_key to an identity keyed `bb:<token>`, status=bound, confidence 1.0 — bypassing evidence
+        derivation (which stays the Tier-3 fallback for NPCs without a token / despawned). This is what flips the
+        NPC from (unbound) to bound. Never throws."""
+        try:
+            name = str(name or "").strip()
+            token = str(blackboard_key or "").strip()
+            if not (save_id and name and token):
+                return {"ok": False, "reason": "need save_id+name+blackboard_key"}
+            pkey = "bb:" + token
+            token_key = self.chat_npc_key(save_id, "chat", name, token)   # PRIMARY conversation key (per-NPC)
+            self.bind_npc(token_key, "", save_id=save_id, game_id="chat", name=name, faction_id=faction,
+                          stats=({"role": role} if role else None))
+            self.upsert_identity(pkey, {"display_name": name, "faction": faction, "role": role})
+            self.set_identity_fields(pkey, status="bound", identity_confidence=1.0)
+            self.link_npc_to_identity(token_key, pkey)
+            # Continuity: union LEGACY name-keyed memory into this identity, UNLESS that name-key is already
+            # claimed by a DIFFERENT identity (duplicate-safety — never steal another same-name NPC's history).
+            name_key = self.make_key(save_id, "chat", name)
+            if name_key != token_key:
+                prev = (self.get_npc(name_key) or {}).get("persistent_key")
+                if (not prev) or prev == pkey:
+                    self.link_npc_to_identity(name_key, pkey)
+            if runtime_id:
+                self.record_evidence(pkey, "blackboard_runtime", str(runtime_id), weight=1.0)
+            return {"ok": True, "npc_key": token_key, "persistent_npc_key": pkey, "status": "bound"}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)[:120]}
+
     # --- Turns (Stage A) ------------------------------------------------------
 
     def record_turn(self, npc_key: str, role: str, text: str) -> None:
@@ -2151,7 +2338,7 @@ class MemoryStore:
         with self._connect() as conn:
             rows = conn.execute("""
                 SELECT n.npc_key, n.npc_id, n.name, n.faction_id, n.save_id, n.game_id,
-                       n.race, n.role, n.ship_class, n.skills,
+                       n.race, n.role, n.ship_class, n.skills, n.persistent_key,
                        n.summary, n.created_at, n.last_active,
                        (SELECT COUNT(*) FROM turns t WHERE t.npc_key = n.npc_key) AS turns,
                        (SELECT COUNT(*) FROM facts f WHERE f.npc_key = n.npc_key) AS facts,
@@ -3255,6 +3442,7 @@ class MemoryStore:
             cur = dict(row) if row else {}
             sc = {k: max(0.0, min(1.0, float(cur.get(k, 0) or 0) + float(delta.get(k, 0)))) for k in self._SOCIAL_SCALARS}
             grief = event_type == "bereavement"
+            status_before = str(cur.get("status") or "none")
             status, rtype = self._advance_social_status(sc, grief)
             ev = json.loads(cur.get("evidence_json") or "[]")
             ev.append({"event": event_type, "note": note, "ts": now})
@@ -3262,7 +3450,8 @@ class MemoryStore:
             self._write_social_edge(conn, save_id, subject_npc, object_npc, sc, status, rtype, json.dumps(ev), now)
             conn.commit()
         return {"ok": True, "subject_npc": subject_npc, "object_npc": object_npc, "event": event_type,
-                "status": status, "relationship_type": rtype, "scores": {k: round(sc[k], 3) for k in self._SOCIAL_SCALARS}}
+                "status_before": status_before, "status": status, "relationship_type": rtype,
+                "scores": {k: round(sc[k], 3) for k in self._SOCIAL_SCALARS}}
 
     def upsert_social_relation(self, save_id: str, subject_npc: str, object_npc: str, **fields) -> dict:
         """Direct set/merge of an edge (manual / test path). Clamps scalars 0..1 + recomputes status. Most changes
@@ -4781,6 +4970,226 @@ def run_soft_confirm_selftest() -> dict:
         store.set_identity_fields(pk, status="tentative", identity_confidence=0.7)
         r4 = store.soft_confirm_identity(k, "hey")
         check("thin_assertion_rejected", r4.get("promoted") is False, str(r4))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+# M4: ambient relationship-arc beats. A social edge changing STATUS (apply_social_event) is the trigger; this
+# turns a NOTABLE transition into a one-line player-facing gossip beat. Non-notable targets (strangers/
+# acquaintances/crewmates, or the private/internal romance pre-stages) stay silent so the feed isn't spammy.
+_RELATIONSHIP_BEATS = {
+    "partners":        "Word is that {a} and {b} have grown inseparable.",
+    "courting":        "There's talk that {a} has been courting {b}.",
+    "flirtation":      "Crew gossip says sparks have been flying between {a} and {b}.",
+    "close friends":   "{a} and {b} have grown close, the mess hall reckons.",
+    "friends":         "{a} and {b} seem to have struck up a friendship.",
+    "mentor/student":  "{a} has taken {b} under their wing.",
+    "rivals":          "Friction is brewing between {a} and {b}.",
+    "enemies":         "{a} and {b} are openly at odds now.",
+    "grieving":        "{a} is said to be grieving the loss of {b}.",
+}
+
+
+def relationship_beat_line(a: str, b: str, status_before: str, status_after: str) -> str:
+    """Pure: a one-line ambient beat for a NOTABLE social-status transition, else ''. Emits only when the status
+    actually changed AND the new status is one players would notice (the gossip-worthy ones)."""
+    a = str(a or "").strip() or "A crew member"
+    b = str(b or "").strip() or "another"
+    if not status_after or status_after == status_before:
+        return ""
+    tmpl = _RELATIONSHIP_BEATS.get(status_after)
+    return tmpl.format(a=a, b=b) if tmpl else ""
+
+
+def run_relationship_beat_selftest() -> dict:
+    """Deterministic oracle for M4: notable transitions emit a beat naming both NPCs; non-transitions and
+    non-notable targets stay silent; souring (friends→rivals) and bereavement (→grieving) emit."""
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    up = relationship_beat_line("Selaia", "Manda", "friends", "partners")
+    check("notable_transition_emits", up != "" and "Selaia" in up and "Manda" in up, up)
+    check("no_transition_silent", relationship_beat_line("Selaia", "Manda", "partners", "partners") == "")
+    check("non_notable_target_silent", relationship_beat_line("A", "B", "strangers", "acquaintances") == "")
+    check("private_prestage_silent", relationship_beat_line("A", "B", "strangers", "private_attraction") == "")
+    check("souring_emits", "Friction" in relationship_beat_line("A", "B", "close friends", "rivals"))
+    check("bereavement_emits", "grieving" in relationship_beat_line("A", "B", "partners", "grieving").lower())
+    check("blank_after_silent", relationship_beat_line("A", "B", "friends", "") == "")
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+# M2: conversational tone → relation/attitude. Words move how an NPC/faction FEELS about the player (the whole
+# point of talking) — bounded via apply_reaction's caps. Words still can't mint RESOURCES (ships/money/wares);
+# only feelings/standing move here. Deterministic baseline so it's testable + reliable without an LLM call.
+_TONE_THREAT = ("kill you", "murder", "destroy you", "wipe you out", "exterminate", "raid you", "raid your",
+                "go to war", "declare war", "hunt you", "end you", "slaughter", "your family", "steal your",
+                "burn your", "blow you", "i'll kill", "wipe out your")
+_TONE_INSULT = ("idiot", "fool", "scum", "coward", "pathetic", "worthless", "piece of shit", "garbage",
+                "trash", "incompetent", "disgusting", "traitor", "liar", "spineless", "moron", "useless")
+_TONE_WARM = ("thank you", "thanks", "appreciate", "grateful", "well done", "respect", "honour", "honor",
+              "my friend", "glad", "pleasure", "help you", "good work", "admire", "trust you", "stand with you")
+
+
+def classify_tone(text: str) -> dict:
+    """Pure: classify the player's message tone/intent into a bounded emotional reaction the NPC/faction holds
+    TOWARD the player. Threat > insult > warmth > neutral. Deltas are within apply_reaction's REACTION_CAPS
+    (resentment ≤+20, fear ≤+15, trust ≥-15). Never throws."""
+    t = str(text or "").lower()
+    if any(p in t for p in _TONE_THREAT):
+        return {"label": "hostile", "resentment": 15, "fear": 8, "trust": -12}
+    if any(p in t for p in _TONE_INSULT):
+        return {"label": "rude", "resentment": 8, "fear": 0, "trust": -6}
+    if any(p in t for p in _TONE_WARM):
+        return {"label": "warm", "resentment": -4, "fear": 0, "trust": 6}
+    return {"label": "neutral", "resentment": 0, "fear": 0, "trust": 0}
+
+
+def run_tone_reaction_selftest() -> dict:
+    """Deterministic oracle for M2: tone classification → bounded reaction. Threats sour + frighten + drop trust;
+    insults sour; warmth builds trust; neutral does nothing; and apply_reaction stays within caps."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    hostile = classify_tone("I'm going to murder your family and steal your ship")
+    check("threat_is_hostile", hostile["label"] == "hostile" and hostile["resentment"] > 0 and hostile["trust"] < 0, str(hostile))
+    rude = classify_tone("you're a pathetic coward")
+    check("insult_is_rude", rude["label"] == "rude" and rude["resentment"] > 0)
+    warm = classify_tone("Thank you, I really appreciate your help")
+    check("warmth_builds_trust", warm["label"] == "warm" and warm["trust"] > 0)
+    neutral = classify_tone("Where is the nearest equipment dock?")
+    check("neutral_no_change", neutral["label"] == "neutral" and neutral["resentment"] == 0 and neutral["trust"] == 0)
+    check("threat_outranks_insult", classify_tone("you idiot, I'll kill you")["label"] == "hostile")
+
+    d = tempfile.mkdtemp(prefix="nl_tone_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "tone.sqlite3")
+        h = classify_tone("I will destroy you")
+        store.apply_reaction("s", "argon", "player", {k: h[k] for k in ("resentment", "fear", "trust")},
+                             mood="", rationale="tone")
+        rel = store.get_relationship("s", "argon", "player") or {}
+        check("reaction_written", float(rel.get("resentment", 0)) > 0, str(rel)[:160])
+        check("within_caps", float(rel.get("resentment", 0)) <= 20)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_blackboard_probe_selftest() -> dict:
+    """Deterministic oracle for the Blackboard identity probe's VERDICT logic (the in-game write/read is what the
+    probe itself proves; this proves we classify the recorded observations correctly). PASS scenario →
+    USE_BLACKBOARD; reload-read-fails → REJECT; works-but-no-id-change → HYBRID."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_bbprobe_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "bb.sqlite3")
+
+        # PASS: write + same-session read + after-reload read, runtime id CHANGED (100->200), dup keys distinct.
+        for r in [
+            {"save_id": "pass", "phase": "write", "target_type": "conversation_person", "runtime_component_id": "100",
+             "npc_name": "Manda", "blackboard_key": "$aic_key", "blackboard_value": "K1", "write_success": True, "read_success": True},
+            {"save_id": "pass", "phase": "same_session", "target_type": "conversation_person", "runtime_component_id": "100",
+             "npc_name": "Manda", "blackboard_value": "K1", "read_success": True},
+            {"save_id": "pass", "phase": "after_reload", "target_type": "conversation_person", "runtime_component_id": "200",
+             "npc_name": "Manda", "blackboard_value": "K1", "read_success": True},
+            {"save_id": "pass", "phase": "duplicate", "runtime_component_id": "201", "npc_name": "CrewA", "blackboard_value": "KA", "read_success": True},
+            {"save_id": "pass", "phase": "duplicate", "runtime_component_id": "202", "npc_name": "CrewB", "blackboard_value": "KB", "read_success": True},
+        ]:
+            store.record_blackboard_probe(r)
+        vp = store.blackboard_verdict("pass")
+        check("pass_legacy_use_blackboard", vp["legacy_verdict"] == "USE_BLACKBOARD", str(vp))
+        check("pass_string_key_survived", vp["string_key_survived"] is True)
+        check("pass_dup_ok", vp["duplicate_separation_ok"] is True)
+
+        # OBJECT_REF: an object-ref payload resolves after reload (new runtime id) AND matches the same person.
+        for r in [
+            {"save_id": "obj", "phase": "write", "payload_type": "object", "runtime_component_id": "100",
+             "npc_name": "Manda", "blackboard_key": "$aic_obj", "blackboard_value": "objref_1",
+             "npctemplate": "tmpl_crew", "write_success": True, "read_success": True, "restored_match": True},
+            {"save_id": "obj", "phase": "after_reload", "payload_type": "object", "runtime_component_id": "200",
+             "npc_name": "Manda", "blackboard_value": "objref_1", "npctemplate": "tmpl_crew",
+             "read_success": True, "restored_match": True},
+        ]:
+            store.record_blackboard_probe(r)
+        vo = store.blackboard_verdict("obj")
+        check("object_ref_verdict", vo["verdict"] == "OBJECT_REF", str(vo))
+        check("object_ref_survived", vo["object_ref_survived"] is True)
+
+        # HYBRID_TEMPLATE: object ref fails to resolve after reload, but the person is re-found via npctemplate.
+        for r in [
+            {"save_id": "tmpl", "phase": "write", "payload_type": "object", "runtime_component_id": "100",
+             "npc_name": "Manda", "blackboard_value": "objref_2", "write_success": True, "read_success": True},
+            {"save_id": "tmpl", "phase": "after_reload", "payload_type": "object", "runtime_component_id": "",
+             "npc_name": "Manda", "blackboard_value": "objref_2", "read_success": False},
+            {"save_id": "tmpl", "phase": "template_fallback", "runtime_component_id": "300", "npc_name": "Manda",
+             "npctemplate": "tmpl_crew", "read_success": True, "restored_match": True},
+        ]:
+            store.record_blackboard_probe(r)
+        check("template_fallback_verdict", store.blackboard_verdict("tmpl")["verdict"] == "HYBRID_TEMPLATE")
+
+        # SYNTHETIC: object ref written but after-reload read fails and no template fallback found.
+        for r in [
+            {"save_id": "rej", "phase": "write", "payload_type": "object", "runtime_component_id": "100",
+             "npc_name": "Manda", "blackboard_value": "R1", "write_success": True, "read_success": True},
+            {"save_id": "rej", "phase": "after_reload", "payload_type": "object", "runtime_component_id": "200",
+             "npc_name": "Manda", "blackboard_value": "", "read_success": False},
+        ]:
+            store.record_blackboard_probe(r)
+        vr = store.blackboard_verdict("rej")
+        check("reject_is_synthetic", vr["verdict"] == "SYNTHETIC", str(vr))
+        check("reject_legacy", vr["legacy_verdict"] == "REJECT")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_blackboard_bind_selftest() -> dict:
+    """Deterministic oracle for wiring the Blackboard token as the PRIMARY identity key: binding links the chat
+    npc to a `bb:<token>` identity (status bound, confidence 1.0); a different token yields a different identity;
+    re-bind is idempotent; missing args are guarded."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_bbbind_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "bind.sqlite3")
+        check("chat_key_uses_token", store.chat_npc_key("s", "chat", "Manda", "tok") == "s|chat|bb:tok")
+        check("chat_key_fallback_name", store.chat_npc_key("s", "chat", "Manda", "") == "s|chat|Manda")
+        r = store.bind_blackboard_identity("s", "Manda Smitt", "argon", "service crew", "aic_100_111", "100")
+        check("bind_ok", bool(r.get("ok")) and r.get("persistent_npc_key") == "bb:aic_100_111", str(r))
+        token_key = store.chat_npc_key("s", "chat", "Manda Smitt", "aic_100_111")
+        check("result_keyed_by_token", r.get("npc_key") == token_key, str(r.get("npc_key")))
+        npc = store.get_npc(token_key) or {}
+        check("token_key_linked", npc.get("persistent_key") == "bb:aic_100_111", str(npc.get("persistent_key")))
+        ident = store.get_identity("bb:aic_100_111") or {}
+        check("identity_bound", str(ident.get("status")) == "bound" and float(ident.get("identity_confidence") or 0) >= 1.0, str(ident))
+        r2 = store.bind_blackboard_identity("s", "Manda Smitt", "argon", "service crew", "aic_100_111")
+        check("rebind_idempotent", r2.get("persistent_npc_key") == "bb:aic_100_111")
+        r3 = store.bind_blackboard_identity("s2", "Other Guy", "teladi", "pilot", "aic_900_999")
+        check("distinct_token_distinct_identity",
+              r3.get("persistent_npc_key") == "bb:aic_900_999"
+              and str((store.get_identity("bb:aic_900_999") or {}).get("status")) == "bound")
+        check("guard_missing", store.bind_blackboard_identity("", "", "", "", "").get("ok") is False)
     finally:
         shutil.rmtree(d, ignore_errors=True)
     return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),

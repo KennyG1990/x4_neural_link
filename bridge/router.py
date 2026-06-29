@@ -16,6 +16,9 @@ from .memory import (
     run_universe_selftest, run_full_stress, run_npc_identity_selftest,
     run_npc_rebind_selftest, run_npc_promotion_selftest, run_npc_recall_gate_selftest,
     run_role_inference_selftest, run_soft_confirm_selftest,
+    relationship_beat_line, run_relationship_beat_selftest,
+    classify_tone, run_tone_reaction_selftest,
+    run_blackboard_probe_selftest, run_blackboard_bind_selftest,
 )
 from .player2_client import Player2Client
 from .telemetry import BridgeTelemetry
@@ -299,6 +302,42 @@ class NeuralRouter:
     def comms_sender_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Deterministic oracle for M5a: player-comms sender/tx_id/priority enrichment."""
         return run_comms_sender_selftest()
+
+    def relationship_beat_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for M4: ambient relationship-beat generation on social-status transitions."""
+        return run_relationship_beat_selftest()
+
+    def tone_reaction_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for M2: conversational tone → bounded relation/attitude reaction."""
+        return run_tone_reaction_selftest()
+
+    # --- NPC Blackboard persistent-identity probe ------------------------------
+    def blackboard_probe_record(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Record one in-game Blackboard probe observation (Phase 1-7 rows posted by the mod's Lua probe)."""
+        rid = self.memory.record_blackboard_probe(payload or {})
+        return {"ok": True, "id": rid}
+
+    def blackboard_probe_latest(self, save_id: str = "") -> dict[str, Any]:
+        return {"ok": True, "probes": self.memory.latest_blackboard_probe(save_id)}
+
+    def blackboard_probe_verdict(self, save_id: str = "") -> dict[str, Any]:
+        return {"ok": True, **self.memory.blackboard_verdict(save_id)}
+
+    def blackboard_probe_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for the probe VERDICT logic (PASS→USE_BLACKBOARD / reload-fail→REJECT / HYBRID)."""
+        return run_blackboard_probe_selftest()
+
+    def identity_bind_blackboard(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Bind an NPC's identity to its durable Blackboard token (the PRIMARY key). payload:
+        {save_id, name, faction, role, blackboard_key, runtime_id}."""
+        p = payload or {}
+        return self.memory.bind_blackboard_identity(
+            str(p.get("save_id") or ""), str(p.get("name") or ""), str(p.get("faction") or ""),
+            str(p.get("role") or ""), str(p.get("blackboard_key") or ""), str(p.get("runtime_id") or ""))
+
+    def blackboard_bind_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for wiring the Blackboard token as the primary identity key."""
+        return run_blackboard_bind_selftest()
 
     def identity_promote(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Promote an identity's tracking priority. payload: {persistent_npc_key|npc_key, reason}."""
@@ -2143,10 +2182,34 @@ class NeuralRouter:
             return {"ok": True, "comm": comm}
         return {"ok": False, "error": "could not build comm"}
 
+    def _ensure_comm_sender(self, comm: dict[str, Any]) -> dict[str, Any]:
+        """M5b: guarantee EVERY player communiqué carries a named sender + priority + tx_id, no matter which
+        generator built it (faction-decision builds set these in _build_comms; the contract/patrol/supply and
+        diplomacy builders did not). Fills missing fields from the comm's faction representative; never overrides
+        an explicitly-set value."""
+        try:
+            if comm.get("sender_name"):
+                return comm
+            save_id = str(comm.get("save_id") or "")
+            fid = str(comm.get("faction") or "argon")
+            fname = str(comm.get("faction_name") or self._fac_name(save_id, fid) or fid)
+            rep = ""
+            try:
+                fac = self.memory.get_faction(save_id, fid) or {}
+                rep = str(fac.get("representative") or "").strip()
+            except Exception:
+                rep = ""
+            for k, v in comms_sender_fields(save_id, fid, fname, rep, str(comm.get("kind") or "alert"), []).items():
+                comm.setdefault(k, v)
+        except Exception:
+            pass
+        return comm
+
     def drain_player_comms(self) -> list[dict[str, Any]]:
-        """Drain all queued player communiqués since the last call (the mod heartbeat consumes these)."""
+        """Drain all queued player communiqués since the last call (the mod heartbeat consumes these).
+        Every comm is enriched with a named sender + priority (M5b) before it leaves the bridge."""
         with self.lock:
-            items = list(self.player_comms)
+            items = [self._ensure_comm_sender(c) for c in self.player_comms]
             self.player_comms.clear()
             return items
 
@@ -2796,13 +2859,39 @@ class NeuralRouter:
         return {"ok": True, "relations": self.memory.list_social_relations(save_id, npc),
                 "summary": (self.memory.social_summary(save_id, npc) if npc else "")}
 
+    def _enqueue_relationship_beat(self, save_id: str, res: dict[str, Any]) -> Optional[str]:
+        """M4: if a social event changed the edge's narrative STATUS, surface a one-line ambient gossip beat to the
+        player (low-priority Messages entry, From: Station Gossip). Returns the beat line or None. Never throws."""
+        try:
+            if not (res or {}).get("ok"):
+                return None
+            line = relationship_beat_line(res.get("subject_npc"), res.get("object_npc"),
+                                          str(res.get("status_before") or ""), str(res.get("status") or ""))
+            if not line:
+                return None
+            comm = {"title": "Crew Affairs", "body": line, "faction": "", "faction_name": "",
+                    "category": "news", "kind": "alert", "save_id": save_id, "ts": time.time(),
+                    "sender_name": "Station Gossip", "sender_faction": "", "sender_npc_key": "",
+                    "sender_role": "narrator", "priority": "low", "tx_id": "tx_" + uuid.uuid4().hex[:12]}
+            self.player_comms.append(comm)
+            while len(self.player_comms) > 200:
+                self.player_comms.popleft()
+            return line
+        except Exception:
+            return None
+
     def social_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         """#39: apply a social EVENT (saved_life, betrayal, served_together, …) to an NPC↔NPC edge — the only
-        sanctioned way relationships change. Mutates scores + evidence + re-derives narrative status."""
+        sanctioned way relationships change. Mutates scores + evidence + re-derives narrative status. M4: a status
+        change also emits an ambient relationship beat to the player."""
         save_id = str(payload.get("save_id") or "unindexed")
-        return self.memory.apply_social_event(save_id, str(payload.get("subject_npc") or ""),
-                                              str(payload.get("object_npc") or ""),
-                                              str(payload.get("event_type") or ""), str(payload.get("note") or ""))
+        res = self.memory.apply_social_event(save_id, str(payload.get("subject_npc") or ""),
+                                             str(payload.get("object_npc") or ""),
+                                             str(payload.get("event_type") or ""), str(payload.get("note") or ""))
+        beat = self._enqueue_relationship_beat(save_id, res)
+        if beat:
+            res = {**res, "beat": beat}
+        return res
 
     def social_edge_brief(self, payload: dict[str, Any]) -> dict[str, Any]:
         """#39: the in-character edge context to inject when subject talks ABOUT object (scores->English)."""
