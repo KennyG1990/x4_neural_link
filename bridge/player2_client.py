@@ -849,11 +849,10 @@ class Player2Client:
         # memory is injected into this turn's context and the exchange is recorded.
         npc_key = None
         if self.memory is not None:
-            # Conversations are keyed by the NPC's durable Blackboard token when present (per-ID memory: same-name
-            # crew no longer share a key, and memory follows the bound NPC across reload). Falls back to the
-            # name-based key for unbound NPCs / non-chat flows — so existing behavior is unchanged without a token.
-            _bbtok = str(request.target.get("blackboard_key") or request.metadata.get("blackboard_key") or "")
-            npc_key = self.memory.chat_npc_key(save_id, game_id, persona.get("name") or system_prompt[:64], _bbtok)
+            # ONE card per (save, name). The Blackboard token is the durable IDENTITY stamped on this card (via the
+            # probe's bind_blackboard_identity POST, survives reload) — NOT the card key. Keying cards by token
+            # duplicated NPCs (one real NPC → two cards), so the conversation card is name-based.
+            npc_key = self.memory.make_key(save_id, game_id, persona.get("name") or system_prompt[:64])
             # Grounded injection: personal memory + faction/relationship/war/sector/
             # world-event context, so replies reference the real, specific universe.
             mem_ctx = self.memory.build_situation_briefing(npc_key)

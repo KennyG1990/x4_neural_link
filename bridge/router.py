@@ -19,6 +19,7 @@ from .memory import (
     relationship_beat_line, run_relationship_beat_selftest,
     classify_tone, run_tone_reaction_selftest,
     run_blackboard_probe_selftest, run_blackboard_bind_selftest,
+    run_deceased_sweep_selftest,
 )
 from .player2_client import Player2Client
 from .telemetry import BridgeTelemetry
@@ -338,6 +339,22 @@ class NeuralRouter:
     def blackboard_bind_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Deterministic oracle for wiring the Blackboard token as the primary identity key."""
         return run_blackboard_bind_selftest()
+
+    def repair_blackboard_duplicates(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """One-shot heal for NPC cards split into duplicate name+token cards by the old bind."""
+        return self.memory.repair_blackboard_duplicates()
+
+    def sweep_deceased(self, save_id: str = "", stale_seconds: str = "") -> dict[str, Any]:
+        """Mark/prune NPCs the census hasn't re-seen for > stale_seconds (their ship/station is gone)."""
+        try:
+            secs = float(stale_seconds) if stale_seconds else 3600.0
+        except ValueError:
+            secs = 3600.0
+        return self.memory.sweep_deceased_npcs(save_id, secs)
+
+    def deceased_sweep_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for the deceased staleness sweep."""
+        return run_deceased_sweep_selftest()
 
     def identity_promote(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Promote an identity's tracking priority. payload: {persistent_npc_key|npc_key, reason}."""

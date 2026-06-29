@@ -48,6 +48,36 @@ becomes the PRIMARY identity (runtime id = session-only, evidence = fallback), u
   blackboards (no shared name|faction slot to collide). VALIDATE: bridge tracks two same-name "Manda" NPCs with
   distinct tokens as SEPARATE identities (no merge), each survives independently → OBJECT_REF; bb_selftest 8/8.
   Phase 6 in-game (two real same-name crew) is the final confirm; mechanism is sound.
+- **🛠️ PHASE 6/7 CHARACTERIZATION (Ken 2026-06-29 — "take phase 6/7, follow the workflow").** RECONCILE: the
+  bridge verdict (`blackboard_verdict` dup_ok + template_fallback_ok) and `run_blackboard_probe_selftest`
+  (OBJECT_REF/HYBRID_TEMPLATE/SYNTHETIC + dup) ALREADY exist + pass; the collector already captures `npctemplate`.
+  REAL gaps: (P6) collector never EMITS a `duplicate`-phase row, so dup_ok has no in-game data; (P7) despawn→template
+  needs OBSERVING X4's real despawn behaviour before any fallback code (ground-against-reality — no speculative build).
+  PLAN: (P6) collector tracks same-name NPCs per session → emits `duplicate` rows with each NPC's distinct token +
+  deterministic dup-collision selftest; (P7) document the in-game lifecycle procedure + expected rows/verdict, keep
+  the existing npctemplate capture as the Tier-2 raw data, mark the proof ◐ in-game. Validate: Forge + selftests.
+  - **✅ PHASE 6 (duplicate-collision) BUILT + VERIFIED 2026-06-29 (in-game ◐).** Collector (`aic_uix.lua`
+    `BlackboardProbe`) now tracks same-name NPCs per session (`AI_Influence._bbSeen[name]={tok,rid}`) and, on meeting
+    a SECOND NPC with the same name, emits a `duplicate`-phase row for BOTH (each with its own token + runtime id) —
+    `postRow` was generalized to honour per-row `npc_name`/`runtime_component_id`. The bridge `blackboard_verdict`
+    `dup_ok` already consumes these. VALIDATE: `blackboard_probe_selftest` **10/10** (added `dup_distinct_tokens_ok`
+    True for two same-name crew with DISTINCT tokens, and `dup_collision_detected` False for a hypothetical shared
+    token); bind 12/12, memory 15/15; Forge `/api/agent/selftest` 10/10 allPassed. ◐ in-game proof: talk to TWO
+    real same-name crew, then `GET /v1/npc_identity_probe/blackboard/verdict?save_id=…` → expect
+    `duplicate_separation_ok:true` with two distinct tokens. (Lua syntax is in-game/debuglog-gated — no offline Lua
+    compiler available in the sandbox.)
+  - **◐ PHASE 7 (despawn→template lifecycle) — DOCUMENTED, NOT pre-built (ground-against-reality).** The collector
+    already captures `npctemplate` on every probe row (the Tier-2 raw data) and the bridge verdict already classifies
+    `template_fallback` rows → `HYBRID_TEMPLATE` (selftest-covered). We deliberately did NOT write speculative
+    despawn-fallback code before OBSERVING X4's real despawn behaviour. IN-GAME PROCEDURE to run the observation:
+    (1) talk to a crew NPC (mints token + stores object-ref on player scope + records npctemplate);
+    (2) save; (3) cause the NPC to DESPAWN (e.g. dismiss/transfer the crew member, or destroy their ship/container);
+    (4) reload; (5) re-open the probe context for that template — the stored object-ref should FAIL to resolve while
+    the `npctemplate` remains readable. EXPECTED: an object `after_reload` row with `read_success:false` + a
+    `template_fallback` row with `restored_match:true` → verdict `HYBRID_TEMPLATE`. Only AFTER seeing this do we
+    decide whether to wire an automatic template-fallback resolver (its design depends on what X4 actually does to a
+    despawned crew's object handle — unknown until observed). Until then the synthetic Tier-3 key remains the
+    despawned-NPC fallback.
 - **✅ WIRED 2026-06-29 — Blackboard token is now the PRIMARY identity key (bridge+selftest verified; in-game BOUND
   pending).** Dedicated path (chosen over threading through rebind_session — lower blast radius):
   `memory.bind_blackboard_identity(save_id,name,faction,role,blackboard_key,runtime_id)` → links the chat npc_key to
@@ -80,6 +110,26 @@ becomes the PRIMARY identity (runtime id = session-only, evidence = fallback), u
     now show a separate `🔒 bound` token-keyed row alongside their legacy `bound*` name-keyed row. memory 15/15,
     bind 9/9 — no regression. ◐ residual (cosmetic): two rows per NPC (legacy name-key + new token-key) — could be
     grouped by `persistent_key` in the list view later; both link to the same identity so recall is unaffected.
+  - **🛠️ DUPLICATE NPC CARD FIX 2026-06-29 (Ken: "one NPC, two cards" — the cosmetic residual was actually a real bug).**
+    RECONCILE finding: the per-ID card change was WRONG as built — `bind_blackboard_identity` CREATED a separate
+    `bb:<token>` card (0 turns) instead of adopting the existing name card (all history), AND the guard refused to
+    upgrade the name card from its synthetic `pid:` identity to the proven Blackboard token. Result: one real NPC →
+    two cards, history stranded, false "2 same-name collisions" warning. DECISION (Ken-confirmed, Option 1): **name
+    card is canonical** (chat already reliably writes there; name+save is itself reload-stable), the Blackboard token
+    is the **durable identity stamped on it** (supersedes synthetic pid → flips 🔒 bound), and we **merge** any stray
+    token card back in. Reverts the bb-card chat keying. Same-name SPLIT deferred until a genuine collision (two
+    distinct tokens, same name+save) is actually observed.
+    **✅ DONE + VERIFIED 2026-06-29.** memory.py: `chat_npc_key` now name-canonical (token no longer keys cards);
+    `bind_blackboard_identity` adopts the name card (creates none), merges any stray token card, upgrades pid:→bb:;
+    new `merge_npc_cards(src,dst)` (repoints turns+facts, drops src) + `repair_blackboard_duplicates()` one-shot;
+    `npc_complete` reverted to name keying. New GET `/api/memory/repair_blackboard_dupes`. VALIDATE (Claude-in-Chrome,
+    live :8713): `blackboard_bind_selftest` **12/12** (added no_separate_token_card / name_card_upgraded_to_token /
+    history_preserved / stray_card_folded / stray_history_merged), `memory_selftest` 15/15. Ran the repair on the live
+    DB → folded 3 duplicates (Daron, Manda, Rina) into their name cards, **0 `…|chat|bb:…` cards remain**; dashboard
+    reload shows **no duplicate names**, Manda one row (92 turns, 🔒 bound), Rina one row (12 turns, 🔒 bound).
+    Binding no longer depends on the unproven token/prompt_vars ride (the probe's explicit bind POST stamps identity).
+    ✅ IN-GAME CONFIRMED 2026-06-29 (Ken: "perfect that worked") — one card per NPC after the repair; no second card.
+    Minor leftover: `bind_live|chat|Manda Smitt` (selftest junk in a test save) — harmless, ignore/filter.
 - **◐ NEXT:** in-game confirm the BOUND flip; then characterization (despawn→template, entity matrix, Phase 5
   save-XML grep); then (optional) re-key chat memory by the token for full duplicate isolation.
 
@@ -437,6 +487,85 @@ sector with stations → confirm the dashboard NPC roster gains those station ma
       MD, so this needs the vanilla crew/station-info menu primitive (SAME gap as Tier-1). → Codex grounding:
       find the accessor in `scriptproperties.xml` + the unpacked ego crew/station menu lua, then re-enable the two
       `run_actions ref=…Census_npcs`. Proven + ready: cue scaffold, find_station, the index→bridge→dashboard path.
+      **RECONCILE 2026-06-29 (Ken: "build it now"):** re-walked all grounding avenues — the person-enumeration
+      accessor is STILL unground-able from the Cowork sandbox: `scriptproperties.xml` + unpacked ego UI live in the
+      un-mounted game root (`G:\…\X4 Foundations\`); the Forge `fs/read` is rooted at `extensions/` and **403s on
+      directory traversal**; the Forge validator does NOT check scriptproperty access (per canon); DeadAir has no
+      person enumeration (only `$ship.commander` = a ship). So the throttled PIPELINE (round-robin clone of
+      `SyncEconomy`, `find_station`/`GetContainedStationsByOwner`/`GetContainedObjectsByOwner`, the
+      `index_npcs→/v1/npcs/index→dashboard` path) is PROVEN + ready, but the **person SOURCE** is blocked.
+      UNBLOCK needed (Ken or Codex): drop `scriptproperties.xml` (or `ui/addons/ego_detailmonitor/menu_map.lua` +
+      the station/crew info menus) into a MOUNTED folder so the legal station/ship→person accessor can be grounded;
+      THEN the census is a one-file wiring job. Do NOT guess more property names (2 already failed → stop-and-research).
+      **✅ ACCESSOR FOUND + CENSUS BUILT 2026-06-29 (Ken supplied the unpacked ego UI at `F:\DEV_ENV\x4-unpacked`).**
+      Grounded the real accessor in the vanilla UI: a station's commanding person is **`GetComponentData(st,"tradenpc")`**
+      (the manager) + **`"shiptrader"`** — NOT `manager`/`controlentity` (which is why the MD guesses came up empty);
+      a ship's captain is `GetComponentData(ship,"pilot")`. Refs: `ego_detailmonitor/menu_map.lua:14440`,
+      `menu_docked.lua:3787`, `menu_map.lua:15280`. BUILT (Lua, not MD — these are Lua-FFI reads): `AI_Influence.SyncNpcCensus`
+      in `aic_uix.lua` clones the proven `SyncEconomy` round-robin (ONE faction + a 40-station slice per ~120s tick,
+      cursor `_npcFac`/`_npcOff` → galaxy-wide GRADUAL fill), reads `tradenpc`+`shiptrader` per station
+      (`ConvertIDTo64Bit` → `GetComponentData(person,"name","postname")`), and POSTs to `/v1/npcs/index` keyed
+      **`sid|chat|name` + game_id=chat** so a censused manager and a LATER chat UNIFY on one card (no duplicate).
+      Wired into the existing heartbeat (line 373, with econ/fleet/logbook/factions). T3 generic ship crew stay LAZY
+      (per spec). Bridge sink unchanged — `index_npcs` already accepts {name,faction_id,role,sector,skills}.
+      VALIDATE: synthetic `/v1/npcs/index` POST mirroring the census → 2 roster rows appear with the correct
+      `sid|chat|name` key + role + faction (then deleted); memory 15/15, probe 10/10, bind 12/12, Forge selftest
+      10/10 — no regression. ◐ IN-GAME GATE: heartbeat tick → dashboard roster gains station managers WITHOUT a chat
+      (and confirm `tradenpc` resolves for AI-faction stations — the thing the MD path couldn't reach). Lua syntax is
+      debuglog-gated (no offline Lua linter — see the Forge tool-improvement). ◐ optional follow-ups: include crew
+      skills in the payload; add ship-captain (`pilot`) tier; reconcile roster rows with the active-runtime layer.
+      **CATALOG-CONFIRMED 2026-06-29:** Ken supplied the full unpacked tree (`F:\DEV_ENV\Games\X4 Foundations\Files\
+      unpacked\`, incl. `libraries/scriptproperties.xml`). Verified the accessors are legal `type="entity"` props:
+      `tradenpc` (Trade control entity), `shiptrader`, `pilot`. Root-caused the old failures for good: `manager` is
+      NOT a property; `controlentity` is only legal as `controlentity.default`/`{$controlpost}`, never bare. The
+      unpacked tree (md/aiscripts/ui/t/scriptproperties) is now the authoritative grounding source — banked in canon.
+      **✅ IN-GAME CONFIRMED 2026-06-29 (Ken: "it's all station managers now in the database NPC graph").** The
+      `tradenpc` census populates the roster without a chat. NEXT (Ken: "what about all the other NPCs"): expand
+      tiers — `controlposts.all` + `controlentity.{$post}` = operational NPCs (defence officers, ship captains);
+      `people/availablepeople.{$npctemplate}` = generic crew (LAZY per spec, don't dump). Scope TBD with Ken.
+      **✅ SHIP-CAPTAIN TIER ADDED 2026-06-29 (Ken chose "Operational NPCs").** `SyncNpcCensus` now does TWO passes
+      per round-robin faction (dual cursor `_npcOff`/`_npcShipOff`, advance faction only when BOTH wrap): stations
+      (tradenpc+shiptrader) AND **ship captains** of SIGNIFICANT ships — capitals (`ship_l`/`ship_xl`) + trade/mine/
+      build purpose via `GetContainedObjectsByOwner`+`GetMacroClass` (reused from SyncFleets), captain =
+      `GetComponentData(ship,"pilot")` (catalog-confirmed). Generic fighter pilots SKIPPED (lazy T3). Shared safe
+      `aic_sectorName` (ConvertStringToLuaID first — the cdata fix). Keyed `sid|chat|name`+game_id=chat (unify w/ chat).
+      VALIDATE: synthetic `/v1/npcs/index` POST w/ captain+shiptrader → rows appear w/ correct role/faction/key, then
+      deleted; memory 15/15, probe 10/10, bind 12/12, Forge 10/10 — no regression. ◐ IN-GAME: roster gains ship
+      captains without a chat. **◐ DEFERRED (honest — NOT delivered): station DEFENCE-OFFICER + other control posts.**
+      Lua FFI only exposes the DEFAULT control entity (`GetControlEntity` = manager); per-post officers need an MD
+      reader over `$station.controlposts.all` + `$station.controlentity.{$controlpost}` (both catalog-legal) — a
+      small MD follow-up, not built (won't guess an FFI that vanilla doesn't use). ◐ perf note: SyncFleets +
+      SyncNpcCensus now both iterate all faction objects each heavy tick — could share one enumeration later.
+      **✅ DEFENCE-OFFICER + ENGINEER READER BUILT 2026-06-29 (MD — the deferred piece; Ken supplied the syntax).**
+      New MD library `Census_officers` in `ai_influence_worldsync.xml`: for current-sector stations
+      (`find_station space="player.sector"`), reads `$st.controlentity.{controlpost.defence}` + `{controlpost.engineer}`
+      (knownname-gated), faction via `$st.owner.id` (faction datatype `id` → matches the Lua census's "argon"), and
+      raises the existing `AIChat.index_npcs` with role as a 3rd `~` field. Wired into Sync_on_load + the 15s Tick.
+      Lua `IndexNpcs` extended: parse `name~faction~role`, key each `sid|chat|name` + game_id=chat (unify w/ chat &
+      the Lua census). GROUNDED: `controlpost.{manager,defence,engineer}` are the live post ids (scriptproperties +
+      vanilla usage); `assignedcontrolentity.{$controlpost}` is the assigned-but-absent fallback. VALIDATE: Forge
+      `project/validate` → the only findings are single-file-isolation artifacts (`missing_content_xml`,
+      `md_lua.missing_register` for AIChat.* — handlers exist in aic_uix.lua); **NO XSD error on the Census_officers
+      library or the control-post syntax** → MD structurally legal. Sink + role/game_id=chat payload already proven
+      via synthetic POST; selftests 15/15·10/10·12/12, Forge 10/10. ◐ IN-GAME: defence/engineer officers appear in
+      the roster for the player's current sector (and confirm `$st.owner.id` yields the short faction id). Scope note:
+      MD officers are CURRENT-SECTOR (gradual as you travel); managers + ship captains are galaxy-wide (Lua). With
+      this, the "Operational NPCs" tier (manager + captain + defence + engineer) is COMPLETE on the build side.
+      **✅ SCALE + DEATH HANDLING 2026-06-29 (Ken: "must not break in large wars; dead NPCs removed or marked
+      deceased").** FOG OF WAR confirmed NOT a limiter: `GetContained*` returns ground truth galaxy-wide (proven by
+      SyncFleets reporting factions the player is nowhere near). (1) CADENCE: `SyncNpcCensus` now loops ALL 12
+      factions each tick with small per-faction caps (12 stations + 12 captains) + per-faction cursors
+      (`_npcStOff`/`_npcShOff`), so every NPC's `last_active` refreshes once per full cycle — the prerequisite for
+      staleness. (2) DEATH via STALENESS (not per-death events — those flood at war-scale): `index_npc` now resets
+      `is_alive=1` on every re-index (self-corrects false positives); new `memory.sweep_deceased_npcs(save_id,
+      stale_seconds)` — chat-scope NPCs not re-seen for > threshold (ship/station gone) → KNOWN (has turns) marked
+      `is_alive=0` (memory KEPT, "they died" is canon), GENERIC (no turns) PRUNED. One bounded query, so a 300-ship
+      battle never floods. GET `/api/memory/sweep_deceased` + `/api/memory/sweep_selftest`; Lua `SweepDeceased` fires
+      ~every 16th heartbeat (~4 min, threshold-protected). Dashboard: ☠ + dimmed row for deceased (`is_alive` added
+      to list_npcs). VALIDATE: `sweep_selftest` **7/7** (mark-known/prune-generic/fresh-untouched/reindex-resurrects),
+      memory 15/15, probe 10/10, bind 12/12; live sweep on real DB = 0/0 (safe). ◐ IN-GAME. TUNABLE: detection
+      latency ≈ cycle(~30m at cap 12) bounded by stale_seconds(default 1h) — raise caps / lower threshold if too slow.
+      ◐ perf: census + SyncFleets now both iterate all faction objects each tick — share one enumeration later.
 - **A4 — Fact-promotion tuning [IG-2, HIGH]. ✅ DONE+VERIFIED 2026-06-27 (live).** Root cause (reconcile):
   condensation is DELIBERATELY disabled (raw turns kept full-fidelity for retrieval — Codex's accuracy choice)
   and `promote_durable_facts` was ON-DEMAND only (ran once via #77 → 11 facts). FIX: auto-wire promotion into

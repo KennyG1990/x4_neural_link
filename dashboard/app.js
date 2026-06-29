@@ -174,8 +174,8 @@ function renderMemory(memNpcs, memMetrics) {
     return n.npc_id ? `rt ${String(n.npc_id).slice(0, 8)}` : "unbound";
   };
   document.getElementById("npcsBody").innerHTML = npcs.map((n) => `
-    <tr class="rowBtn ${n.npc_key === selectedNpcKey ? "rowSel" : ""}" data-npc="${esc(n.npc_key)}">
-      ${td(n.name || "(unnamed)")}
+    <tr class="rowBtn ${n.npc_key === selectedNpcKey ? "rowSel" : ""} ${n.is_alive === 0 ? "dim" : ""}" data-npc="${esc(n.npc_key)}">
+      ${td((n.is_alive === 0 ? "☠ " : "") + (n.name || "(unnamed)"))}
       ${td(n.faction_id || "")}
       ${td(roleSkill(n))}
       ${td(`${n.save_id || "—"} / ${n.game_id || "—"}`, "mono")}

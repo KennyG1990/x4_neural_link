@@ -112,6 +112,16 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/blackboard_bind/selftest":
             self._send_json(200, self.router.blackboard_bind_selftest())
             return
+        if parsed.path == "/api/memory/repair_blackboard_dupes":
+            self._send_json(200, self.router.repair_blackboard_duplicates())
+            return
+        if parsed.path == "/api/memory/sweep_deceased":
+            self._send_json(200, self.router.sweep_deceased(
+                query.get("save_id", [""])[0], query.get("stale_seconds", [""])[0]))
+            return
+        if parsed.path == "/api/memory/sweep_selftest":
+            self._send_json(200, self.router.deceased_sweep_selftest())
+            return
         if parsed.path == "/v1/npc_identity_probe/blackboard/latest":
             self._send_json(200, self.router.blackboard_probe_latest(query.get("save_id", [""])[0]))
             return

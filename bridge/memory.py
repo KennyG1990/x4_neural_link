@@ -638,12 +638,12 @@ class MemoryStore:
         return f"{save_id or 'nosave'}|{game_id or 'nogame'}|{persona or 'default'}"
 
     def chat_npc_key(self, save_id: str, game_id: str, name: str, blackboard_token: str = "") -> str:
-        """The conversation memory key. When the NPC carries a durable Blackboard token (now proven to survive
-        save/reload), key the conversation by `bb:<token>` so each unique NPC gets ISOLATED, persistent memory
-        (two same-name crew no longer share a key). Falls back to the name-based key for unbound NPCs — so all
-        existing/non-chat flows are unchanged."""
-        tok = str(blackboard_token or "").strip()
-        return self.make_key(save_id, game_id, ("bb:" + tok) if tok else (name or ""))
+        """The conversation memory CARD key — ONE card per (save, name). The Blackboard token is the durable
+        IDENTITY (stamped on the card via bind_blackboard_identity, survives reload) — it is NOT the card key.
+        Keying cards by token duplicated NPCs (one real NPC → two cards, history stranded), so card-keying is
+        name-based; same-name SPLIT is deferred until a genuine collision is actually observed. `blackboard_token`
+        is accepted for call-site compatibility but no longer changes the card key."""
+        return self.make_key(save_id, game_id, name or "")
 
     # X4 crew skills (0..15 internal = 0..5 stars). morale is universal.
     X4_SKILLS = ("piloting", "management", "engineering", "boarding", "morale")
@@ -873,7 +873,8 @@ class MemoryStore:
                     sector = COALESCE(NULLIF(excluded.sector,''), npcs.sector),
                     skills = COALESCE(excluded.skills, npcs.skills),
                     stats = COALESCE(excluded.stats, npcs.stats),
-                    last_active = excluded.last_active
+                    last_active = excluded.last_active,
+                    is_alive = 1
             """, (npc_key, save_id, game_id, name, faction_id,
                   race, role, ship_class, gender, ship_name, sector,
                   skills_json, stats_json, now, now))
@@ -974,6 +975,31 @@ class MemoryStore:
             conn.execute("DELETE FROM npcs WHERE npc_key = ?", (npc_key,))
             conn.commit()
         return {"ok": True, "deleted_npc": npc_key, "turns_purged": turns, "facts_purged": facts}
+
+    def sweep_deceased_npcs(self, save_id: str = "", stale_seconds: float = 3600.0) -> dict:
+        """War-scale death handling WITHOUT chasing individual deaths. The census re-reads ground truth every
+        cycle and refreshes `last_active`; an NPC not re-seen for > stale_seconds means its ship/station is gone
+        (destroyed/despawned). KNOWN NPCs (have conversation turns) → mark deceased (`is_alive=0`, memory kept so
+        "they died" is part of the story); generic roster-only NPCs (no turns) → prune (delete) to keep the DB
+        lean during long wars. Chat-scope only (`game_id='chat'`); one bounded sweep, so a 300-ship battle never
+        floods us. stale_seconds MUST exceed a full census cycle (tune in-game); defaults conservative."""
+        cutoff = time.time() - max(60.0, float(stale_seconds or 3600.0))
+        marked, pruned = 0, 0
+        with self._lock, self._connect() as conn:
+            params: list = [cutoff]
+            sql = "SELECT npc_key FROM npcs WHERE game_id='chat' AND is_alive=1 AND last_active < ?"
+            if save_id:
+                sql += " AND save_id = ?"; params.append(save_id)
+            for r in conn.execute(sql, tuple(params)).fetchall():
+                k = r["npc_key"]
+                turns = conn.execute("SELECT COUNT(*) AS c FROM turns WHERE npc_key = ?", (k,)).fetchone()["c"]
+                if turns > 0:
+                    conn.execute("UPDATE npcs SET is_alive = 0 WHERE npc_key = ?", (k,)); marked += 1
+                else:
+                    conn.execute("DELETE FROM facts WHERE npc_key = ?", (k,))
+                    conn.execute("DELETE FROM npcs WHERE npc_key = ?", (k,)); pruned += 1
+            conn.commit()
+        return {"ok": True, "marked_deceased": marked, "pruned": pruned, "cutoff": cutoff}
 
     # --- EPIC I (I0): Persistent NPC identity layer ---------------------------
     # persistent_npc_key is HANDLE-INDEPENDENT: derived ONLY from stable evidence (name, faction,
@@ -1587,36 +1613,84 @@ class MemoryStore:
                 "survived_runtime_id_change": survived_id_change, "duplicate_separation_ok": dup_ok,
                 "person_after_reload": person_ok, "target_matrix": matrix, "rows": len(rows)}
 
+    def merge_npc_cards(self, src_key: str, dst_key: str) -> dict:
+        """Fold one NPC card into another: move all turns + facts from src → dst, then remove the src card.
+        Used to heal a DUPLICATE (e.g. an empty token-keyed card created alongside the real name-keyed card by
+        the old duplicating bind). dst keeps its own profile/identity; src's memory is repointed, not purged."""
+        src_key = str(src_key or ""); dst_key = str(dst_key or "")
+        if not src_key or not dst_key or src_key == dst_key:
+            return {"ok": False, "reason": "need distinct src+dst"}
+        with self._lock, self._connect() as conn:
+            if not conn.execute("SELECT 1 FROM npcs WHERE npc_key=?", (src_key,)).fetchone():
+                return {"ok": False, "reason": "src not found"}
+            t = conn.execute("UPDATE turns SET npc_key=? WHERE npc_key=?", (dst_key, src_key)).rowcount or 0
+            f = conn.execute("UPDATE facts SET npc_key=? WHERE npc_key=?", (dst_key, src_key)).rowcount or 0
+            conn.execute("DELETE FROM npcs WHERE npc_key=?", (src_key,))
+            conn.commit()
+        return {"ok": True, "moved_turns": t, "moved_facts": f, "src": src_key, "dst": dst_key}
+
     def bind_blackboard_identity(self, save_id: str, name: str, faction: str = "", role: str = "",
                                 blackboard_key: str = "", runtime_id: str = "") -> dict:
-        """Make the NPC's durable Blackboard token the PRIMARY identity key (proven to survive save/reload). Links
-        the chat npc_key to an identity keyed `bb:<token>`, status=bound, confidence 1.0 — bypassing evidence
-        derivation (which stays the Tier-3 fallback for NPCs without a token / despawned). This is what flips the
-        NPC from (unbound) to bound. Never throws."""
+        """Stamp the NPC's durable Blackboard token as the bound identity on the CANONICAL name card — ONE card
+        per (save, name). The token (proven to survive save/reload) becomes the identity `bb:<token>`
+        (status=bound, confidence 1.0) and SUPERSEDES a synthetic `pid:` identity (the Tier-3 fallback). Does NOT
+        create a separate token-keyed card (that was the duplication bug); if a stray one already exists, its
+        memory is merged back into the name card. Never throws."""
         try:
             name = str(name or "").strip()
             token = str(blackboard_key or "").strip()
             if not (save_id and name and token):
                 return {"ok": False, "reason": "need save_id+name+blackboard_key"}
             pkey = "bb:" + token
-            token_key = self.chat_npc_key(save_id, "chat", name, token)   # PRIMARY conversation key (per-NPC)
-            self.bind_npc(token_key, "", save_id=save_id, game_id="chat", name=name, faction_id=faction,
-                          stats=({"role": role} if role else None))
+            name_key = self.make_key(save_id, "chat", name)       # CANONICAL card — one per NPC
+            token_key = self.make_key(save_id, "chat", "bb:" + token)
+            # Ensure the canonical card exists WITHOUT clobbering its history.
+            if not self.get_npc(name_key):
+                self.bind_npc(name_key, "", save_id=save_id, game_id="chat", name=name, faction_id=faction,
+                              stats=({"role": role} if role else None))
+            # Heal any prior duplicate: a separate token-keyed card → fold its memory into the name card, drop it.
+            if token_key != name_key and self.get_npc(token_key):
+                self.merge_npc_cards(token_key, name_key)
+            # Register/bind the identity and stamp it on the canonical card. The Blackboard token is the proven
+            # Tier-1 key and UPGRADES a synthetic pid: identity. Only a DIFFERENT bb: token is left untouched
+            # (that would be a genuine same-name collision — don't steal it).
             self.upsert_identity(pkey, {"display_name": name, "faction": faction, "role": role})
             self.set_identity_fields(pkey, status="bound", identity_confidence=1.0)
-            self.link_npc_to_identity(token_key, pkey)
-            # Continuity: union LEGACY name-keyed memory into this identity, UNLESS that name-key is already
-            # claimed by a DIFFERENT identity (duplicate-safety — never steal another same-name NPC's history).
-            name_key = self.make_key(save_id, "chat", name)
-            if name_key != token_key:
-                prev = (self.get_npc(name_key) or {}).get("persistent_key")
-                if (not prev) or prev == pkey:
-                    self.link_npc_to_identity(name_key, pkey)
+            prev = str((self.get_npc(name_key) or {}).get("persistent_key") or "")
+            if (not prev) or prev == pkey or prev.startswith("pid:"):
+                self.link_npc_to_identity(name_key, pkey)
             if runtime_id:
                 self.record_evidence(pkey, "blackboard_runtime", str(runtime_id), weight=1.0)
-            return {"ok": True, "npc_key": token_key, "persistent_npc_key": pkey, "status": "bound"}
+            return {"ok": True, "npc_key": name_key, "persistent_npc_key": pkey, "status": "bound"}
         except Exception as e:
             return {"ok": False, "reason": str(e)[:120]}
+
+    def repair_blackboard_duplicates(self) -> dict:
+        """One-shot heal for cards split by the OLD duplicating bind: fold every `bb:<token>`-keyed chat card into
+        its sibling name card (same save), then re-stamp the name card with the bb identity (superseding pid:).
+        Idempotent — after it runs there are no `…|chat|bb:…` cards left to fold."""
+        healed: list[dict] = []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT npc_key, save_id, name, persistent_key FROM npcs "
+                "WHERE game_id='chat' AND npc_key LIKE '%|chat|bb:%'").fetchall()
+        for r in rows:
+            tok_key = r["npc_key"]; save_id = str(r["save_id"] or ""); name = str(r["name"] or "").strip()
+            pkey = str(r["persistent_key"] or "")
+            if not (save_id and name):
+                continue
+            name_key = self.make_key(save_id, "chat", name)
+            if name_key == tok_key:
+                continue
+            if not self.get_npc(name_key):
+                self.bind_npc(name_key, "", save_id=save_id, game_id="chat", name=name)
+            self.merge_npc_cards(tok_key, name_key)
+            if pkey.startswith("bb:"):
+                cur = str((self.get_npc(name_key) or {}).get("persistent_key") or "")
+                if (not cur) or cur.startswith("pid:") or cur == pkey:
+                    self.link_npc_to_identity(name_key, pkey)
+            healed.append({"folded": tok_key, "into": name_key})
+        return {"ok": True, "healed": healed, "count": len(healed)}
 
     # --- Turns (Stage A) ------------------------------------------------------
 
@@ -2338,7 +2412,7 @@ class MemoryStore:
         with self._connect() as conn:
             rows = conn.execute("""
                 SELECT n.npc_key, n.npc_id, n.name, n.faction_id, n.save_id, n.game_id,
-                       n.race, n.role, n.ship_class, n.skills, n.persistent_key,
+                       n.race, n.role, n.ship_class, n.skills, n.persistent_key, n.is_alive,
                        n.summary, n.created_at, n.last_active,
                        (SELECT COUNT(*) FROM turns t WHERE t.npc_key = n.npc_key) AS turns,
                        (SELECT COUNT(*) FROM facts f WHERE f.npc_key = n.npc_key) AS facts,
@@ -5153,6 +5227,21 @@ def run_blackboard_probe_selftest() -> dict:
         vr = store.blackboard_verdict("rej")
         check("reject_is_synthetic", vr["verdict"] == "SYNTHETIC", str(vr))
         check("reject_legacy", vr["legacy_verdict"] == "REJECT")
+
+        # PHASE 6 (duplicate-collision): two same-name crew with DISTINCT tokens → dup_ok TRUE (the in-game proof
+        # the collector now emits). Same token for two DIFFERENT NPCs (a hypothetical mint collision) → dup_ok FALSE.
+        for r in [
+            {"save_id": "dupok", "phase": "duplicate", "runtime_component_id": "11", "npc_name": "Manda", "blackboard_value": "aic_11_1"},
+            {"save_id": "dupok", "phase": "duplicate", "runtime_component_id": "12", "npc_name": "Manda", "blackboard_value": "aic_12_2"},
+        ]:
+            store.record_blackboard_probe(r)
+        check("dup_distinct_tokens_ok", store.blackboard_verdict("dupok")["duplicate_separation_ok"] is True)
+        for r in [
+            {"save_id": "dupbad", "phase": "duplicate", "runtime_component_id": "21", "npc_name": "Manda", "blackboard_value": "SHARED"},
+            {"save_id": "dupbad", "phase": "duplicate", "runtime_component_id": "22", "npc_name": "Manda", "blackboard_value": "SHARED"},
+        ]:
+            store.record_blackboard_probe(r)
+        check("dup_collision_detected", store.blackboard_verdict("dupbad")["duplicate_separation_ok"] is False)
     finally:
         shutil.rmtree(d, ignore_errors=True)
     return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
@@ -5173,23 +5262,78 @@ def run_blackboard_bind_selftest() -> dict:
     d = tempfile.mkdtemp(prefix="nl_bbbind_selftest_")
     try:
         store = MemoryStore(Path(d) / "bind.sqlite3")
-        check("chat_key_uses_token", store.chat_npc_key("s", "chat", "Manda", "tok") == "s|chat|bb:tok")
-        check("chat_key_fallback_name", store.chat_npc_key("s", "chat", "Manda", "") == "s|chat|Manda")
+        name_key = store.make_key("s", "chat", "Manda Smitt")
+        # 1. card key is ALWAYS name-based (token no longer keys cards — that caused duplication).
+        check("card_key_name_based", store.chat_npc_key("s", "chat", "Manda", "tok") == "s|chat|Manda")
+        # 2. existing name card with history + a synthetic pid: identity → bind ADOPTS the name card (no new card)
+        #    and UPGRADES it to the proven bb token.
+        store.bind_npc(name_key, "", save_id="s", game_id="chat", name="Manda Smitt", faction_id="argon")
+        store.link_npc_to_identity(name_key, "pid:deadbeef0000")   # simulate prior synthetic identity
+        store.record_turn(name_key, "user", "hello")
+        store.record_turn(name_key, "assistant", "hi")
         r = store.bind_blackboard_identity("s", "Manda Smitt", "argon", "service crew", "aic_100_111", "100")
         check("bind_ok", bool(r.get("ok")) and r.get("persistent_npc_key") == "bb:aic_100_111", str(r))
-        token_key = store.chat_npc_key("s", "chat", "Manda Smitt", "aic_100_111")
-        check("result_keyed_by_token", r.get("npc_key") == token_key, str(r.get("npc_key")))
-        npc = store.get_npc(token_key) or {}
-        check("token_key_linked", npc.get("persistent_key") == "bb:aic_100_111", str(npc.get("persistent_key")))
+        check("result_keyed_by_name", r.get("npc_key") == name_key, str(r.get("npc_key")))
+        check("no_separate_token_card", store.get_npc(store.make_key("s", "chat", "bb:aic_100_111")) is None)
+        npc = store.get_npc(name_key) or {}
+        check("name_card_upgraded_to_token", npc.get("persistent_key") == "bb:aic_100_111", str(npc.get("persistent_key")))
+        check("history_preserved", store.turn_count(name_key) == 2, "turns kept on the one card")
         ident = store.get_identity("bb:aic_100_111") or {}
         check("identity_bound", str(ident.get("status")) == "bound" and float(ident.get("identity_confidence") or 0) >= 1.0, str(ident))
+        # 3. rebind idempotent — still one card, same identity.
         r2 = store.bind_blackboard_identity("s", "Manda Smitt", "argon", "service crew", "aic_100_111")
-        check("rebind_idempotent", r2.get("persistent_npc_key") == "bb:aic_100_111")
+        check("rebind_idempotent", r2.get("npc_key") == name_key and r2.get("persistent_npc_key") == "bb:aic_100_111")
+        # 4. heal: a STRAY token card (from the old bug) gets folded back into the name card on next bind.
+        stray = store.make_key("s", "chat", "bb:aic_100_111")
+        store.bind_npc(stray, "", save_id="s", game_id="chat", name="Manda Smitt")
+        store.record_turn(stray, "user", "stranded turn")
+        store.bind_blackboard_identity("s", "Manda Smitt", "argon", "service crew", "aic_100_111")
+        check("stray_card_folded", store.get_npc(stray) is None)
+        check("stray_history_merged", store.turn_count(name_key) == 3, "stranded turn moved onto name card")
+        # 5. distinct NPC → distinct identity, still one card each.
         r3 = store.bind_blackboard_identity("s2", "Other Guy", "teladi", "pilot", "aic_900_999")
-        check("distinct_token_distinct_identity",
+        check("distinct_identity",
               r3.get("persistent_npc_key") == "bb:aic_900_999"
               and str((store.get_identity("bb:aic_900_999") or {}).get("status")) == "bound")
         check("guard_missing", store.bind_blackboard_identity("", "", "", "", "").get("ok") is False)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_deceased_sweep_selftest() -> dict:
+    """Oracle for the deceased staleness sweep: a stale KNOWN npc (has turns) is MARKED deceased (kept); a stale
+    GENERIC npc (no turns) is PRUNED; a FRESH npc is untouched + alive; re-index RESURRECTS (false-positive fix)."""
+    import shutil
+    import tempfile
+    import time as _t
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_sweep_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "sweep.sqlite3")
+        sid = "s"
+        store.index_npc(npc_key="s|chat|Fresh", save_id=sid, game_id="chat", name="Fresh", faction_id="argon")
+        store.index_npc(npc_key="s|chat|Known", save_id=sid, game_id="chat", name="Known", faction_id="argon")
+        store.record_turn("s|chat|Known", "user", "hi")
+        store.index_npc(npc_key="s|chat|Generic", save_id=sid, game_id="chat", name="Generic", faction_id="argon")
+        with store._connect() as conn:        # backdate the two "stale" rows past the cutoff
+            conn.execute("UPDATE npcs SET last_active = ? WHERE npc_key IN ('s|chat|Known','s|chat|Generic')",
+                         (_t.time() - 99999,))
+            conn.commit()
+        res = store.sweep_deceased_npcs(sid, stale_seconds=3600)
+        check("marked_one", res["marked_deceased"] == 1, str(res))
+        check("pruned_one", res["pruned"] == 1, str(res))
+        check("known_kept_deceased", (store.get_npc("s|chat|Known") or {}).get("is_alive") == 0)
+        check("known_memory_kept", store.turn_count("s|chat|Known") == 1)
+        check("generic_pruned", store.get_npc("s|chat|Generic") is None)
+        check("fresh_untouched_alive", (store.get_npc("s|chat|Fresh") or {}).get("is_alive") == 1)
+        store.index_npc(npc_key="s|chat|Known", save_id=sid, game_id="chat", name="Known", faction_id="argon")
+        check("reindex_resurrects", (store.get_npc("s|chat|Known") or {}).get("is_alive") == 1)
     finally:
         shutil.rmtree(d, ignore_errors=True)
     return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
