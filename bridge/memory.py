@@ -26,6 +26,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -482,6 +483,201 @@ class MemoryStore:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_world_events_save ON world_events(save_id, importance, created_at)")
+            # ---- OPORD: persistent military operations command layer (spec: OPORD_Update) -------
+            # Turns raw strategic pressure into ONE durable operation per threat (dedupe), with COAs,
+            # tasks, and reports. The partial-unique index is the anti-spam guarantee: at most one
+            # active operation per (save, faction, threat_key). Deterministic engine owns lifecycle;
+            # the LLM only writes prose. (Phase 1 = schema + CRUD; later phases add threat→COA→OPORD.)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS military_operations (
+                    id TEXT PRIMARY KEY,
+                    save_id TEXT NOT NULL,
+                    faction_id TEXT NOT NULL,
+                    operation_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    threat_key TEXT NOT NULL,
+                    threat_id TEXT,
+                    target_faction TEXT,
+                    target_sector TEXT,
+                    target_object TEXT,
+                    mission_statement TEXT,
+                    commander_intent TEXT,
+                    desired_end_state TEXT,
+                    warning_order_json TEXT,
+                    mission_analysis_json TEXT,
+                    selected_coa_id TEXT,
+                    opord_json TEXT,
+                    annexes_json TEXT,
+                    doctrine_json TEXT,
+                    constraints_json TEXT,
+                    ccir_json TEXT,
+                    budget_reserved INTEGER DEFAULT 0,
+                    budget_spent INTEGER DEFAULT 0,
+                    priority INTEGER DEFAULT 0,
+                    urgency INTEGER DEFAULT 0,
+                    importance INTEGER DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    issued_at REAL,
+                    activated_at REAL,
+                    concluded_at REAL,
+                    conclusion_status TEXT,
+                    conclusion_summary TEXT,
+                    evidence_json TEXT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ops_save_status ON military_operations(save_id, status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ops_faction_status ON military_operations(save_id, faction_id, status)")
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_active_threat
+                ON military_operations(save_id, faction_id, threat_key)
+                WHERE status NOT IN ('completed', 'failed', 'aborted', 'transitioned')
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS operation_coas (
+                    id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL,
+                    coa_type TEXT NOT NULL,
+                    concept TEXT NOT NULL,
+                    viability_status TEXT NOT NULL,
+                    rejection_reason TEXT,
+                    tasks_json TEXT NOT NULL,
+                    required_assets_json TEXT,
+                    required_budget INTEGER DEFAULT 0,
+                    expected_duration REAL,
+                    wargame_json TEXT,
+                    score_json TEXT,
+                    weighted_score REAL DEFAULT 0,
+                    selected INTEGER DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY(operation_id) REFERENCES military_operations(id)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_coas_op ON operation_coas(operation_id)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS operation_tasks (
+                    id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL,
+                    coa_id TEXT,
+                    task_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    priority INTEGER DEFAULT 0,
+                    assigned_actor_type TEXT,
+                    assigned_actor_id TEXT,
+                    owning_faction TEXT,
+                    target_faction TEXT,
+                    target_sector TEXT,
+                    target_object TEXT,
+                    job_id TEXT,
+                    agreement_id TEXT,
+                    order_id TEXT,
+                    success_criteria_json TEXT,
+                    failure_criteria_json TEXT,
+                    evidence_json TEXT,
+                    created_at REAL NOT NULL,
+                    issued_at REAL,
+                    activated_at REAL,
+                    completed_at REAL,
+                    failed_at REAL,
+                    FOREIGN KEY(operation_id) REFERENCES military_operations(id)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_optasks_op ON operation_tasks(operation_id, status)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS operation_reports (
+                    id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL,
+                    report_type TEXT NOT NULL,
+                    severity INTEGER DEFAULT 0,
+                    summary TEXT NOT NULL,
+                    evidence_json TEXT,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY(operation_id) REFERENCES military_operations(id)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_opreports_op ON operation_reports(operation_id, created_at)")
+            # ---- OPORD Phase 6: job market (external fulfillment routing) ----------------------------
+            # When a faction can't fulfill an OPORD task internally, the requirement becomes a job-market
+            # listing (patrol/escort/supply/privateer/recon/defence). The partial-unique open-job index is the
+            # anti-spam guarantee: ONE open job per job_key — repeated pressure updates urgency/reward, never reposts.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS market_jobs (
+                    id TEXT PRIMARY KEY,
+                    save_id TEXT NOT NULL,
+                    issuing_faction TEXT NOT NULL,
+                    job_type TEXT NOT NULL,
+                    job_key TEXT NOT NULL,
+                    target_sector TEXT,
+                    target_faction TEXT,
+                    ware TEXT,
+                    reward INTEGER DEFAULT 0,
+                    urgency INTEGER DEFAULT 0,
+                    visibility TEXT DEFAULT 'public',
+                    status TEXT NOT NULL,
+                    operation_id TEXT,
+                    operation_task_id TEXT,
+                    evidence_json TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_save_status ON market_jobs(save_id, status)")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_open_key "
+                         "ON market_jobs(save_id, job_key) WHERE status='open'")
+            # ---- OPORD Execution Authority: real-ship leases + force-quota requests ------------------
+            # A military task is only EXECUTED when a real faction ship is leased + ordered. The lease table
+            # prevents two OPORDs stealing the same ship, tracks whether vanilla AI overwrote the order, and gives
+            # SITREP/FRAGO real evidence. opord_force_requests = the durable demand when no ship is available.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS opord_asset_leases (
+                    lease_id TEXT PRIMARY KEY,
+                    save_id TEXT NOT NULL,
+                    operation_id TEXT NOT NULL,
+                    task_id TEXT,
+                    faction TEXT,
+                    ship_runtime_id TEXT,
+                    ship_name TEXT,
+                    ship_macro TEXT,
+                    ship_class TEXT,
+                    sector TEXT,
+                    original_order_summary TEXT,
+                    assigned_order_id TEXT,
+                    order_kind TEXT,
+                    priority INTEGER DEFAULT 0,
+                    status TEXT NOT NULL,
+                    issued_at REAL,
+                    last_seen_at REAL,
+                    released_at REAL,
+                    failure_reason TEXT,
+                    created_at REAL NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_leases_op ON opord_asset_leases(save_id, operation_id, status)")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_leases_active_ship "
+                         "ON opord_asset_leases(save_id, ship_runtime_id) "
+                         "WHERE status NOT IN ('completed','failed','released','lost')")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS opord_force_requests (
+                    request_id TEXT PRIMARY KEY,
+                    save_id TEXT NOT NULL,
+                    operation_id TEXT,
+                    task_id TEXT,
+                    faction TEXT,
+                    sector TEXT,
+                    ship_role TEXT,
+                    ship_size TEXT,
+                    quantity INTEGER DEFAULT 1,
+                    priority INTEGER DEFAULT 0,
+                    reward_budget INTEGER DEFAULT 0,
+                    req_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    last_escalated_at REAL,
+                    expires_at REAL
+                )
+            """)
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_forcereq_open_key "
+                         "ON opord_force_requests(save_id, req_key) WHERE status='open'")
             # Live chat transcript: one row per player↔NPC turn (prompt + reply), so the
             # dashboard can show the actual conversation, not just request metadata.
             conn.execute("""
@@ -3239,6 +3435,962 @@ class MemoryStore:
             conn.commit()
         return {"ok": True, "id": agreement_id, "status": status}
 
+    # --- OPORD: military operations command layer (Phase 1 CRUD) -----------------------------------
+    # One durable operation per (save, faction, threat_key). create_or_get DEDUPES on the active threat
+    # (the partial-unique index is the hard guarantee); concluded ops are excluded so a recurring threat
+    # later spawns a fresh operation. JSON columns accept dict/list (auto-encoded).
+    OP_CONCLUDED_STATUSES = ("completed", "failed", "aborted", "transitioned")
+    OPORD_JOB_REWARDS = {"patrol": 80000, "privateer": 60000, "supply": 100000, "escort": 70000,
+                         "recon": 40000, "station_defense": 90000, "task": 50000}
+    OPORD_MIN_ACTIVE_S = 300.0       # min active time before "pressure abated → complete" can fire
+    OPORD_MAX_ACTIVE_S = 3600.0      # past this, a still-contested op FAILS instead of hanging forever
+    OPORD_JOB_UNCLAIMED_S = 600.0    # an open linked job older than this → FRAGO: increase reward
+    OPORD_REINFORCE_MAG = 1.0        # new hostile magnitude in-sector since activation → FRAGO: reinforcement
+    _OP_WRITABLE = {
+        "threat_id", "target_faction", "target_sector", "target_object", "mission_statement",
+        "commander_intent", "desired_end_state", "warning_order_json", "mission_analysis_json",
+        "selected_coa_id", "opord_json", "annexes_json", "doctrine_json", "constraints_json",
+        "ccir_json", "budget_reserved", "budget_spent", "priority", "urgency", "importance",
+        "evidence_json", "issued_at", "activated_at",
+    }
+    _OP_JSON_COLS = {"warning_order_json", "mission_analysis_json", "opord_json", "annexes_json",
+                     "doctrine_json", "constraints_json", "ccir_json", "evidence_json",
+                     "tasks_json", "required_assets_json", "wargame_json", "score_json",
+                     "success_criteria_json", "failure_criteria_json"}
+
+    @staticmethod
+    def _enc(col: str, val: Any) -> Any:
+        """Auto-encode JSON columns; pass scalars through."""
+        if val is None:
+            return None
+        if col in MemoryStore._OP_JSON_COLS or isinstance(val, (dict, list)):
+            return json.dumps(val) if not isinstance(val, str) else val
+        return val
+
+    @staticmethod
+    def _decode_op_row(row: dict) -> dict:
+        row = dict(row)
+        for k in list(row.keys()):
+            if k.endswith("_json") and row.get(k):
+                try:
+                    row[k] = json.loads(row[k])
+                except Exception:
+                    pass
+        return row
+
+    def create_or_get_operation(self, save_id: str, faction_id: str, operation_type: str,
+                                threat_key: str, status: str = "warning", **fields) -> dict:
+        """Create a new operation OR return the existing ACTIVE one for this threat (anti-spam dedupe)."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id, status FROM military_operations WHERE save_id=? AND faction_id=? AND threat_key=? "
+                "AND status NOT IN ('completed','failed','aborted','transitioned') "
+                "ORDER BY created_at DESC LIMIT 1", (save_id, faction_id, threat_key)).fetchone()
+            if existing:
+                conn.execute("UPDATE military_operations SET updated_at=? WHERE id=?", (now, existing["id"]))
+                conn.commit()
+                return {"ok": True, "id": existing["id"], "created": False, "status": existing["status"]}
+            op_id = "op_" + (faction_id or "x") + "_" + uuid.uuid4().hex[:10]
+            cols = ["id", "save_id", "faction_id", "operation_type", "status", "threat_key",
+                    "created_at", "updated_at"]
+            vals: list = [op_id, save_id, faction_id, operation_type, status, threat_key, now, now]
+            for k, v in fields.items():
+                if k in self._OP_WRITABLE:
+                    cols.append(k); vals.append(self._enc(k, v))
+            conn.execute(f"INSERT INTO military_operations ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", vals)
+            conn.commit()
+        return {"ok": True, "id": op_id, "created": True, "status": status}
+
+    def update_operation(self, op_id: str, status: Optional[str] = None, **fields) -> dict:
+        sets, vals = ["updated_at=?"], [time.time()]
+        if status:
+            sets.append("status=?"); vals.append(status)
+        for k, v in fields.items():
+            if k in self._OP_WRITABLE:
+                sets.append(f"{k}=?"); vals.append(self._enc(k, v))
+        vals.append(op_id)
+        with self._lock, self._connect() as conn:
+            conn.execute(f"UPDATE military_operations SET {','.join(sets)} WHERE id=?", vals)
+            conn.commit()
+        return {"ok": True, "id": op_id}
+
+    def get_operation(self, op_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM military_operations WHERE id=?", (op_id,)).fetchone()
+        return self._decode_op_row(row) if row else None
+
+    def list_operations(self, save_id: str, status: Optional[str] = None) -> list[dict]:
+        sel = ("SELECT *, (SELECT COUNT(*) FROM operation_tasks t WHERE t.operation_id=military_operations.id) "
+               "AS task_count FROM military_operations WHERE save_id=?")
+        with self._connect() as conn:
+            if status:
+                rows = conn.execute(sel + " AND status=? ORDER BY updated_at DESC", (save_id, status)).fetchall()
+            else:
+                rows = conn.execute(sel + " ORDER BY updated_at DESC", (save_id,)).fetchall()
+        return [self._decode_op_row(r) for r in rows]
+
+    def attach_coa(self, op_id: str, coa_type: str, concept: str, tasks: Any,
+                   viability_status: str = "candidate", required_budget: int = 0,
+                   expected_duration: Optional[float] = None, **fields) -> str:
+        coa_id = "coa_" + uuid.uuid4().hex[:10]
+        cols = ["id", "operation_id", "coa_type", "concept", "viability_status", "tasks_json",
+                "required_budget", "expected_duration", "created_at"]
+        vals: list = [coa_id, op_id, coa_type, concept, viability_status, self._enc("tasks_json", tasks),
+                      int(required_budget or 0), expected_duration, time.time()]
+        for k, v in fields.items():
+            if k in {"rejection_reason", "required_assets_json", "wargame_json", "score_json",
+                     "weighted_score", "selected"}:
+                cols.append(k); vals.append(self._enc(k, v))
+        with self._lock, self._connect() as conn:
+            conn.execute(f"INSERT INTO operation_coas ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", vals)
+            conn.commit()
+        return coa_id
+
+    def attach_task(self, op_id: str, task_type: str, status: str = "planned",
+                    coa_id: Optional[str] = None, **fields) -> str:
+        task_id = "task_" + uuid.uuid4().hex[:10]
+        cols = ["id", "operation_id", "coa_id", "task_type", "status", "created_at"]
+        vals: list = [task_id, op_id, coa_id, task_type, status, time.time()]
+        for k, v in fields.items():
+            if k in {"priority", "assigned_actor_type", "assigned_actor_id", "owning_faction",
+                     "target_faction", "target_sector", "target_object", "job_id", "agreement_id",
+                     "order_id", "success_criteria_json", "failure_criteria_json", "evidence_json"}:
+                cols.append(k); vals.append(self._enc(k, v))
+        with self._lock, self._connect() as conn:
+            conn.execute(f"INSERT INTO operation_tasks ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", vals)
+            conn.commit()
+        return task_id
+
+    def attach_report(self, op_id: str, report_type: str, summary: str, severity: int = 0,
+                      evidence: Any = None) -> str:
+        rpt_id = "rpt_" + uuid.uuid4().hex[:10]
+        with self._lock, self._connect() as conn:
+            conn.execute("INSERT INTO operation_reports (id, operation_id, report_type, severity, summary, "
+                         "evidence_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (rpt_id, op_id, report_type, int(severity or 0), summary,
+                          self._enc("evidence_json", evidence), time.time()))
+            conn.commit()
+        return rpt_id
+
+    def conclude_operation(self, op_id: str, conclusion_status: str, conclusion_summary: str = "") -> dict:
+        """Close an operation AND clean up its side effects (the anti-stale guarantee): release unused reserved
+        budget (reserved→spent), CANCEL linked open jobs, EXPIRE linked pending agreements. conclusion_status is
+        the terminal lifecycle status (completed/failed/aborted/transitioned) — recorded so the active-threat dedupe
+        index frees the threat_key. Idempotent: re-conclusion finds nothing open to clean."""
+        status = conclusion_status if conclusion_status in self.OP_CONCLUDED_STATUSES else "completed"
+        now = time.time()
+        op = self.get_operation(op_id) or {}
+        reserved = int(op.get("budget_reserved") or 0)
+        spent = int(op.get("budget_spent") or 0)
+        released = max(0, reserved - spent)
+        with self._lock, self._connect() as conn:
+            cancelled = conn.execute("UPDATE market_jobs SET status='cancelled', updated_at=? "
+                                     "WHERE operation_id=? AND status='open'", (now, op_id)).rowcount or 0
+            conn.execute("UPDATE military_operations SET status=?, concluded_at=?, updated_at=?, "
+                         "conclusion_status=?, conclusion_summary=?, budget_reserved=? WHERE id=?",
+                         (status, now, now, status, conclusion_summary, spent, op_id))
+            conn.commit()
+        expired = 0
+        for ag in self.list_agreements(op.get("save_id") or "", "pending"):
+            terms = ag.get("terms") if isinstance(ag.get("terms"), dict) else {}
+            if terms.get("operation_id") == op_id:
+                self.set_agreement_status(op.get("save_id") or "", ag["id"], "expired")
+                expired += 1
+        leases_released = self.release_operation_leases(op.get("save_id") or "", op_id)
+        reqs_cancelled = self.cancel_operation_force_requests(op.get("save_id") or "", op_id)
+        return {"ok": True, "id": op_id, "status": status, "budget_released": released,
+                "jobs_cancelled": cancelled, "agreements_expired": expired,
+                "leases_released": leases_released, "force_requests_cancelled": reqs_cancelled}
+
+    def operation_detail(self, op_id: str) -> Optional[dict]:
+        """Full operation + its COAs, tasks, reports — for the dashboard drill-down and selftests."""
+        op = self.get_operation(op_id)
+        if not op:
+            return None
+        with self._connect() as conn:
+            op["coas"] = [self._decode_op_row(r) for r in conn.execute(
+                "SELECT * FROM operation_coas WHERE operation_id=? ORDER BY created_at", (op_id,)).fetchall()]
+            op["tasks"] = [self._decode_op_row(r) for r in conn.execute(
+                "SELECT * FROM operation_tasks WHERE operation_id=? ORDER BY created_at", (op_id,)).fetchall()]
+            op["reports"] = [self._decode_op_row(r) for r in conn.execute(
+                "SELECT * FROM operation_reports WHERE operation_id=? ORDER BY created_at", (op_id,)).fetchall()]
+        return op
+
+    # --- OPORD Phase 8: milestone world-events (routed through the gate → news/NPC memory, anti-spam) -----
+    def _get_opord_gate(self):
+        g = getattr(self, "_opord_gate", None)
+        if g is None:
+            try:
+                from .gates import EventGate
+            except ImportError:
+                from gates import EventGate
+            g = EventGate()
+            self._opord_gate = g
+        return g
+
+    def emit_operation_event(self, op: dict, milestone: str, importance: int, summary: str) -> dict:
+        """Emit an OPORD milestone as a world_event — but ONLY through the gate (tier/cooldown/dedup), so a
+        persistent FRAGO condition can't spam the feed every assess tick. Fired events land in `world_events`
+        (the dashboard's durable history) AND propagate to NPCs via `build_situation_briefing`. Linked to the
+        operation via source='opord:<id>'. Deterministic summary; an LLM news wrapper is optional/later."""
+        gate = self._get_opord_gate()
+        res = gate.evaluate(op["save_id"], {"event_type": milestone, "faction": op.get("faction_id"),
+                                            "target": op.get("target_faction"), "importance": int(importance),
+                                            "state_changed": True, "authorized": True,
+                                            "player_relevant": int(importance) >= 4})
+        if res.get("fire"):
+            self.add_world_event(op["save_id"], milestone, summary, primary_faction=op.get("faction_id") or "",
+                                 secondary_faction=op.get("target_faction") or "",
+                                 sector_id=op.get("target_sector") or "", importance=int(importance),
+                                 source="opord:" + op["id"])
+            return {"emitted": True, "tier": res.get("tier")}
+        return {"emitted": False, "reason": res.get("reason")}
+
+    def list_operation_events(self, op_id: str) -> list[dict]:
+        """World events linked to an operation (for the dashboard drill-down)."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM world_events WHERE source=? ORDER BY created_at DESC",
+                                ("opord:" + op_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- OPORD Phase 9: operational health warnings (the dashboard's audit layer) -------------------
+    def operations_health(self, save_id: str) -> dict:
+        """Per-operation health checks for the dashboard audit panel — surface stuck/leaky/incoherent ops.
+        Each is derived from REAL state (status, tasks, linked jobs/agreements, reports), so the panel makes the
+        whole threat→conclusion chain auditable and catches regressions (e.g. a concluded op that still has open
+        jobs = a cleanup leak)."""
+        now = time.time()
+        pending_ag_by_op: dict = {}
+        for a in self.list_agreements(save_id, "pending"):
+            terms = a.get("terms") if isinstance(a.get("terms"), dict) else {}
+            opref = terms.get("operation_id")
+            if opref:
+                pending_ag_by_op.setdefault(opref, 0)
+                pending_ag_by_op[opref] += 1
+        out = []
+        for op in self.list_operations(save_id):
+            op_id, status = op["id"], op["status"]
+            concluded = status in self.OP_CONCLUDED_STATUSES
+            active_like = status in ("coa_generated", "opord_issued", "active", "frago_required")
+            with self._connect() as conn:
+                tasks = conn.execute("SELECT job_id, agreement_id, order_id FROM operation_tasks "
+                                     "WHERE operation_id=?", (op_id,)).fetchall()
+                open_jobs = conn.execute("SELECT COUNT(*) AS c, MIN(created_at) AS oldest FROM market_jobs "
+                                         "WHERE operation_id=? AND status='open'", (op_id,)).fetchone()
+                frago_n = conn.execute("SELECT COUNT(*) AS c FROM operation_reports "
+                                       "WHERE operation_id=? AND report_type='frago'", (op_id,)).fetchone()["c"]
+                report_n = conn.execute("SELECT COUNT(*) AS c FROM operation_reports WHERE operation_id=?",
+                                        (op_id,)).fetchone()["c"]
+            open_job_n = open_jobs["c"] or 0
+            pending_ag = pending_ag_by_op.get(op_id, 0)
+            warns: list = []
+            if status in ("opord_issued", "active") and not op.get("selected_coa_id"):
+                warns.append("no_selected_coa")
+            if status in ("opord_issued", "active") and len(tasks) == 0:
+                warns.append("opord_no_tasks")
+            if status == "active" and open_jobs["oldest"] and (now - float(open_jobs["oldest"])) >= self.OPORD_JOB_UNCLAIMED_S:
+                warns.append("stale_unclaimed_job")
+            if active_like and int(op.get("budget_reserved") or 0) > 0:
+                linked = any((t["job_id"] or t["agreement_id"] or t["order_id"]) for t in tasks) or open_job_n > 0 or pending_ag > 0
+                if not linked:
+                    warns.append("budget_reserved_no_link")
+            if concluded and open_job_n > 0:
+                warns.append("concluded_open_jobs")          # cleanup regression detector
+            if concluded and pending_ag > 0:
+                warns.append("concluded_pending_agreements")  # cleanup regression detector
+            if not concluded and frago_n >= 3:
+                warns.append("repeated_fragos_no_progress")
+            if active_like and report_n == 0:
+                warns.append("no_reports")
+            if status == "active" and op.get("activated_at") and (now - float(op["activated_at"])) >= self.OPORD_MAX_ACTIVE_S:
+                warns.append("active_too_long")
+            if warns:
+                out.append({"op_id": op_id, "faction": op.get("faction_id"), "status": status, "warnings": warns})
+        return {"ok": True, "unhealthy": out, "count": len(out)}
+
+    # --- OPORD Phase 6: job market + task update helpers --------------------------------------------
+    def create_or_update_job(self, save_id: str, issuing_faction: str, job_type: str, target_sector: str = "",
+                             target_faction: str = "", ware: str = "", reward: int = 0, urgency: int = 0,
+                             visibility: str = "public", operation_id: Optional[str] = None,
+                             operation_task_id: Optional[str] = None, evidence: Any = None) -> dict:
+        """Create OR update one open job-market listing (anti-spam: ONE open job per job_key; repeated need raises
+        reward/urgency + refreshes evidence instead of reposting). job_key = save:faction:type:sector:target:ware."""
+        job_key = f"{save_id}:{issuing_faction}:{job_type}:{target_sector}:{target_faction}:{ware}"
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT id, reward, urgency FROM market_jobs WHERE save_id=? AND job_key=? "
+                               "AND status='open' LIMIT 1", (save_id, job_key)).fetchone()
+            if row:
+                conn.execute("UPDATE market_jobs SET reward=?, urgency=?, evidence_json=?, updated_at=? WHERE id=?",
+                             (max(int(row["reward"] or 0), int(reward or 0)),
+                              max(int(row["urgency"] or 0), int(urgency or 0)),
+                              self._enc("evidence_json", evidence), now, row["id"]))
+                conn.commit()
+                return {"ok": True, "id": row["id"], "created": False, "job_key": job_key}
+            job_id = "job_" + uuid.uuid4().hex[:10]
+            conn.execute("INSERT INTO market_jobs (id, save_id, issuing_faction, job_type, job_key, target_sector, "
+                         "target_faction, ware, reward, urgency, visibility, status, operation_id, "
+                         "operation_task_id, evidence_json, created_at, updated_at) "
+                         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (job_id, save_id, issuing_faction, job_type, job_key, target_sector, target_faction, ware,
+                          int(reward or 0), int(urgency or 0), visibility, "open", operation_id, operation_task_id,
+                          self._enc("evidence_json", evidence), now, now))
+            conn.commit()
+        return {"ok": True, "id": job_id, "created": True, "job_key": job_key}
+
+    def list_jobs(self, save_id: str, status: Optional[str] = None) -> list[dict]:
+        with self._connect() as conn:
+            if status:
+                rows = conn.execute("SELECT * FROM market_jobs WHERE save_id=? AND status=? ORDER BY updated_at DESC",
+                                    (save_id, status)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM market_jobs WHERE save_id=? ORDER BY updated_at DESC",
+                                    (save_id,)).fetchall()
+        return [self._decode_op_row(r) for r in rows]
+
+    def update_task(self, task_id: str, status: Optional[str] = None, **fields) -> dict:
+        sets, vals = [], []
+        if status:
+            sets.append("status=?"); vals.append(status)
+        for k, v in fields.items():
+            if k in {"assigned_actor_type", "assigned_actor_id", "owning_faction", "job_id", "agreement_id",
+                     "order_id", "target_faction", "target_sector", "priority", "evidence_json", "issued_at",
+                     "activated_at", "completed_at", "failed_at", "success_criteria_json", "failure_criteria_json"}:
+                sets.append(f"{k}=?"); vals.append(self._enc(k, v))
+        if not sets:
+            return {"ok": True, "id": task_id}
+        vals.append(task_id)
+        with self._lock, self._connect() as conn:
+            conn.execute(f"UPDATE operation_tasks SET {','.join(sets)} WHERE id=?", vals)
+            conn.commit()
+        return {"ok": True, "id": task_id}
+
+    # --- OPORD execution lifecycle: job claim/complete + budget SPEND + task success (#1 build) ----------
+    def claim_job(self, save_id: str, job_id: str, claimant: str = "") -> dict:
+        """Mark an open job claimed (player/NPC took the contract)."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            n = conn.execute("UPDATE market_jobs SET status='claimed', updated_at=? WHERE id=? AND save_id=? "
+                             "AND status='open'", (now, job_id, save_id)).rowcount or 0
+            conn.commit()
+        return {"ok": n > 0, "id": job_id, "status": "claimed" if n else "not_open", "claimant": claimant}
+
+    def complete_job(self, save_id: str, job_id: str, claimant: str = "", evidence: Any = None) -> dict:
+        """Fulfillment PROOF: complete the job, complete its linked task, and SPEND the reward from the issuing
+        faction's budget (the spec's 'budget spends only on execution' — reservation was at OPORD issue). Bumps the
+        operation's budget_spent + logs a task_update. Idempotent (a completed/cancelled job is a no-op)."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM market_jobs WHERE id=? AND save_id=?", (job_id, save_id)).fetchone()
+        if not row:
+            return {"ok": False, "reason": "job not found"}
+        job = self._decode_op_row(row)
+        if job.get("status") in ("completed", "cancelled"):
+            return {"ok": True, "id": job_id, "status": job["status"], "noop": True}
+        now = time.time()
+        reward = int(job.get("reward") or 0)
+        fac = job.get("issuing_faction") or ""
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE market_jobs SET status='completed', updated_at=? WHERE id=?", (now, job_id))
+            conn.commit()
+        spent_total = self.record_budget_spend(save_id, fac, reward)
+        op_id = job.get("operation_id")
+        if job.get("operation_task_id"):
+            self.update_task(job["operation_task_id"], status="completed", completed_at=now,
+                             evidence_json={"completed_by": claimant or "claimant", "via": "job", "reward": reward})
+        if op_id:
+            op = self.get_operation(op_id)
+            if op:
+                self.update_operation(op_id, budget_spent=int(op.get("budget_spent") or 0) + reward)
+                self.attach_report(op_id, "task_update",
+                                   f"Job {job.get('job_type')} completed by {claimant or 'a claimant'}; {reward} spent.",
+                                   severity=2, evidence={"job_id": job_id, "reward": reward, "claimant": claimant})
+        return {"ok": True, "id": job_id, "status": "completed", "reward_spent": reward, "faction_spent_total": spent_total}
+
+    def fail_job(self, save_id: str, job_id: str, reason: str = "") -> dict:
+        """Mark a job failed (unclaimed/expired/abandoned). Reserved budget is freed when the op concludes."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE market_jobs SET status='failed', updated_at=? WHERE id=? AND save_id=?",
+                         (now, job_id, save_id))
+            conn.commit()
+        return {"ok": True, "id": job_id, "status": "failed", "reason": reason}
+
+    # --- OPORD Execution Authority: ship leases (real-asset orders) + force-quota requests --------------
+    _LEASE_TERMINAL = ("completed", "failed", "released", "lost")
+
+    def pending_orders(self, save_id: str) -> dict:
+        """Tasks awaiting a REAL in-game ship order — internal-fleet tasks routed but still `pending_ingame`.
+        The MD issuer polls this, finds a ship, leases it, issues a create_order, then reports back."""
+        out = []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT t.id AS task_id, t.operation_id, t.task_type, t.target_sector, t.target_faction, "
+                "o.faction_id, o.target_sector AS op_sector, o.priority, o.urgency, o.operation_type "
+                "FROM operation_tasks t JOIN military_operations o ON t.operation_id=o.id "
+                "WHERE o.save_id=? AND t.assigned_actor_type='fleet' AND t.status='issued' "
+                "AND (t.order_id IS NULL OR t.order_id='pending_ingame') "
+                "AND o.status IN ('active','opord_issued','frago_required')", (save_id,)).fetchall()
+        for r in rows:
+            r = dict(r)
+            out.append({"task_id": r["task_id"], "operation_id": r["operation_id"], "faction": r["faction_id"],
+                        "task_type": r["task_type"], "sector": r["target_sector"] or r["op_sector"],
+                        "target_faction": r["target_faction"],
+                        "priority": max(int(r["priority"] or 0), int(r["urgency"] or 0))})
+        return {"ok": True, "pending": out}
+
+    def lease_asset(self, save_id: str, operation_id: str, task_id: str, faction: str, ship_runtime_id: str,
+                    ship_name: str = "", ship_macro: str = "", ship_class: str = "", sector: str = "",
+                    order_kind: str = "protectposition", priority: int = 0,
+                    original_order_summary: str = "") -> dict:
+        """Reserve a real ship for a task. One ACTIVE lease per ship (anti-steal); a HIGHER-priority op overrides a
+        lower-priority lease (the old one is released as 'interrupted-by-priority'); equal/higher blocks."""
+        now = time.time()
+        if not ship_runtime_id:
+            return {"ok": False, "reason": "no ship"}
+        with self._lock, self._connect() as conn:
+            ex = conn.execute("SELECT lease_id, priority, operation_id FROM opord_asset_leases WHERE save_id=? "
+                              "AND ship_runtime_id=? AND status NOT IN ('completed','failed','released','lost') "
+                              "LIMIT 1", (save_id, ship_runtime_id)).fetchone()
+            if ex:
+                if int(priority) > int(ex["priority"] or 0):
+                    conn.execute("UPDATE opord_asset_leases SET status='released', released_at=?, "
+                                 "failure_reason='overridden by higher-priority OPORD' WHERE lease_id=?",
+                                 (now, ex["lease_id"]))
+                else:
+                    conn.commit()
+                    return {"ok": False, "blocked": True, "reason": "ship already leased",
+                            "held_by": ex["operation_id"], "lease_id": ex["lease_id"]}
+            lease_id = "lease_" + uuid.uuid4().hex[:10]
+            conn.execute("INSERT INTO opord_asset_leases (lease_id, save_id, operation_id, task_id, faction, "
+                         "ship_runtime_id, ship_name, ship_macro, ship_class, sector, original_order_summary, "
+                         "order_kind, priority, status, last_seen_at, created_at) "
+                         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (lease_id, save_id, operation_id, task_id, faction, ship_runtime_id, ship_name, ship_macro,
+                          ship_class, sector, original_order_summary, order_kind, int(priority), "reserved", now, now))
+            conn.commit()
+        return {"ok": True, "lease_id": lease_id, "status": "reserved"}
+
+    def mark_order_issued(self, save_id: str, lease_id: str, assigned_order_id: str = "") -> dict:
+        """The MD issued a real create_order for the leased ship → lease 'issued'; the task goes 'active'."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT task_id FROM opord_asset_leases WHERE save_id=? AND lease_id=?",
+                               (save_id, lease_id)).fetchone()
+            conn.execute("UPDATE opord_asset_leases SET status='issued', issued_at=?, last_seen_at=?, "
+                         "assigned_order_id=? WHERE lease_id=?", (now, now, assigned_order_id, lease_id))
+            conn.commit()
+        if row and row["task_id"]:
+            self.update_task(row["task_id"], status="active", order_id=assigned_order_id or "issued",
+                             activated_at=now)
+        return {"ok": True, "lease_id": lease_id, "status": "issued"}
+
+    def record_order_event(self, save_id: str, lease_id: str, event: str, evidence: Any = None) -> dict:
+        """Observed execution event from the watchdog: arrived/engaged/completed/failed/lost/interrupted. Completed/
+        failed/lost drive the linked task's terminal state — execution evidence, never intent."""
+        now = time.time()
+        ev = str(event or "").lower()
+        status = ev if ev in ("arrived", "engaged", "completed", "failed", "lost", "interrupted") else "interrupted"
+        detail = json.dumps(evidence) if isinstance(evidence, (dict, list)) else (evidence or "")
+        released = now if status in ("completed", "failed", "lost") else None
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT lease_id, task_id FROM opord_asset_leases WHERE save_id=? AND lease_id=?",
+                               (save_id, lease_id)).fetchone()
+            if not row:
+                # the aiscript reports by task_id (its leasetag) — resolve to the active lease for that task.
+                row = conn.execute("SELECT lease_id, task_id FROM opord_asset_leases WHERE save_id=? AND task_id=? "
+                                   "AND status NOT IN ('completed','failed','released','lost') "
+                                   "ORDER BY created_at DESC LIMIT 1", (save_id, lease_id)).fetchone()
+                if row:
+                    lease_id = row["lease_id"]
+            conn.execute("UPDATE opord_asset_leases SET status=?, last_seen_at=?, "
+                         "released_at=COALESCE(?, released_at), failure_reason=? WHERE lease_id=?",
+                         (status, now, released, detail, lease_id))
+            conn.commit()
+        if row and row["task_id"]:
+            if status == "completed":
+                self.update_task(row["task_id"], status="completed", completed_at=now,
+                                 evidence_json={"execution": "order_completed"})
+            elif status in ("failed", "lost"):
+                self.update_task(row["task_id"], status="failed", failed_at=now,
+                                 evidence_json={"execution": status})
+        return {"ok": True, "lease_id": lease_id, "status": status}
+
+    def release_asset(self, save_id: str, lease_id: str, reason: str = "") -> dict:
+        """Release a lease (idempotent — a terminal lease is a no-op)."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT status FROM opord_asset_leases WHERE save_id=? AND lease_id=?",
+                               (save_id, lease_id)).fetchone()
+            if not row:
+                return {"ok": False, "reason": "lease not found"}
+            if row["status"] in self._LEASE_TERMINAL:
+                return {"ok": True, "lease_id": lease_id, "status": row["status"], "noop": True}
+            conn.execute("UPDATE opord_asset_leases SET status='released', released_at=?, failure_reason=? "
+                         "WHERE lease_id=?", (now, reason, lease_id))
+            conn.commit()
+        return {"ok": True, "lease_id": lease_id, "status": "released"}
+
+    def release_operation_leases(self, save_id: str, op_id: str) -> int:
+        """Release every still-active lease of an operation (closeout)."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            n = conn.execute("UPDATE opord_asset_leases SET status='released', released_at=?, "
+                             "failure_reason='operation concluded' WHERE save_id=? AND operation_id=? "
+                             "AND status NOT IN ('completed','failed','released','lost')", (now, save_id, op_id)).rowcount or 0
+            conn.commit()
+        return n
+
+    def list_leases(self, save_id: str, operation_id: Optional[str] = None) -> list[dict]:
+        with self._connect() as conn:
+            if operation_id:
+                rows = conn.execute("SELECT * FROM opord_asset_leases WHERE save_id=? AND operation_id=? "
+                                    "ORDER BY created_at DESC", (save_id, operation_id)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM opord_asset_leases WHERE save_id=? ORDER BY created_at DESC",
+                                    (save_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def create_or_update_force_request(self, save_id: str, operation_id: str, task_id: str, faction: str,
+                                       sector: str, ship_role: str, ship_size: str = "", quantity: int = 1,
+                                       priority: int = 0, reward_budget: int = 0) -> dict:
+        """Durable force demand when no ship is available — ONE open request per (faction,sector,role,operation);
+        repeated need escalates priority/reward instead of spamming."""
+        now = time.time()
+        req_key = f"{save_id}:{faction}:{sector}:{ship_role}:{operation_id}"
+        with self._lock, self._connect() as conn:
+            ex = conn.execute("SELECT request_id, priority, reward_budget FROM opord_force_requests WHERE save_id=? "
+                              "AND req_key=? AND status='open' LIMIT 1", (save_id, req_key)).fetchone()
+            if ex:
+                conn.execute("UPDATE opord_force_requests SET priority=?, reward_budget=?, last_escalated_at=? "
+                             "WHERE request_id=?", (max(int(ex["priority"] or 0), int(priority)),
+                             max(int(ex["reward_budget"] or 0), int(reward_budget)), now, ex["request_id"]))
+                conn.commit()
+                return {"ok": True, "request_id": ex["request_id"], "created": False}
+            rid = "freq_" + uuid.uuid4().hex[:10]
+            conn.execute("INSERT INTO opord_force_requests (request_id, save_id, operation_id, task_id, faction, "
+                         "sector, ship_role, ship_size, quantity, priority, reward_budget, req_key, status, created_at) "
+                         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (rid, save_id, operation_id, task_id, faction, sector, ship_role, ship_size, int(quantity),
+                          int(priority), int(reward_budget), req_key, "open", now))
+            conn.commit()
+        return {"ok": True, "request_id": rid, "created": True}
+
+    def cancel_operation_force_requests(self, save_id: str, op_id: str) -> int:
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            n = conn.execute("UPDATE opord_force_requests SET status='cancelled', last_escalated_at=? "
+                             "WHERE save_id=? AND operation_id=? AND status='open'", (now, save_id, op_id)).rowcount or 0
+            conn.commit()
+        return n
+
+    # --- OPORD Phase 2: threat recognition (real hostile events → deduped warning-order operations) -----
+    def recognize_threats(self, save_id: str, window_s: float = 3600.0) -> dict:
+        """Turn REAL recent hostile events into THREATS, each a deduped warning-order operation. Aggregate by
+        (victim = the DEFENDING faction that would mount an op, aggressor, sector); criminal aggressors (Xenon/
+        Kha'ak/pirates) → `raid_pressure`, else `sector_pressure`. create_or_get_operation dedupes (one active op
+        per threat_key — anti-spam); an existing op is UPDATED (evidence/urgency) instead of re-created. Pure +
+        evidence-grounded; fabricates nothing (only reads events the mod actually recorded)."""
+        evs = self.list_hostile_events(save_id, window_s=window_s, limit=2000)
+        agg: dict = {}
+        for e in evs:
+            atk, vic, sect = e.get("attacker_faction"), e.get("victim_faction"), (e.get("sector") or "")
+            if not atk or not vic or atk == vic:
+                continue
+            ttype = "raid_pressure" if atk in self.CRIMINAL_FACTIONS else "sector_pressure"
+            a = agg.setdefault((vic, ttype, atk, sect),
+                               {"faction": vic, "ttype": ttype, "target": atk, "sector": sect,
+                                "events": 0, "magnitude": 0.0, "first": None, "last": None})
+            a["events"] += 1
+            a["magnitude"] += float(e.get("magnitude") or 0)
+            ts = float(e.get("ts") or 0)
+            a["first"] = ts if a["first"] is None else min(a["first"], ts)
+            a["last"] = ts if a["last"] is None else max(a["last"], ts)
+        created, updated, threats = 0, 0, []
+        for a in agg.values():
+            vic, ttype, atk, sect = a["faction"], a["ttype"], a["target"], a["sector"]
+            slug = re.sub(r"[^a-z0-9]+", "_", (sect or "unknown").lower()).strip("_") or "unknown"
+            threat_key = f"{save_id}:{vic}:{ttype}:{atk}:{slug}"
+            urgency = max(1, min(5, 1 + int(a["magnitude"] // 10)))
+            importance = max(1, min(5, 1 + a["events"] // 2))
+            threat_desc = (f"{atk} pressure in {sect}" if sect else f"{atk} pressure")
+            warning = {"type": "warning_order", "faction": vic, "threat_type": ttype, "threat": threat_desc,
+                       "urgency": urgency, "importance": importance,
+                       "constraints": ["avoid full escalation if possible"],
+                       "ccir": ["enemy fleet strength", "sector trade disruption", "available patrol assets"],
+                       "evidence": {"hostile_events": a["events"], "recent_losses": round(a["magnitude"], 1)}}
+            evidence = {"hostile_events": a["events"], "magnitude": round(a["magnitude"], 1),
+                        "sector": sect, "first_at": a["first"], "last_at": a["last"]}
+            res = self.create_or_get_operation(save_id, vic, ttype, threat_key, status="warning",
+                                               target_faction=atk, target_sector=sect, threat_id=threat_key,
+                                               urgency=urgency, importance=importance,
+                                               warning_order_json=warning, evidence_json=evidence)
+            if res.get("created"):
+                created += 1
+            else:
+                self.update_operation(res["id"], urgency=urgency, importance=importance,
+                                      warning_order_json=warning, evidence_json=evidence)
+                updated += 1
+            threats.append({"op_id": res["id"], "threat_key": threat_key, "created": res.get("created", False)})
+        # --- ECONOMY shortages → supply_shortage operations (non-combat feed; this data syncs in normal play) ---
+        for econ in self.list_economy(save_id):
+            fid = econ.get("faction_id")
+            if not fid:
+                continue
+            shortages = econ.get("shortages") or {}
+            health = float(econ.get("production_health", 1.0) or 1.0)
+            worst = max([float(s or 0) for s in shortages.values()] + [0.0])
+            sev = max(worst, 1.0 - health)
+            if sev < 0.34:                       # not a real shortage
+                continue
+            tk = f"{save_id}:{fid}:supply_shortage:none:economy"
+            urgency = max(1, min(5, 1 + int(sev * 4)))
+            importance = max(1, min(5, 2 + int(sev * 3)))
+            needs = [str(w) for w in (econ.get("key_needs") or list(shortages.keys()))][:4]
+            warn = {"type": "warning_order", "faction": fid, "threat_type": "supply_shortage",
+                    "threat": f"Supply shortage ({', '.join(needs) or 'key wares'})", "urgency": urgency,
+                    "importance": importance, "constraints": ["protect supply lines"],
+                    "ccir": ["stock levels", "delivery routes", "contractor availability"],
+                    "evidence": {"production_health": round(health, 2), "shortage_severity": round(sev, 2)}}
+            evid = {"production_health": round(health, 2), "shortage_severity": round(sev, 2), "needs": needs}
+            res = self.create_or_get_operation(save_id, fid, "supply_shortage", tk, status="warning",
+                                               target_faction="", target_sector="", threat_id=tk, urgency=urgency,
+                                               importance=importance, warning_order_json=warn, evidence_json=evid)
+            if res.get("created"):
+                created += 1
+            else:
+                self.update_operation(res["id"], urgency=urgency, importance=importance,
+                                      warning_order_json=warn, evidence_json=evid)
+                updated += 1
+            threats.append({"op_id": res["id"], "threat_key": tk, "created": res.get("created", False)})
+        # --- broken/expired AGREEMENTS → agreement_breakdown operations (diplomacy feed) ---
+        for st in ("broken", "expired"):
+            for ag in self.list_agreements(save_id, st):
+                a, b = ag.get("party_a"), ag.get("party_b")
+                if not a or not b or a == b:
+                    continue
+                tk = f"{save_id}:{a}:agreement_breakdown:{b}:diplomacy"
+                warn = {"type": "warning_order", "faction": a, "threat_type": "agreement_breakdown",
+                        "threat": f"{ag.get('type') or 'agreement'} with {b} {st}", "urgency": 3, "importance": 3,
+                        "constraints": ["avoid full escalation if possible"], "ccir": ["enemy intent", "relation status"],
+                        "evidence": {"agreement_id": ag.get("id"), "agreement_status": st}}
+                evid = {"agreement_id": ag.get("id"), "status": st}
+                res = self.create_or_get_operation(save_id, a, "agreement_breakdown", tk, status="warning",
+                                                   target_faction=b, target_sector="", threat_id=tk, urgency=3,
+                                                   importance=3, warning_order_json=warn, evidence_json=evid)
+                if res.get("created"):
+                    created += 1
+                else:
+                    self.update_operation(res["id"], warning_order_json=warn, evidence_json=evid)
+                    updated += 1
+                threats.append({"op_id": res["id"], "threat_key": tk, "created": res.get("created", False)})
+        return {"ok": True, "created": created, "updated": updated, "threats": threats}
+
+    # --- OPORD Phase 3: mission analysis (deterministic — mission/intent/end-state/constraints/CCIR/assets) ----
+    def analyze_mission(self, op_id: str) -> dict:
+        """Phase 3: deterministic mission analysis for a warning-order operation. Derives mission statement,
+        commander intent, desired end state, constraints, CCIR, and REAL available assets (faction fleet + budget)
+        from the threat. Advances status warning→analysing. Pure; no LLM, no fabrication."""
+        op = self.get_operation(op_id)
+        if not op:
+            return {"ok": False, "reason": "operation not found"}
+        save_id, fid = op["save_id"], op["faction_id"]
+        target = op.get("target_faction") or ""
+        sector = op.get("target_sector") or ""
+        ttype = op.get("operation_type") or "sector_pressure"
+        fac = self.get_faction(save_id, fid) or self.get_faction(self.CANON_SAVE, fid) or {}
+        fac_name = fac.get("name") or fid
+        tgt = self.get_faction(save_id, target) or self.get_faction(self.CANON_SAVE, target) or {}
+        tgt_name = tgt.get("name") or target or "hostile forces"
+        fight = 0
+        for f in self.list_fleet_strength(save_id):
+            if f.get("faction_id") == fid:
+                fight = int(f.get("fight") or 0)
+                break
+        budget_available = max(0.0, self.budget_capacity(save_id, fid) - self.budget_spent(save_id, fid))
+        where = sector or "the contested zone"
+        is_raid = ttype == "raid_pressure"
+        mission_statement = (f"{fac_name} secures {where} to reduce {tgt_name} "
+                             + ("raiding and restore security." if is_raid else "pressure and protect trade traffic."))
+        commander_intent = ("Neutralize the raiders and restore freedom of movement." if is_raid
+                            else "Restore freedom of movement without triggering wider war.")
+        desired_end_state = f"Hostile pressure reduced and {where} stable."
+        constraints = list((op.get("warning_order_json") or {}).get("constraints") or ["avoid full escalation if possible"])
+        if not is_raid and "protect civilian traffic" not in constraints:
+            constraints.append("protect civilian traffic")
+        ccir = list((op.get("warning_order_json") or {}).get("ccir") or
+                    ["enemy reinforcements", "friendly losses", "trade corridor status"])
+        analysis = {"mission_statement": mission_statement, "commander_intent": commander_intent,
+                    "desired_end_state": desired_end_state, "constraints": constraints,
+                    "available_assets": {"combat_ships": fight, "budget_available": int(budget_available)},
+                    "ccir": ccir}
+        self.update_operation(op_id, status="analysing", mission_statement=mission_statement,
+                              commander_intent=commander_intent, desired_end_state=desired_end_state,
+                              mission_analysis_json=analysis, constraints_json=constraints, ccir_json=ccir)
+        return {"ok": True, "id": op_id, "analysis": analysis}
+
+    def analyze_pending_missions(self, save_id: str) -> dict:
+        """Run mission analysis on every operation still at `warning` (the recognize→analyse stage transition)."""
+        n = 0
+        for op in self.list_operations(save_id, "warning"):
+            self.analyze_mission(op["id"])
+            n += 1
+        return {"ok": True, "analysed": n}
+
+    # --- OPORD Phase 4: COA engine (generate → screen → wargame → doctrine score → select) ---------------
+    def plan_operation_coas(self, op_id: str) -> dict:
+        """For an analysed operation: generate candidate COAs, screen out infeasible ones, wargame + doctrine-score
+        the viable ones, SELECT the highest (deterministic — same inputs always pick the same COA, ties broken by
+        coa_type), persist all COAs, and advance status analysing→coa_generated with selected_coa_id. The LLM does
+        not choose; this does."""
+        op = self.get_operation(op_id)
+        if not op:
+            return {"ok": False, "reason": "operation not found"}
+        assets = (op.get("mission_analysis_json") or {}).get("available_assets") or {}
+        weights = OPORD_DOCTRINE.get(op["faction_id"], OPORD_DOCTRINE["default"])
+        persisted, best = [], None
+        for c in opord_generate_coas(op):
+            viable, reason = opord_screen_coa(c, assets, op)
+            if not viable:
+                cid = self.attach_coa(op_id, c["coa_type"], c["concept"], c["tasks"],
+                                      viability_status="rejected", rejection_reason=reason,
+                                      required_budget=c.get("required_budget", 0),
+                                      expected_duration=c.get("expected_duration"),
+                                      required_assets_json=c.get("required_assets"))
+                persisted.append({"coa_id": cid, "type": c["coa_type"], "viable": False, "reason": reason})
+                continue
+            wg = opord_wargame_coa(c, op, assets)
+            score, breakdown = opord_score_coa(wg, weights)
+            cid = self.attach_coa(op_id, c["coa_type"], c["concept"], c["tasks"],
+                                  viability_status="viable", required_budget=c.get("required_budget", 0),
+                                  expected_duration=c.get("expected_duration"),
+                                  required_assets_json=c.get("required_assets"),
+                                  wargame_json=wg, score_json=breakdown, weighted_score=score)
+            rec = {"coa_id": cid, "type": c["coa_type"], "viable": True, "score": score}
+            persisted.append(rec)
+            if best is None or score > best["score"] or (score == best["score"] and c["coa_type"] < best["type"]):
+                best = rec
+        if best:
+            with self._lock, self._connect() as conn:
+                conn.execute("UPDATE operation_coas SET viability_status='selected', selected=1 WHERE id=?",
+                             (best["coa_id"],))
+                conn.commit()
+            self.update_operation(op_id, status="coa_generated", selected_coa_id=best["coa_id"])
+        return {"ok": True, "op_id": op_id, "coas": persisted, "selected": best}
+
+    def plan_pending_coas(self, save_id: str) -> dict:
+        """Run the COA engine on every operation at `analysing` (the analyse→coa_generated transition)."""
+        n = 0
+        for op in self.list_operations(save_id, "analysing"):
+            self.plan_operation_coas(op["id"])
+            n += 1
+        return {"ok": True, "planned": n}
+
+    # --- OPORD Phase 5: OPORD generator (selected COA → SMESC + annexes + executable tasks) --------------
+    def generate_opord(self, op_id: str) -> dict:
+        """Turn the selected COA into the formal order: build SMESC opord_json + annexes_json, DERIVE executable
+        operation_tasks (each tagged with the selected coa_id so every task maps back to the COA), reserve the
+        COA's budget, and advance coa_generated→opord_issued (issued_at). Deterministic; LLM prose is optional/later."""
+        op = self.get_operation(op_id)
+        if not op:
+            return {"ok": False, "reason": "operation not found"}
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM operation_coas WHERE operation_id=? AND selected=1 LIMIT 1",
+                               (op_id,)).fetchone()
+        if not row:
+            return {"ok": False, "reason": "no selected COA"}
+        coa = self._decode_op_row(row)
+        smesc = opord_build_smesc(op, coa)
+        annexes = opord_build_annexes(op, coa)
+        task_ids = []
+        for t in (coa.get("tasks_json") or []):
+            tid = self.attach_task(op_id, t.get("task_type") or "task", status="planned", coa_id=coa["id"],
+                                   target_faction=t.get("target_faction"), target_sector=t.get("sector"),
+                                   success_criteria_json=t.get("success_criteria"))
+            task_ids.append(tid)
+        reserved = int(coa.get("required_budget") or 0)
+        self.update_operation(op_id, status="opord_issued", opord_json=smesc, annexes_json=annexes,
+                              budget_reserved=reserved, issued_at=time.time())
+        sector = op.get("target_sector") or "the contested zone"
+        self.emit_operation_event(op, "opord_issued", 3,
+                                  f"{op.get('faction_id')} High Command issued an operation in {sector} "
+                                  f"against {op.get('target_faction') or 'hostile forces'}.")
+        return {"ok": True, "op_id": op_id, "tasks": task_ids, "budget_reserved": reserved}
+
+    def issue_pending_opords(self, save_id: str) -> dict:
+        """Generate OPORDs for every operation at `coa_generated` (the coa_generated→opord_issued transition)."""
+        n = 0
+        for op in self.list_operations(save_id, "coa_generated"):
+            self.generate_opord(op["id"])
+            n += 1
+        return {"ok": True, "issued": n}
+
+    # --- OPORD Phase 6: execution routing (task → internal fleet / job market / agreement proposal) ------
+    def route_operation_task(self, op: dict, task: dict) -> dict:
+        """Route ONE OPORD task to a fulfillment mechanism per the spec rule: do it internally (owned fleet) when
+        capable + ships exist; else create/update a job-market listing; tasks needing another faction's consent
+        become an agreement PROPOSAL (the Negotiations engine scores acceptance later). Links the task to its
+        job_id/agreement_id/order_id and marks it issued."""
+        save_id, faction, op_id, task_id = op["save_id"], op["faction_id"], op["id"], task["id"]
+        ttype = task.get("task_type") or ""
+        sector = task.get("target_sector") or op.get("target_sector") or ""
+        target = task.get("target_faction") or op.get("target_faction") or ""
+        ships = int(((op.get("mission_analysis_json") or {}).get("available_assets") or {}).get("combat_ships") or 0)
+        ev = {"operation_id": op_id, "sector": sector}
+        if ttype in {"patrol_sector", "engage_hostiles", "raid_enemy_logistics"} and ships > 0:
+            self.update_task(task_id, status="issued", assigned_actor_type="fleet", owning_faction=faction,
+                             order_id="pending_ingame", issued_at=time.time())
+            return {"task_id": task_id, "route": "internal_fleet"}
+        if ttype in {"request_allied_support"}:
+            ag = self.add_agreement(save_id, faction, "", type="alliance", status="pending",
+                                    terms={"operation_id": op_id, "operation_task_id": task_id,
+                                           "kind": "allied_support", "sector": sector})
+            self.update_task(task_id, status="issued", agreement_id=str(ag.get("id")), issued_at=time.time())
+            return {"task_id": task_id, "route": "agreement:allied"}
+        if ttype in {"seek_ceasefire"}:
+            ag = self.add_agreement(save_id, faction, target, type="ceasefire", status="pending",
+                                    terms={"operation_id": op_id, "operation_task_id": task_id, "kind": "ceasefire"})
+            self.update_task(task_id, status="issued", agreement_id=str(ag.get("id")), issued_at=time.time())
+            return {"task_id": task_id, "route": "agreement:ceasefire"}
+        jt = ("supply" if ttype in {"request_supplies", "post_supply_contract", "supply_delivery"}
+              else "escort" if ttype == "escort_supply_convoy"
+              else "privateer" if ttype == "raid_enemy_logistics"
+              else "patrol" if ttype in {"patrol_sector", "post_patrol_contract", "engage_hostiles"}
+              else "task")
+        job = self.create_or_update_job(save_id, faction, jt, target_sector=sector, target_faction=target,
+                                        reward=self.OPORD_JOB_REWARDS.get(jt, 50000), urgency=int(op.get("urgency") or 0),
+                                        operation_id=op_id, operation_task_id=task_id, evidence=ev)
+        self.update_task(task_id, status="issued", job_id=str(job.get("id")), issued_at=time.time())
+        return {"task_id": task_id, "route": "job:" + jt, "job_created": job.get("created")}
+
+    def route_operation(self, op_id: str) -> dict:
+        """Route all PLANNED tasks of an issued operation, then advance opord_issued→active (activated_at)."""
+        op = self.get_operation(op_id)
+        if not op:
+            return {"ok": False, "reason": "operation not found"}
+        with self._connect() as conn:
+            tasks = [self._decode_op_row(r) for r in conn.execute(
+                "SELECT * FROM operation_tasks WHERE operation_id=? AND status='planned'", (op_id,)).fetchall()]
+        routes = [self.route_operation_task(op, t) for t in tasks]
+        self.update_operation(op_id, status="active", activated_at=time.time())
+        return {"ok": True, "op_id": op_id, "routes": routes}
+
+    def route_pending_operations(self, save_id: str) -> dict:
+        """Route every operation at `opord_issued` (the opord_issued→active transition)."""
+        n = 0
+        for op in self.list_operations(save_id, "opord_issued"):
+            self.route_operation(op["id"])
+            n += 1
+        return {"ok": True, "routed": n}
+
+    # --- OPORD Phase 7: assessment + FRAGO (battle rhythm, reward escalation, conclude-or-fail) -----------
+    def assess_operation(self, op_id: str) -> dict:
+        """Assess one ACTIVE operation against REAL evidence and adapt it: emit a SITREP; fire FRAGOs (enemy
+        reinforcement → allied-support proposal; unclaimed linked job too long → increase reward); and conclude
+        from evidence (pressure abated + min age → completed; still contested past max age → failed, so nothing
+        hangs forever). Deterministic; never fabricates outcomes."""
+        op = self.get_operation(op_id)
+        if not op or op.get("status") not in ("active", "frago_required"):
+            return {"ok": False, "reason": "not an active operation"}
+        save_id = op["save_id"]
+        sector = op.get("target_sector") or ""
+        target = op.get("target_faction") or ""
+        now = time.time()
+        activated = float(op.get("activated_at") or op.get("issued_at") or op.get("created_at") or now)
+        age = now - activated
+        # New enemy pressure in THIS op's sector since it activated (real events only).
+        recent_mag = 0.0
+        for e in self.list_hostile_events(save_id, window_s=max(age, 1.0) + 5.0, limit=2000):
+            if e.get("sector") == sector and e.get("attacker_faction") == target and float(e.get("ts") or 0) >= activated:
+                recent_mag += float(e.get("magnitude") or 0)
+        fragos: list = []
+        self.attach_report(op_id, "sitrep", f"Assessment: age {int(age)}s, new hostile magnitude {round(recent_mag, 1)} in {sector or 'AO'}.",
+                           severity=1, evidence={"age_s": int(age), "recent_magnitude": round(recent_mag, 1)})
+        # TASK SUCCESS FROM REAL EVIDENCE (not intent): our forces inflicting losses on the target completes the
+        # offensive tasks (the spec's "no success may be claimed from intent alone"). our_kills = events we caused.
+        our_kills = 0.0
+        for e in self.list_hostile_events(save_id, window_s=max(age, 1.0) + 5.0, limit=2000):
+            if (e.get("attacker_faction") == op["faction_id"] and e.get("victim_faction") == target
+                    and float(e.get("ts") or 0) >= activated):
+                our_kills += float(e.get("magnitude") or 0)
+        if our_kills > 0:
+            with self._connect() as conn:
+                tids = [r["id"] for r in conn.execute(
+                    "SELECT id FROM operation_tasks WHERE operation_id=? AND task_type IN "
+                    "('raid_enemy_logistics','engage_hostiles') AND status IN ('planned','issued','active')",
+                    (op_id,)).fetchall()]
+            for tid in tids:
+                self.update_task(tid, status="completed", completed_at=now,
+                                 evidence_json={"enemy_loss_observed": round(our_kills, 1)})
+            if tids:
+                self.attach_report(op_id, "bda", f"BDA: enemy losses observed ({round(our_kills, 1)}); offensive tasks complete.",
+                                   severity=2, evidence={"enemy_loss": round(our_kills, 1), "tasks_completed": len(tids)})
+        # FRAGO: enemy reinforcement → request allied support (a real proposal) + report.
+        if recent_mag >= self.OPORD_REINFORCE_MAG:
+            ag = self.add_agreement(save_id, op["faction_id"], "", type="alliance", status="pending",
+                                    terms={"operation_id": op_id, "kind": "allied_support", "reason": "reinforcement"})
+            self.attach_report(op_id, "frago", f"FRAGO: {target} reinforcing {sector}; requesting allied support.",
+                               severity=3, evidence={"trigger": "enemy_reinforcement", "agreement_id": ag.get("id")})
+            fragos.append("enemy_reinforcement")
+        # FRAGO: unclaimed linked job too long → increase reward, BUT gated by the op's reserved budget
+        # (no escalation beyond what the operation actually reserved — spec budget rule; #2 audit fix).
+        reserved = int(op.get("budget_reserved") or 0)
+        for j in self.list_jobs(save_id, "open"):
+            if j.get("operation_id") == op_id and (now - float(j.get("created_at") or now)) >= self.OPORD_JOB_UNCLAIMED_S:
+                cur = int(j.get("reward") or 0)
+                new_reward = min(int(cur * 1.5) or 1, reserved)
+                if new_reward > cur:
+                    with self._lock, self._connect() as conn:
+                        conn.execute("UPDATE market_jobs SET reward=?, updated_at=? WHERE id=?", (new_reward, now, j["id"]))
+                        conn.commit()
+                    self.attach_report(op_id, "frago", f"FRAGO: job unclaimed; reward raised to {new_reward}.",
+                                       severity=2, evidence={"trigger": "job_unclaimed", "job_id": j["id"], "reward": new_reward})
+                    fragos.append("job_unclaimed")
+                else:
+                    self.attach_report(op_id, "budget_report",
+                                       f"Job unclaimed but reserved budget ({reserved}) cannot raise reward above {cur}.",
+                                       severity=2, evidence={"trigger": "budget_exhausted", "job_id": j["id"]})
+                    fragos.append("budget_exhausted")
+        if fragos:  # one gated milestone event for the FRAGO (cooldown stops per-tick spam)
+            self.emit_operation_event(op, "frago_issued", 3,
+                                      f"FRAGO on {op['faction_id']} operation in {sector or 'AO'}: {', '.join(fragos)}.")
+        # Conclude from evidence.
+        outcome = None
+        if recent_mag <= 0 and age >= self.OPORD_MIN_ACTIVE_S:
+            self.conclude_operation(op_id, "completed", "Hostile pressure abated; sector stable.")
+            self.attach_report(op_id, "completion_report", "Operation complete: pressure abated.", severity=2)
+            self.emit_operation_event(op, "operation_completed", 4,
+                                      f"{op['faction_id']} operation in {sector or 'the sector'} succeeded; pressure abated.")
+            outcome = "completed"
+        elif age >= self.OPORD_MAX_ACTIVE_S:
+            self.conclude_operation(op_id, "failed", "Operation timed out without resolving the threat.")
+            self.attach_report(op_id, "failure_report", "Operation failed: timed out, threat unresolved.", severity=3)
+            self.emit_operation_event(op, "operation_failed", 3,
+                                      f"{op['faction_id']} operation in {sector or 'the sector'} failed; threat unresolved.")
+            outcome = "failed"
+        return {"ok": True, "op_id": op_id, "recent_magnitude": round(recent_mag, 1), "fragos": fragos, "outcome": outcome}
+
+    def assess_active_operations(self, save_id: str) -> dict:
+        """Battle-rhythm pass: assess every active/frago_required operation (FRAGOs + conclude-or-fail)."""
+        n, concluded = 0, 0
+        for op in (self.list_operations(save_id, "active") + self.list_operations(save_id, "frago_required")):
+            r = self.assess_operation(op["id"])
+            n += 1
+            if r.get("outcome"):
+                concluded += 1
+        return {"ok": True, "assessed": n, "concluded": concluded}
+
+    def advance_operations(self, save_id: str) -> dict:
+        """OPORD pipeline driver — runs each BUILT stage in spec order for one save. Extended as phases land
+        (P2 recognize → P3 analyse → P4 COA → P5 OPORD → P6 route → P7 assess/FRAGO → … ). One Lua entrypoint."""
+        rec = self.recognize_threats(save_id)
+        ana = self.analyze_pending_missions(save_id)
+        coa = self.plan_pending_coas(save_id)
+        opd = self.issue_pending_opords(save_id)
+        rte = self.route_pending_operations(save_id)
+        ass = self.assess_active_operations(save_id)
+        return {"ok": True, "recognize": rec, "analyze": ana, "coa": coa, "opord": opd, "route": rte, "assess": ass}
+
     # --- Economy MEANING + player market --------------------------------------
 
     ECONOMY_REAL_FIELDS = ("player_economic_importance", "dependency_on_player", "production_health")
@@ -5296,6 +6448,995 @@ def run_blackboard_bind_selftest() -> dict:
               r3.get("persistent_npc_key") == "bb:aic_900_999"
               and str((store.get_identity("bb:aic_900_999") or {}).get("status")) == "bound")
         check("guard_missing", store.bind_blackboard_identity("", "", "", "", "").get("ok") is False)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+# =================== OPORD Phase 4: COA engine (deterministic — the commander decides, not the LLM) ===========
+def _op_clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+# Faction doctrine weights (spec OPORD_Update). Weighted-sum over normalized wargame dimensions → COA score.
+OPORD_DOCTRINE = {
+    "argon":   {"mission_success": 0.25, "force_protection": 0.20, "trade_protection": 0.20, "speed": 0.10,
+                "budget_efficiency": 0.10, "political_acceptability": 0.10, "flexibility": 0.05},
+    "split":   {"mission_success": 0.30, "speed": 0.20, "aggression": 0.20, "force_protection": 0.05,
+                "political_acceptability": 0.05, "flexibility": 0.10, "budget_efficiency": 0.10},
+    "teladi":  {"mission_success": 0.20, "profit": 0.25, "budget_efficiency": 0.20, "force_protection": 0.15,
+                "political_acceptability": 0.10, "flexibility": 0.10},
+    "default": {"mission_success": 0.30, "force_protection": 0.20, "trade_protection": 0.15, "speed": 0.10,
+                "budget_efficiency": 0.10, "political_acceptability": 0.10, "flexibility": 0.05},
+}
+
+# Enemy reaction baseline (spec) — most-likely behaviour string per target faction.
+OPORD_ENEMY_REACTION = {
+    "xenon": "Xenon reinforce and strike infrastructure; no diplomacy.",
+    "khaak": "Kha'ak swarm and raid; no negotiation.",
+    "teladi": "Teladi avoid losses and counter-contract while contesting trade lanes.",
+    "split": "Split escalate aggressively.",
+    "argon": "Argon protect trade and civilians.",
+    "paranid": "Paranid escalate ideologically with formal reprisal.",
+    "boron": "Boron stay defensive with humanitarian framing.",
+    "scaleplate": "Pirates privateer and raid opportunistically.",
+}
+
+
+def opord_enemy_reaction(target_faction: str) -> str:
+    return OPORD_ENEMY_REACTION.get(str(target_faction or ""), "Enemy contests the objective.")
+
+
+def opord_generate_coas(op: dict) -> list[dict]:
+    """Candidate COAs from the threat + the operation's analysed assets. Screening + doctrine decide which wins;
+    this just offers the menu. Always offers the full relevant set (don't pre-filter — that's screening's job)."""
+    analysis = op.get("mission_analysis_json") or {}
+    sector = op.get("target_sector") or "the sector"
+    target = op.get("target_faction") or "the enemy"
+    faction = op.get("faction_id") or "the faction"
+    is_criminal = target in MemoryStore.CRIMINAL_FACTIONS
+    if (op.get("operation_type") or "") == "supply_shortage":
+        # supply threats get logistics COAs, not military ones — no enemy to patrol/raid.
+        return [
+            {"coa_type": "request_supplies", "concept": f"Post a public supply contract for {faction}.",
+             "tasks": [{"task_type": "request_supplies"}], "required_assets": {}, "required_budget": 100000,
+             "expected_duration": 2400},
+            {"coa_type": "escort_supply_convoy", "concept": "Escort a supply convoy to the shortage.",
+             "tasks": [{"task_type": "escort_supply_convoy"}], "required_assets": {"combat_ships": 2},
+             "required_budget": 40000, "expected_duration": 1800},
+            {"coa_type": "hire_contractors", "concept": "Hire independent haulers to cover the shortfall.",
+             "tasks": [{"task_type": "post_supply_contract"}], "required_assets": {}, "required_budget": 120000,
+             "expected_duration": 2400},
+        ]
+    coas = [
+        {"coa_type": "defensive_posture", "concept": f"Hold a defensive posture in {sector}.",
+         "tasks": [{"task_type": "patrol_sector", "sector": sector, "duration": 1800}],
+         "required_assets": {"combat_ships": 1}, "required_budget": 0, "expected_duration": 1800},
+        {"coa_type": "organic_patrol", "concept": f"Deploy patrol ships to {sector}.",
+         "tasks": [{"task_type": "patrol_sector", "sector": sector, "duration": 1800},
+                   {"task_type": "engage_hostiles", "target_faction": target, "rules": ["respond_only"]}],
+         "required_assets": {"combat_ships": 3}, "required_budget": 0, "expected_duration": 1800},
+        {"coa_type": "hire_contractors", "concept": f"Post a patrol contract for {sector}.",
+         "tasks": [{"task_type": "post_patrol_contract", "sector": sector}],
+         "required_assets": {}, "required_budget": 120000, "expected_duration": 2400},
+        {"coa_type": "raid_enemy_logistics", "concept": f"Raid {target} logistics to relieve pressure.",
+         "tasks": [{"task_type": "raid_enemy_logistics", "target_faction": target}],
+         "required_assets": {"combat_ships": 4}, "required_budget": 50000, "expected_duration": 2400},
+        {"coa_type": "request_allied_support", "concept": "Request allied support for the operation.",
+         "tasks": [{"task_type": "request_allied_support"}],
+         "required_assets": {}, "required_budget": 0, "expected_duration": 1800},
+    ]
+    if not is_criminal:
+        coas.append({"coa_type": "seek_ceasefire", "concept": f"Open ceasefire talks with {target}.",
+                     "tasks": [{"task_type": "seek_ceasefire", "target_faction": target}],
+                     "required_assets": {}, "required_budget": 0, "expected_duration": 1200})
+    return coas
+
+
+def opord_screen_coa(coa: dict, assets: dict, op: dict) -> tuple:
+    """Reject infeasible/illegal COAs before scoring. Returns (viable, reason)."""
+    ships = int((assets or {}).get("combat_ships") or 0)
+    budget = int((assets or {}).get("budget_available") or 0)
+    need_ships = int((coa.get("required_assets") or {}).get("combat_ships") or 0)
+    need_budget = int(coa.get("required_budget") or 0)
+    if need_ships > ships:
+        return False, f"insufficient combat ships ({ships} < {need_ships})"
+    if need_budget > budget:
+        return False, f"budget cannot reserve {need_budget} (available {budget})"
+    if coa.get("coa_type") == "seek_ceasefire" and (op.get("target_faction") in MemoryStore.CRIMINAL_FACTIONS):
+        return False, "target faction does not negotiate"
+    return True, ""
+
+
+# Per-COA baseline wargame profile (deterministic). Keys: success, frisk(friendly loss risk), enemy(loss potential),
+# esc(escalation risk), trade(trade protection), speed, flex(flexibility), aggr(aggression), profit.
+_OPORD_COA_PROFILE = {
+    "defensive_posture":     {"success": 0.55, "frisk": 0.15, "enemy": 0.10, "esc": 0.10, "trade": 0.55, "speed": 0.90, "flex": 0.50, "aggr": 0.10, "profit": 0.00},
+    "organic_patrol":        {"success": 0.62, "frisk": 0.31, "enemy": 0.22, "esc": 0.22, "trade": 0.70, "speed": 0.65, "flex": 0.60, "aggr": 0.40, "profit": 0.00},
+    "hire_contractors":      {"success": 0.58, "frisk": 0.05, "enemy": 0.20, "esc": 0.15, "trade": 0.65, "speed": 0.55, "flex": 0.70, "aggr": 0.30, "profit": 0.10},
+    "raid_enemy_logistics":  {"success": 0.50, "frisk": 0.45, "enemy": 0.60, "esc": 0.60, "trade": 0.30, "speed": 0.60, "flex": 0.40, "aggr": 0.90, "profit": 0.30},
+    "request_allied_support": {"success": 0.50, "frisk": 0.10, "enemy": 0.20, "esc": 0.20, "trade": 0.50, "speed": 0.40, "flex": 0.80, "aggr": 0.30, "profit": 0.00},
+    "seek_ceasefire":        {"success": 0.40, "frisk": 0.00, "enemy": 0.00, "esc": 0.00, "trade": 0.60, "speed": 0.50, "flex": 0.50, "aggr": 0.00, "profit": 0.00},
+    "request_supplies":      {"success": 0.60, "frisk": 0.00, "enemy": 0.00, "esc": 0.00, "trade": 0.55, "speed": 0.55, "flex": 0.60, "aggr": 0.00, "profit": 0.10},
+    "escort_supply_convoy":  {"success": 0.65, "frisk": 0.20, "enemy": 0.10, "esc": 0.10, "trade": 0.70, "speed": 0.55, "flex": 0.50, "aggr": 0.20, "profit": 0.00},
+}
+
+
+def opord_wargame_coa(coa: dict, op: dict, assets: dict) -> dict:
+    """Deterministic outcome estimate for a COA (same inputs → same output). Ship advantage vs threat magnitude
+    nudges success up / friendly risk down, bounded."""
+    p = _OPORD_COA_PROFILE.get(coa.get("coa_type"), {"success": 0.4, "frisk": 0.2, "enemy": 0.1, "esc": 0.2,
+                                                     "trade": 0.4, "speed": 0.5, "flex": 0.4, "aggr": 0.2, "profit": 0.0})
+    ships = int((assets or {}).get("combat_ships") or 0)
+    mag = float((op.get("evidence_json") or {}).get("magnitude") or 1.0)
+    adv = max(-0.20, min(0.20, (ships - mag) * 0.02))
+    return {"success": round(_op_clamp01(p["success"] + adv), 3),
+            "friendly_loss_risk": round(_op_clamp01(p["frisk"] - adv), 3),
+            "enemy_loss_potential": p["enemy"], "escalation_risk": p["esc"], "trade_protection": p["trade"],
+            "cost": int(coa.get("required_budget") or 0), "time_to_effect": coa.get("expected_duration") or 1800,
+            "_speed": p["speed"], "_flex": p["flex"], "_aggr": p["aggr"], "_profit": p["profit"],
+            "enemy_most_likely": opord_enemy_reaction(op.get("target_faction"))}
+
+
+def opord_score_coa(wargame: dict, weights: dict) -> tuple:
+    """Doctrine-weighted score (deterministic). Maps wargame metrics → normalized [0,1] scoring dimensions."""
+    dims = {
+        "mission_success": wargame["success"],
+        "force_protection": 1.0 - wargame["friendly_loss_risk"],
+        "trade_protection": wargame["trade_protection"],
+        "speed": wargame["_speed"],
+        "budget_efficiency": 1.0 - min(1.0, float(wargame["cost"]) / 300000.0),
+        "political_acceptability": 1.0 - wargame["escalation_risk"],
+        "flexibility": wargame["_flex"],
+        "aggression": wargame["_aggr"],
+        "profit": wargame["_profit"],
+    }
+    score = sum(float(w) * dims.get(k, 0.0) for k, w in weights.items())
+    return round(score, 4), {k: round(dims.get(k, 0.0), 3) for k in weights}
+
+
+# =================== OPORD Phase 5: OPORD generator (SMESC + annexes + task derivation) =======================
+# Phase sequencing per selected COA — the "phases" line of Annex A / Execution.
+OPORD_PHASES = {
+    "defensive_posture":     ["Establish defensive posture", "Screen the sector", "Hold until pressure abates"],
+    "organic_patrol":        ["Recon sector", "Deploy patrol", "Intercept hostile pressure", "Hold until trade resumes"],
+    "hire_contractors":      ["Post contract", "Brief contractors", "Sustain patrol coverage", "Verify proof"],
+    "raid_enemy_logistics":  ["Locate enemy logistics", "Strike the target", "Assess damage", "Withdraw"],
+    "request_allied_support": ["Request support", "Coordinate forces", "Joint operation", "Consolidate"],
+    "seek_ceasefire":        ["Open channel", "Propose terms", "Await response", "Implement / fall back"],
+}
+
+
+def opord_build_smesc(op: dict, coa: dict) -> dict:
+    """Build the machine-readable SMESC OPORD from the operation + its selected COA. Player-readable strings come
+    from the deterministic mission/intent/end-state; an optional LLM prose wrapper is a later/optional step."""
+    faction = op.get("faction_id") or ""
+    sector = op.get("target_sector") or "the contested zone"
+    target = op.get("target_faction") or "hostile forces"
+    analysis = op.get("mission_analysis_json") or {}
+    assets = analysis.get("available_assets") or {}
+    constraints = op.get("constraints_json") or analysis.get("constraints") or []
+    coa_tasks = coa.get("tasks_json") or []
+    wargame = coa.get("wargame_json") or {}
+    exec_tasks = []
+    for t in coa_tasks:
+        exec_tasks.append({"unit": f"{faction}_{coa.get('coa_type', 'force')}", "task": t.get("task_type"),
+                           "sector": t.get("sector") or sector, "target_faction": t.get("target_faction")})
+    return {
+        "situation": {
+            "enemy": opord_enemy_reaction(target),
+            "friendly": f"{faction} has {int(assets.get('combat_ships') or 0)} combat ships available.",
+            "civil_economic": (f"Trade disruption is affecting {faction} logistics." if sector else ""),
+            "constraints": list(constraints),
+        },
+        "mission": op.get("mission_statement") or "",
+        "execution": {
+            "intent": op.get("commander_intent") or "",
+            "phases": OPORD_PHASES.get(coa.get("coa_type"), ["Execute", "Assess", "Consolidate"]),
+            "tasks": exec_tasks,
+            "coordinating_instructions": list(constraints) + ["report hostile contact",
+                                                              "withdraw if outmatched by capital-class enemy"],
+        },
+        "service_support": {
+            "budget_reserved": int(coa.get("required_budget") or 0),
+            "repair_policy": f"return damaged ships to nearest {faction} station",
+            "logistics_needs": ["energycells", "hullparts"],
+        },
+        "command_signal": {
+            "commander": f"{faction} High Command",
+            "reports": ["contact", "loss", "sector_clear", "mission_complete"],
+            "frago_triggers": ["enemy_reinforcement", "budget_exceeded", "friendly_losses_high", "job_unclaimed"],
+        },
+    }
+
+
+def opord_build_annexes(op: dict, coa: dict) -> dict:
+    """Annexes A/B/D/E/R-S/Q as JSON sub-documents (attached to military_operations.annexes_json)."""
+    sector = op.get("target_sector") or "the sector"
+    constraints = op.get("constraints_json") or []
+    coa_tasks = coa.get("tasks_json") or []
+    wargame = coa.get("wargame_json") or {}
+    return {
+        "A_conduct": {"phases": OPORD_PHASES.get(coa.get("coa_type"), []),
+                      "abort_conditions": ["capital-class enemy arrives", "friendly losses exceed tolerance"]},
+        "B_task_org": {"course_of_action": coa.get("coa_type"),
+                       "tasks": [t.get("task_type") for t in coa_tasks]},
+        "D_intel": {"enemy_most_likely": wargame.get("enemy_most_likely", ""),
+                    "enemy_strength": (op.get("evidence_json") or {}).get("magnitude"),
+                    "intel_gaps": ["enemy reinforcement timing"]},
+        "E_rules": {"roe": ["respond only", "avoid neutral shipping"], "constraints": list(constraints),
+                    "excluded_enemies": []},
+        "RS_sustainment": {"budget_reserved": int(coa.get("required_budget") or 0),
+                           "repair_policy": f"nearest {op.get('faction_id', '')} station",
+                           "supply_requirements": ["energycells", "hullparts"]},
+        "Q_command": {"reports": ["contact", "loss", "sector_clear", "mission_complete"],
+                      "frago_triggers": ["enemy_reinforcement", "budget_exceeded", "friendly_losses_high", "job_unclaimed"]},
+    }
+
+
+def run_oport_selftest() -> dict:
+    """Oracle for OPORD Phase 1 (schema + repository): create op, DEDUPE active threat into one op, different
+    threat → new op, JSON round-trip, attach COAs/tasks/reports, operation_detail aggregates, conclude →
+    terminal status, and a recurring threat (after conclusion) spawns a FRESH op (dedupe index frees it)."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_oport_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "ops.sqlite3")
+        sid, tk = "s", "s:argon:sector_pressure:teladi:silent_witness_i"
+        a = store.create_or_get_operation(sid, "argon", "defensive_posture", tk,
+                                          target_faction="teladi", target_sector="Silent Witness I",
+                                          urgency=4, importance=5)
+        check("created_new", a["created"] is True and a["id"].startswith("op_argon_"), str(a))
+        b = store.create_or_get_operation(sid, "argon", "defensive_posture", tk)
+        check("dedupe_same_threat", b["created"] is False and b["id"] == a["id"], str(b))
+        c = store.create_or_get_operation(sid, "paranid", "raid_pressure", "s:paranid:raid:khaak:frontier")
+        check("different_threat_new_op", c["created"] is True and c["id"] != a["id"])
+        op_id = a["id"]
+        store.update_operation(op_id, status="analysing", mission_statement="Secure SW-I",
+                               opord_json={"mission": "secure"})
+        op = store.get_operation(op_id)
+        check("json_roundtrip", isinstance(op.get("opord_json"), dict) and op["opord_json"]["mission"] == "secure", str(op.get("opord_json")))
+        check("status_updated", op["status"] == "analysing")
+        coa1 = store.attach_coa(op_id, "organic_patrol", "Deploy patrol", [{"task_type": "patrol_sector"}], required_budget=120000)
+        store.attach_coa(op_id, "hire_contractors", "Hire", [{"task_type": "post_contract"}],
+                         viability_status="rejected", rejection_reason="no budget")
+        t1 = store.attach_task(op_id, "patrol_sector", status="planned", coa_id=coa1, target_sector="Silent Witness I")
+        store.attach_report(op_id, "sitrep", "Patrol deployed", severity=1, evidence={"ships": 3})
+        det = store.operation_detail(op_id)
+        check("coas_attached", len(det["coas"]) == 2)
+        check("tasks_attached", len(det["tasks"]) == 1 and det["tasks"][0]["id"] == t1)
+        check("reports_attached", len(det["reports"]) == 1)
+        check("report_evidence_decoded", det["reports"][0].get("evidence_json", {}).get("ships") == 3)
+        store.conclude_operation(op_id, "completed", "secured")
+        cop = store.get_operation(op_id)
+        check("concluded_terminal", cop["status"] == "completed" and cop["conclusion_status"] == "completed")
+        e = store.create_or_get_operation(sid, "argon", "defensive_posture", tk)
+        check("recurring_threat_new_op", e["created"] is True and e["id"] != op_id, str(e))
+        check("list_has_active", any(o["id"] == e["id"] for o in store.list_operations(sid, "warning")))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_opord_events_selftest() -> dict:
+    """Oracle for OPORD Phase 8: a milestone (opord_issued) emits ONE world_event linked to the op (source
+    opord:<id>) that lands in the durable history (→ NPC briefings); repeated FRAGO milestones inside the gate
+    cooldown emit only ONCE (anti-spam); operation_completed routes as a critical event."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_opordevents_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "opordevents.sqlite3")
+        sid = "s"
+        store.upsert_fleet_strength(sid, "argon", fight=6, total_ships=12)
+        op = store.create_or_get_operation(sid, "argon", "sector_pressure",
+                                           "s:argon:sector_pressure:teladi:swi", status="warning",
+                                           target_faction="teladi", target_sector="Silent Witness I",
+                                           evidence_json={"magnitude": 4})["id"]
+        store.analyze_mission(op)
+        store.plan_operation_coas(op)
+        store.generate_opord(op)  # emits opord_issued
+        evs = store.list_operation_events(op)
+        check("opord_issued_emitted", any(e["event_type"] == "opord_issued" for e in evs), str(len(evs)))
+        check("linked_source", all(e.get("source") == "opord:" + op for e in evs) and len(evs) >= 1)
+        opd = store.get_operation(op)
+        e1 = store.emit_operation_event(opd, "frago_issued", 3, "FRAGO 1")
+        e2 = store.emit_operation_event(opd, "frago_issued", 3, "FRAGO 2")
+        check("frago_first_emits", e1.get("emitted") is True, str(e1))
+        check("frago_cooldown_blocks_second", e2.get("emitted") is False, str(e2))
+        check("one_frago_event", len([e for e in store.list_operation_events(op) if e["event_type"] == "frago_issued"]) == 1)
+        e3 = store.emit_operation_event(opd, "operation_completed", 4, "secured")
+        check("completed_emitted_critical", e3.get("emitted") is True and e3.get("tier") == "critical", str(e3))
+        allwe = store.list_world_events(sid, limit=50)
+        check("in_durable_history", any((w.get("source") or "").startswith("opord:") for w in allwe))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_opord_e2e_selftest() -> dict:
+    """OPORD Phase 10 — END-TO-END integration on the REAL pipeline (advance_operations), proving the phases
+    COMPOSE (not just pass in isolation) against the spec's live-validation acceptance: one pressure → one op;
+    repeated pressure → SAME op; jobs don't duplicate; reward escalates via FRAGO; op concludes from evidence +
+    cleans up; a recurring threat after conclusion spawns a fresh op. (The in-game run is the separate ◐ gate.)"""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_opord_e2e_")
+    try:
+        store = MemoryStore(Path(d) / "e2e.sqlite3")
+        sid = "game_e2e"
+        # Argon: NO combat ships (forces the external job route) + owned stations (budget capacity for contractors).
+        store.upsert_fleet_strength(sid, "argon", fight=0, total_ships=2)
+        store.upsert_economy_station(sid, {"station_id": "arg1", "faction_id": "argon", "sector_id": "Silent Witness I"})
+        store.upsert_economy_station(sid, {"station_id": "arg2", "faction_id": "argon", "sector_id": "Silent Witness I"})
+
+        def hit(mag=5, ts=None):
+            ev = {"attacker_faction": "teladi", "victim_faction": "argon", "sector": "Silent Witness I", "magnitude": mag}
+            if ts is not None:
+                ev["ts"] = ts
+            store.add_hostile_event(sid, ev)
+
+        # 1) Teladi pressure → full pipeline → ONE operation.
+        for _ in range(3):
+            hit()
+        store.advance_operations(sid)
+        ops = store.list_operations(sid)
+        check("one_operation", len(ops) == 1, str(len(ops)))
+        op = ops[0]
+        op_id = op["id"]
+        check("argon_vs_teladi_swi", op["faction_id"] == "argon" and op["target_faction"] == "teladi"
+              and op["target_sector"] == "Silent Witness I", str({k: op.get(k) for k in ("faction_id", "target_faction", "target_sector")}))
+        check("reached_active", op["status"] in ("active", "opord_issued"), op["status"])
+        check("has_selected_coa", bool(op.get("selected_coa_id")))
+
+        # 2) Repeated pressure → SAME op (dedup).
+        for _ in range(2):
+            hit(4)
+        store.advance_operations(sid)
+        check("repeated_pressure_same_op", len(store.list_operations(sid)) == 1)
+
+        # 3) Jobs don't duplicate across repeated advances.
+        for _ in range(3):
+            store.advance_operations(sid)
+        op_jobs = [j for j in store.list_jobs(sid, "open") if j["operation_id"] == op_id]
+        check("one_open_job_no_dup", len(op_jobs) == 1, str(len(op_jobs)))
+
+        # 4) Unclaimed job → reward escalates via FRAGO (budget-gated).
+        if op_jobs:
+            job = op_jobs[0]
+            with store._connect() as conn:
+                conn.execute("UPDATE market_jobs SET created_at=? WHERE id=?", (time.time() - 700, job["id"]))
+                conn.commit()
+            store.assess_operation(op_id)
+            j2 = [j for j in store.list_jobs(sid, "open") if j["id"] == job["id"]]
+            check("reward_escalated", bool(j2) and int(j2[0]["reward"]) > int(job["reward"]),
+                  f"{job['reward']}->{j2 and j2[0].get('reward')}")
+
+        # 5) Pressure abates (events pre-date activation) + age ≥ MIN → conclude completed.
+        now = time.time()
+        with store._connect() as conn:
+            conn.execute("UPDATE hostile_events SET ts=? WHERE save_id=?", (now - 5000, sid))
+            conn.commit()
+        store.update_operation(op_id, activated_at=now - 400)
+        store.assess_operation(op_id)
+        check("concluded_completed", store.get_operation(op_id)["status"] == "completed", store.get_operation(op_id)["status"])
+
+        # 6) Conclusion cleaned up linked jobs (no open jobs for this op).
+        check("cleanup_no_open_jobs", len([j for j in store.list_jobs(sid, "open") if j["operation_id"] == op_id]) == 0)
+
+        # 7) Recurring threat AFTER conclusion → a fresh operation.
+        hit(6, ts=now)
+        store.advance_operations(sid)
+        check("recurring_threat_new_op", len(store.list_operations(sid)) == 2)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_threat_sources_selftest() -> dict:
+    """Oracle for the P1a feed broadening: NON-combat threat sources. An economy shortage creates a
+    supply_shortage op that gets SUPPLY COAs (not military) and a supply/escort job; a broken agreement creates an
+    agreement_breakdown op against the breaker; sources dedupe like combat threats."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_threatsrc_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "src.sqlite3")
+        sid = "s"
+        # economy shortage (alliance) + stations so it can still fund a supply contract. NOTE budget_capacity =
+        # stations × 250k × production_health, so a low-health shortage faction needs enough stations to afford
+        # contractors — 3 stations × 0.3 ≈ 225k covers the 100k/120k supply COAs.
+        for i in range(3):
+            store.upsert_economy_station(sid, {"station_id": f"al{i}", "faction_id": "alliance"})
+        store.upsert_economy(sid, "alliance", production_health=0.3, shortages={"energycells": 0.8},
+                             key_needs=["energycells"])
+        r = store.recognize_threats(sid)
+        supply = [t for t in r["threats"] if "supply_shortage" in t["threat_key"]]
+        check("economy_supply_op", len(supply) == 1, str(r["threats"]))
+        op = store.get_operation(supply[0]["op_id"])
+        check("op_type_supply", op["operation_type"] == "supply_shortage")
+        store.advance_operations(sid)
+        det = store.operation_detail(supply[0]["op_id"])
+        sel = [c for c in det["coas"] if c.get("selected")]
+        check("supply_coa_selected", bool(sel) and sel[0]["coa_type"] in
+              ("request_supplies", "escort_supply_convoy", "hire_contractors"), str(sel and sel[0].get("coa_type")))
+        check("supply_op_progressed", store.get_operation(supply[0]["op_id"])["status"] in
+              ("active", "opord_issued", "coa_generated"))
+        # agreement breakdown source
+        store.add_agreement(sid, "argon", "teladi", type="ceasefire", status="broken")
+        r2 = store.recognize_threats(sid)
+        ab = [t for t in r2["threats"] if "agreement_breakdown" in t["threat_key"]]
+        check("agreement_breakdown_op", len(ab) == 1, str(r2["threats"]))
+        abop = store.get_operation(ab[0]["op_id"])
+        check("ab_op_targets_breaker", abop["operation_type"] == "agreement_breakdown" and abop["target_faction"] == "teladi")
+        # dedup: economy + agreement sources don't multiply on re-scan
+        n_before = len(store.list_operations(sid))
+        store.recognize_threats(sid)
+        check("sources_dedup", len(store.list_operations(sid)) == n_before, str(n_before))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_opord_lease_selftest() -> dict:
+    """Oracle for the OPORD Execution Authority spine (Phase A+B): a ship can't be leased twice; a higher-priority
+    OPORD overrides a lower one (old lease released); the order/event lifecycle drives the task; release is
+    idempotent; operation closeout releases leases + cancels force requests; force requests dedup + escalate."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_lease_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "lease.sqlite3")
+        sid = "s"
+
+        def aop(k):
+            return store.create_or_get_operation(sid, "argon", "sector_pressure", k, status="active",
+                                                 target_faction="teladi", target_sector="X")["id"]
+
+        op = aop("s:argon:sp:teladi:l1")
+        t1 = store.attach_task(op, "patrol_sector", status="issued")
+        r1 = store.lease_asset(sid, op, t1, "argon", "ship_1", ship_name="ANL Vanguard", sector="X", priority=2)
+        check("lease_ok", r1["ok"] and bool(r1.get("lease_id")), str(r1))
+        l1 = r1["lease_id"]
+        op2 = aop("s:argon:sp:teladi:l2")
+        r2 = store.lease_asset(sid, op2, store.attach_task(op2, "patrol_sector", status="issued"), "argon", "ship_1", priority=1)
+        check("lease_twice_blocked", r2["ok"] is False and r2.get("blocked") is True, str(r2))
+        op3 = aop("s:argon:sp:teladi:l3")
+        r3 = store.lease_asset(sid, op3, store.attach_task(op3, "patrol_sector", status="issued"), "argon", "ship_1", priority=5)
+        check("priority_override", r3["ok"] is True and r3["lease_id"] != l1, str(r3))
+        old = [x for x in store.list_leases(sid) if x["lease_id"] == l1][0]
+        check("old_lease_released", old["status"] == "released")
+        # order/event lifecycle → task completion from observed execution
+        store.mark_order_issued(sid, r3["lease_id"], "order_99")
+        store.record_order_event(sid, r3["lease_id"], "arrived")
+        store.record_order_event(sid, r3["lease_id"], "completed", {"sector": "X"})
+        l3 = [x for x in store.list_leases(sid) if x["lease_id"] == r3["lease_id"]][0]
+        check("order_completed", l3["status"] == "completed")
+        check("task_done_on_complete", any(t["status"] == "completed" for t in store.operation_detail(op3)["tasks"]))
+        check("release_idempotent_terminal", store.release_asset(sid, r3["lease_id"], "x").get("noop") is True)
+        # closeout releases an active lease
+        op4 = aop("s:argon:sp:teladi:l4")
+        store.lease_asset(sid, op4, store.attach_task(op4, "patrol_sector", status="issued"), "argon", "ship_4", priority=1)
+        cc = store.conclude_operation(op4, "completed", "done")
+        check("closeout_releases_leases", cc.get("leases_released") == 1, str(cc))
+        # force-request dedup + escalate + cancel on conclude
+        fr1 = store.create_or_update_force_request(sid, op, t1, "argon", "X", "patrol", priority=2, reward_budget=50000)
+        check("force_req_created", fr1["created"] is True)
+        fr2 = store.create_or_update_force_request(sid, op, t1, "argon", "X", "patrol", priority=4, reward_budget=80000)
+        check("force_req_dedup", fr2["created"] is False and fr2["request_id"] == fr1["request_id"])
+        check("force_req_cancelled_on_conclude", store.conclude_operation(op, "completed", "done").get("force_requests_cancelled") >= 1)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_execution_lifecycle_selftest() -> dict:
+    """Oracle for the #1 execution build: job fulfillment SPENDS budget + completes the linked task (no success
+    from intent — fulfillment proof required); claim works; complete is idempotent; and OFFENSIVE tasks complete
+    from REAL combat evidence (our forces inflicting losses on the target), logging a BDA report."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_exec_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "exec.sqlite3")
+        sid = "s"
+        now = time.time()
+        op = store.create_or_get_operation(sid, "argon", "sector_pressure", "s:argon:sp:teladi:ex", status="active",
+                                           target_faction="teladi", target_sector="X", budget_reserved=200000,
+                                           activated_at=now - 50)["id"]
+        t1 = store.attach_task(op, "post_patrol_contract", status="issued")
+        job = store.create_or_update_job(sid, "argon", "patrol", target_sector="X", reward=80000,
+                                         operation_id=op, operation_task_id=t1)
+        check("claim_works", store.claim_job(sid, job["id"], "Player")["ok"] is True)
+        res = store.complete_job(sid, job["id"], claimant="Player")
+        check("job_completed_spent", res["status"] == "completed" and res["reward_spent"] == 80000, str(res))
+        det = store.operation_detail(op)
+        tk = [t for t in det["tasks"] if t["id"] == t1][0]
+        check("linked_task_completed", tk["status"] == "completed" and bool(tk.get("completed_at")))
+        check("op_budget_spent", int(store.get_operation(op)["budget_spent"]) == 80000)
+        check("faction_budget_spent", store.budget_spent(sid, "argon") == 80000)
+        check("task_update_report", any(r["report_type"] == "task_update" for r in det["reports"]))
+        check("complete_idempotent", store.complete_job(sid, job["id"]).get("noop") is True)
+        # offensive task completes from REAL evidence (our kills on the target)
+        op2 = store.create_or_get_operation(sid, "argon", "raid_pressure", "s:argon:rp:teladi:y", status="active",
+                                            target_faction="teladi", target_sector="Y", activated_at=now - 50)["id"]
+        rt = store.attach_task(op2, "raid_enemy_logistics", status="issued")
+        store.add_hostile_event(sid, {"attacker_faction": "argon", "victim_faction": "teladi", "sector": "Y",
+                                      "magnitude": 4, "ts": now})
+        store.assess_operation(op2)
+        det2 = store.operation_detail(op2)
+        rtk = [t for t in det2["tasks"] if t["id"] == rt][0]
+        check("raid_task_done_from_evidence", rtk["status"] == "completed", rtk["status"])
+        check("bda_report", any(r["report_type"] == "bda" for r in det2["reports"]))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_ops_health_selftest() -> dict:
+    """Oracle for OPORD Phase 9 operational health warnings — each warning fires for the right op, and a coherent
+    op stays clean. Includes the cleanup-regression detectors (concluded op with open jobs / pending agreements)."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_health_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "health.sqlite3")
+        sid = "s"
+
+        def mk(tkey, status, **f):
+            return store.create_or_get_operation(sid, "argon", "sector_pressure", tkey, status=status,
+                                                 target_faction="teladi", target_sector="X", **f)["id"]
+
+        def health():
+            return {h["op_id"]: h["warnings"] for h in store.operations_health(sid)["unhealthy"]}
+
+        a = mk("s:argon:sp:teladi:a", "active")
+        store.attach_task(a, "patrol_sector", status="issued", job_id="j")
+        store.attach_report(a, "sitrep", "x")
+        check("no_selected_coa", "no_selected_coa" in health().get(a, []), str(health().get(a)))
+
+        b = mk("s:argon:sp:teladi:b", "opord_issued", selected_coa_id="coa_x")
+        store.attach_report(b, "sitrep", "x")
+        check("opord_no_tasks", "opord_no_tasks" in health().get(b, []))
+
+        c = mk("s:argon:sp:teladi:c", "active", selected_coa_id="coa_x", budget_reserved=100000)
+        store.attach_task(c, "patrol_sector", status="planned")  # no links
+        store.attach_report(c, "sitrep", "x")
+        check("budget_reserved_no_link", "budget_reserved_no_link" in health().get(c, []))
+
+        e = mk("s:argon:sp:teladi:e", "active", selected_coa_id="coa_x")
+        store.create_or_update_job(sid, "argon", "patrol", target_sector="X", reward=1000, operation_id=e)
+        store.update_operation(e, status="completed")  # bypass conclude → simulate a cleanup LEAK
+        check("concluded_open_jobs", "concluded_open_jobs" in health().get(e, []))
+
+        f = mk("s:argon:sp:teladi:f", "active", selected_coa_id="coa_x")
+        store.add_agreement(sid, "argon", "", type="alliance", status="pending", terms={"operation_id": f})
+        store.update_operation(f, status="completed")
+        check("concluded_pending_agreements", "concluded_pending_agreements" in health().get(f, []))
+
+        g = mk("s:argon:sp:teladi:g", "active", selected_coa_id="coa_x")
+        store.attach_task(g, "patrol_sector", status="issued", job_id="j")
+        for _ in range(3):
+            store.attach_report(g, "frago", "f")
+        check("repeated_fragos", "repeated_fragos_no_progress" in health().get(g, []))
+
+        h2 = mk("s:argon:sp:teladi:h", "active", selected_coa_id="coa_x")
+        store.attach_task(h2, "patrol_sector", status="issued", job_id="j")
+        store.attach_report(h2, "sitrep", "x")
+        check("healthy_op_clean", h2 not in health(), str(health().get(h2)))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_opord_cleanup_selftest() -> dict:
+    """Oracle for the P7 hardening (Codex audit #2/#4): conclusion RELEASES unused reserved budget, CANCELS linked
+    open jobs, EXPIRES linked pending agreements, and is idempotent; reward escalation is GATED by the op's
+    reserved budget (no raise beyond reserved)."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_opordcleanup_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "cleanup.sqlite3")
+        sid = "s"
+        # active op with reserved 200000, spent 50000, a linked open job + a linked pending agreement.
+        op = store.create_or_get_operation(sid, "argon", "sector_pressure", "s:argon:sp:teladi:cl", status="active",
+                                           target_faction="teladi", target_sector="SW I",
+                                           budget_reserved=200000, budget_spent=50000)["id"]
+        job = store.create_or_update_job(sid, "argon", "patrol", target_sector="SW I", reward=80000,
+                                         operation_id=op, operation_task_id="t1")
+        ag = store.add_agreement(sid, "argon", "", type="alliance", status="pending",
+                                 terms={"operation_id": op, "kind": "allied_support"})
+        res = store.conclude_operation(op, "failed", "timed out")
+        check("budget_released", res["budget_released"] == 150000, str(res))
+        check("job_cancelled_count", res["jobs_cancelled"] == 1, str(res))
+        check("agreement_expired_count", res["agreements_expired"] == 1, str(res))
+        opd = store.get_operation(op)
+        check("reserved_down_to_spent", opd["budget_reserved"] == 50000)
+        check("status_failed", opd["status"] == "failed")
+        check("no_open_jobs_left", len([j for j in store.list_jobs(sid, "open") if j["operation_id"] == op]) == 0)
+        check("agreement_now_expired", any(a["id"] == ag["id"] and a["status"] == "expired"
+                                           for a in store.list_agreements(sid)))
+        # idempotent: concluding again cleans nothing new.
+        res2 = store.conclude_operation(op, "failed", "again")
+        check("idempotent_no_double_cleanup", res2["jobs_cancelled"] == 0 and res2["agreements_expired"] == 0, str(res2))
+
+        # reward escalation budget gate: a small reserved op can't raise reward beyond reserved.
+        now = time.time()
+        opB = store.create_or_get_operation(sid, "argon", "sector_pressure", "s:argon:sp:teladi:cl2", status="active",
+                                            target_faction="teladi", target_sector="B Sector",
+                                            budget_reserved=90000, activated_at=now - 100)["id"]
+        store.add_hostile_event(sid, {"attacker_faction": "teladi", "victim_faction": "argon",
+                                      "sector": "B Sector", "magnitude": 3, "ts": now})  # keep active
+        jb = store.create_or_update_job(sid, "argon", "patrol", target_sector="B Sector", reward=80000,
+                                        operation_id=opB, operation_task_id="tb")
+        with store._connect() as conn:
+            conn.execute("UPDATE market_jobs SET created_at=? WHERE id=?", (now - 700, jb["id"]))
+            conn.commit()
+        store.assess_operation(opB)
+        jrow = [j for j in store.list_jobs(sid, "open") if j["id"] == jb["id"]]
+        # reserved 90000 < 1.5×80000(=120000) → capped at 90000 (raised but bounded by reserved)
+        check("reward_capped_by_reserved", bool(jrow) and int(jrow[0]["reward"]) == 90000, str(jrow and jrow[0].get("reward")))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_assessment_frago_selftest() -> dict:
+    """Oracle for OPORD Phase 7: SITREP emitted; enemy reinforcement → FRAGO (allied proposal); unclaimed linked
+    job → FRAGO reward escalation; pressure abated + min age → completed; still-contested past max age → failed
+    (no hanging). Per-op sectors keep the seeded events isolated."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_frago_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "frago.sqlite3")
+        sid = "s"
+        now = time.time()
+
+        def active_op(tkey, offset, sector):
+            return store.create_or_get_operation(sid, "argon", "sector_pressure", tkey, status="active",
+                                                 target_faction="teladi", target_sector=sector,
+                                                 budget_reserved=200000, activated_at=now - offset)["id"]
+
+        # A+B: recent reinforcement + an old unclaimed linked job (age 100s < MIN, stays active).
+        opAB = active_op("s:argon:sp:teladi:ab", 100, "AB Sector")
+        store.add_hostile_event(sid, {"attacker_faction": "teladi", "victim_faction": "argon",
+                                      "sector": "AB Sector", "magnitude": 3, "ts": now})
+        job = store.create_or_update_job(sid, "argon", "patrol", target_sector="AB Sector", target_faction="teladi",
+                                         reward=80000, operation_id=opAB, operation_task_id="t1")
+        with store._connect() as conn:
+            conn.execute("UPDATE market_jobs SET created_at=? WHERE id=?", (now - 700, job["id"]))
+            conn.commit()
+        rAB = store.assess_operation(opAB)
+        check("reinforcement_frago", "enemy_reinforcement" in rAB["fragos"], str(rAB))
+        check("job_unclaimed_frago", "job_unclaimed" in rAB["fragos"])
+        jrow = [j for j in store.list_jobs(sid, "open") if j["id"] == job["id"]][0]
+        check("reward_escalated", int(jrow["reward"]) == 120000, str(jrow.get("reward")))
+        check("ab_still_active", store.get_operation(opAB)["status"] == "active")
+        det = store.operation_detail(opAB)
+        check("sitrep_emitted", any(r["report_type"] == "sitrep" for r in det["reports"]))
+        check("frago_reports", sum(1 for r in det["reports"] if r["report_type"] == "frago") >= 2)
+
+        # C: pressure abated (no events in its sector) + age >= MIN → completed.
+        opC = active_op("s:argon:sp:teladi:c", 400, "C Sector")
+        rC = store.assess_operation(opC)
+        check("abated_completed", rC["outcome"] == "completed" and store.get_operation(opC)["status"] == "completed")
+
+        # D: still contested + age >= MAX → failed (no hanging forever).
+        opD = active_op("s:argon:sp:teladi:d", 4000, "D Sector")
+        store.add_hostile_event(sid, {"attacker_faction": "teladi", "victim_faction": "argon",
+                                      "sector": "D Sector", "magnitude": 2, "ts": now})
+        rD = store.assess_operation(opD)
+        check("timeout_failed", rD["outcome"] == "failed" and store.get_operation(opD)["status"] == "failed")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_execution_routing_selftest() -> dict:
+    """Oracle for OPORD Phase 6: tasks route to the right mechanism — patrol+ships→internal fleet, patrol w/o
+    ships→patrol job, supply→one durable job (deduped), allied_support→agreement proposal, ceasefire→agreement;
+    tasks get linked (job_id/agreement_id/order_id) + marked issued; op advances opord_issued→active."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_route_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "route.sqlite3")
+        sid = "s"
+
+        def issued_op(tkey, ships):
+            op_id = store.create_or_get_operation(sid, "argon", "sector_pressure", tkey, status="opord_issued",
+                                                  target_faction="teladi", target_sector="Silent Witness I",
+                                                  urgency=3,
+                                                  mission_analysis_json={"available_assets": {"combat_ships": ships}})["id"]
+            return op_id
+
+        # op with ships=4: patrol→internal, supply→job, allied→agreement, ceasefire→agreement
+        op1 = issued_op("s:argon:sector_pressure:teladi:a1", 4)
+        store.attach_task(op1, "patrol_sector", status="planned", target_sector="Silent Witness I")
+        store.attach_task(op1, "request_supplies", status="planned")
+        store.attach_task(op1, "request_allied_support", status="planned")
+        store.attach_task(op1, "seek_ceasefire", status="planned", target_faction="teladi")
+        r1 = store.route_operation(op1)
+        routes = {x["route"] for x in r1["routes"]}
+        check("patrol_internal", "internal_fleet" in routes, str(routes))
+        check("supply_job", "job:supply" in routes)
+        check("allied_agreement", "agreement:allied" in routes)
+        check("ceasefire_agreement", "agreement:ceasefire" in routes)
+        check("op_active", store.get_operation(op1)["status"] == "active")
+        det1 = store.operation_detail(op1)
+        check("tasks_issued", all(t["status"] == "issued" for t in det1["tasks"]))
+        check("tasks_linked", all((t.get("job_id") or t.get("agreement_id") or t.get("order_id")) for t in det1["tasks"]))
+
+        # supply dedupe: a second op, same faction+sector supply → still ONE open supply job
+        op2 = issued_op("s:argon:sector_pressure:teladi:a2", 4)
+        store.attach_task(op2, "request_supplies", status="planned")
+        store.route_operation(op2)
+        supply_jobs = [j for j in store.list_jobs(sid, "open") if j["job_type"] == "supply"]
+        check("supply_deduped_to_one", len(supply_jobs) == 1, str(len(supply_jobs)))
+
+        # patrol WITHOUT ships → patrol job
+        op0 = issued_op("s:argon:sector_pressure:teladi:a0", 0)
+        store.attach_task(op0, "patrol_sector", status="planned", target_sector="Silent Witness I")
+        r0 = store.route_operation(op0)
+        check("patrol_job_no_ships", any(x["route"] == "job:patrol" for x in r0["routes"]), str(r0["routes"]))
+        check("agreement_created", len(store.list_agreements(sid, "pending")) >= 2)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_opord_generator_selftest() -> dict:
+    """Oracle for OPORD Phase 5: selected COA → SMESC opord (all 5 sections) + all 6 annexes + executable tasks
+    derived from the COA (every task maps back to the selected coa_id); status → opord_issued + issued_at; budget
+    reserved equals the selected COA's required_budget; mission is player-readable."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_opordgen_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "opordgen.sqlite3")
+        sid = "s"
+        store.upsert_fleet_strength(sid, "argon", fight=6, total_ships=12)
+        op = store.create_or_get_operation(sid, "argon", "sector_pressure",
+                                           "s:argon:sector_pressure:teladi:silent_witness_i", status="warning",
+                                           target_faction="teladi", target_sector="Silent Witness I",
+                                           evidence_json={"magnitude": 4})["id"]
+        store.analyze_mission(op)
+        store.plan_operation_coas(op)
+        r = store.generate_opord(op)
+        check("ok", r.get("ok") is True, str(r))
+        check("tasks_derived", len(r.get("tasks", [])) >= 1)
+        opd = store.get_operation(op)
+        check("status_opord_issued", opd["status"] == "opord_issued" and bool(opd.get("issued_at")))
+        smesc = opd.get("opord_json") or {}
+        for sec in ("situation", "mission", "execution", "service_support", "command_signal"):
+            check("smesc_" + sec, sec in smesc)
+        check("execution_tasks", len((smesc.get("execution") or {}).get("tasks") or []) >= 1)
+        check("mission_readable", bool(smesc.get("mission")))
+        ann = opd.get("annexes_json") or {}
+        for a in ("A_conduct", "B_task_org", "D_intel", "E_rules", "RS_sustainment", "Q_command"):
+            check("annex_" + a, a in ann)
+        det = store.operation_detail(op)
+        sel = [c for c in det["coas"] if c.get("selected")]
+        check("one_selected", len(sel) == 1)
+        check("budget_reserved_matches", opd.get("budget_reserved") == int((sel[0].get("required_budget") or 0)) if sel else False)
+        check("tasks_map_to_selected_coa", len(det["tasks"]) >= 1 and all(t.get("coa_id") == sel[0]["id"] for t in det["tasks"]) if sel else False)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_coa_engine_selftest() -> dict:
+    """Oracle for OPORD Phase 4: infeasible COAs rejected (0 assets), viable COAs scored + ONE selected, status →
+    coa_generated with selected_coa_id, selection is DETERMINISTIC (same inputs → same COA), and faction doctrine
+    changes the selection (argon vs split pick different COAs on identical inputs)."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_coa_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "coa.sqlite3")
+        sid = "s"
+
+        def make(fac, ships, budget, tkey):
+            return store.create_or_get_operation(
+                sid, fac, "sector_pressure", tkey, status="warning", target_faction="teladi",
+                target_sector="Silent Witness I", evidence_json={"magnitude": 4},
+                mission_analysis_json={"available_assets": {"combat_ships": ships, "budget_available": budget}})["id"]
+
+        # 1. impossible (0 assets): ship/budget COAs rejected; only no-asset COAs viable.
+        op0 = make("argon", 0, 0, "s:argon:sector_pressure:teladi:a0")
+        r0 = store.plan_operation_coas(op0)
+        rej = {c["type"] for c in r0["coas"] if not c["viable"]}
+        check("impossible_rejected", {"organic_patrol", "hire_contractors", "raid_enemy_logistics"} <= rej, str(rej))
+        check("selected_present", r0["selected"] is not None)
+        op0d = store.get_operation(op0)
+        check("status_coa_generated", op0d["status"] == "coa_generated" and op0d["selected_coa_id"] == r0["selected"]["coa_id"])
+
+        # 2. ample assets, argon.
+        opA = make("argon", 6, 200000, "s:argon:sector_pressure:teladi:aA")
+        rA = store.plan_operation_coas(opA)
+        check("argon_selected_viable", rA["selected"]["viable"] is True)
+
+        # 3. determinism: identical inputs (fresh op) → identical selected COA type.
+        opA2 = make("argon", 6, 200000, "s:argon:sector_pressure:teladi:aA2")
+        rA2 = store.plan_operation_coas(opA2)
+        check("deterministic_selection", rA2["selected"]["type"] == rA["selected"]["type"],
+              rA["selected"]["type"] + " vs " + rA2["selected"]["type"])
+
+        # 4. doctrine changes selection: split (aggression/speed-weighted) vs argon on identical assets.
+        opS = make("split", 6, 200000, "s:split:sector_pressure:teladi:aS")
+        rS = store.plan_operation_coas(opS)
+        check("doctrine_changes_selection", rS["selected"]["type"] != rA["selected"]["type"],
+              "argon=" + rA["selected"]["type"] + " split=" + rS["selected"]["type"])
+
+        # 5. rejected COAs carry a reason; selected COA is marked in the table.
+        det = store.operation_detail(opA)
+        sel = [c for c in det["coas"] if c.get("selected")]
+        check("one_selected_in_table", len(sel) == 1 and sel[0]["viability_status"] == "selected")
+        check("viable_has_wargame", all(c.get("wargame_json") for c in det["coas"] if c["viability_status"] == "viable"))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_mission_analysis_selftest() -> dict:
+    """Oracle for OPORD Phase 3: a warning op gets a full mission analysis (mission/intent/end-state/constraints/
+    CCIR + REAL assets), status advances warning→analysing, evidence is preserved, raid vs sector differ, and the
+    advance_operations pipeline driver runs clean."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_mission_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "mission.sqlite3")
+        sid = "s"
+        store.upsert_fleet_strength(sid, "argon", fight=4, total_ships=10)
+        op = store.create_or_get_operation(sid, "argon", "sector_pressure",
+                                           "s:argon:sector_pressure:teladi:silent_witness_i", status="warning",
+                                           target_faction="teladi", target_sector="Silent Witness I",
+                                           warning_order_json={"constraints": ["avoid full escalation if possible"],
+                                                               "ccir": ["enemy fleet strength"]},
+                                           evidence_json={"hostile_events": 2})
+        r = store.analyze_mission(op["id"])
+        a = r.get("analysis") or {}
+        check("ok", r.get("ok") is True)
+        check("mission_statement", "Silent Witness I" in a.get("mission_statement", ""), a.get("mission_statement"))
+        check("commander_intent", bool(a.get("commander_intent")))
+        check("desired_end_state", "stable" in a.get("desired_end_state", ""))
+        check("constraints_civilian", "protect civilian traffic" in a.get("constraints", []))
+        check("assets_combat_ships", (a.get("available_assets") or {}).get("combat_ships") == 4)
+        check("budget_field", "budget_available" in (a.get("available_assets") or {}))
+        check("ccir_present", len(a.get("ccir", [])) >= 1)
+        op2 = store.get_operation(op["id"])
+        check("status_analysing", op2["status"] == "analysing")
+        check("stored_mission", op2.get("mission_statement") == a.get("mission_statement"))
+        check("evidence_preserved", (op2.get("evidence_json") or {}).get("hostile_events") == 2)
+        opr = store.create_or_get_operation(sid, "argon", "raid_pressure", "s:argon:raid_pressure:xenon:frontier",
+                                            status="warning", target_faction="xenon", target_sector="Frontier")
+        ar = store.analyze_mission(opr["id"]).get("analysis") or {}
+        check("raid_variant", "raiders" in ar.get("commander_intent", "").lower())
+        adv = store.advance_operations(sid)
+        check("advance_ok", adv.get("ok") is True)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_threat_recognition_selftest() -> dict:
+    """Oracle for OPORD Phase 2: real hostile events → deduped warning-order ops. Repeated pressure UPDATES one
+    op (anti-spam); a different sector/aggressor makes a different op; criminal aggressor → raid_pressure;
+    evidence + warning order are populated; threat_key matches the spec format."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_threat_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "threat.sqlite3")
+        sid = "s"
+        for _ in range(2):
+            store.add_hostile_event(sid, {"attacker_faction": "teladi", "victim_faction": "argon",
+                                          "sector": "Silent Witness I", "magnitude": 5})
+        r1 = store.recognize_threats(sid)
+        check("created_one", r1["created"] == 1 and r1["updated"] == 0, str(r1))
+        op = store.get_operation(r1["threats"][0]["op_id"])
+        check("defender_is_argon_warning", op["faction_id"] == "argon" and op["status"] == "warning")
+        check("threat_key_format", op["threat_key"] == "s:argon:sector_pressure:teladi:silent_witness_i", op["threat_key"])
+        check("evidence_present", (op.get("evidence_json") or {}).get("hostile_events") == 2, str(op.get("evidence_json")))
+        check("warning_order_present", (op.get("warning_order_json") or {}).get("threat_type") == "sector_pressure")
+        r2 = store.recognize_threats(sid)              # repeat → updates the SAME op
+        check("dedupe_updates_same", r2["created"] == 0 and r2["updated"] == 1, str(r2))
+        check("still_one_op", len(store.list_operations(sid)) == 1)
+        store.add_hostile_event(sid, {"attacker_faction": "teladi", "victim_faction": "argon",
+                                      "sector": "Profit Center", "magnitude": 3})
+        store.recognize_threats(sid)
+        check("new_sector_new_op", len(store.list_operations(sid)) == 2)
+        store.add_hostile_event(sid, {"attacker_faction": "xenon", "victim_faction": "argon",
+                                      "sector": "Frontier Edge", "magnitude": 8})
+        r4 = store.recognize_threats(sid)
+        check("criminal_is_raid", any("raid_pressure" in t["threat_key"] for t in r4["threats"]), str(r4))
     finally:
         shutil.rmtree(d, ignore_errors=True)
     return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),

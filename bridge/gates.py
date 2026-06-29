@@ -29,6 +29,11 @@ ACTION_TIER: dict[str, str] = {
     "declare_war": "critical", "sue_for_peace": "critical", "form_alliance": "critical",
     "sector_change": "critical", "sector_lost": "critical", "station_destroyed": "critical",
     "fleet_wiped": "critical", "war_threshold": "critical", "peace": "critical",
+    "operation_completed": "critical", "objective_secured": "critical",
+    # OPORD operation milestones (military command layer) — strategic/policy so they make news without spamming
+    "opord_issued": "strategic", "operation_started": "strategic", "operation_failed": "strategic",
+    "major_contact": "strategic", "after_action_report": "policy", "frago_issued": "policy",
+    "warning_order_created": "local",
     # strategic — war-phase moves + sustained pressure
     "mobilize_fleet": "strategic", "raid_supply_line": "strategic", "fortify_sector": "strategic",
     "request_supplies": "strategic", "demand_reparations": "strategic", "war_exhaustion_warning": "strategic",

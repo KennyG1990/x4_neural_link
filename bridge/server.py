@@ -122,6 +122,71 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/memory/sweep_selftest":
             self._send_json(200, self.router.deceased_sweep_selftest())
             return
+        if parsed.path == "/api/ops/selftest":
+            self._send_json(200, self.router.oport_selftest())
+            return
+        if parsed.path == "/api/ops":
+            self._send_json(200, self.router.ops_list(
+                query.get("save_id", [""])[0], query.get("status", [""])[0]))
+            return
+        if parsed.path == "/api/ops/detail":
+            self._send_json(200, self.router.ops_detail(query.get("op_id", [""])[0]))
+            return
+        if parsed.path == "/api/ops/recognize":
+            self._send_json(200, self.router.ops_recognize(query.get("save_id", [""])[0]))
+            return
+        if parsed.path == "/api/ops/recognize_selftest":
+            self._send_json(200, self.router.threat_recognition_selftest())
+            return
+        if parsed.path == "/api/ops/advance":
+            self._send_json(200, self.router.ops_advance(query.get("save_id", [""])[0]))
+            return
+        if parsed.path == "/api/ops/analyze_selftest":
+            self._send_json(200, self.router.mission_analysis_selftest())
+            return
+        if parsed.path == "/api/ops/coa_selftest":
+            self._send_json(200, self.router.coa_engine_selftest())
+            return
+        if parsed.path == "/api/ops/opord_selftest":
+            self._send_json(200, self.router.opord_generator_selftest())
+            return
+        if parsed.path == "/api/ops/route_selftest":
+            self._send_json(200, self.router.execution_routing_selftest())
+            return
+        if parsed.path == "/api/ops/frago_selftest":
+            self._send_json(200, self.router.assessment_frago_selftest())
+            return
+        if parsed.path == "/api/ops/events_selftest":
+            self._send_json(200, self.router.opord_events_selftest())
+            return
+        if parsed.path == "/api/ops/cleanup_selftest":
+            self._send_json(200, self.router.opord_cleanup_selftest())
+            return
+        if parsed.path == "/api/ops/health":
+            self._send_json(200, self.router.ops_health(query.get("save_id", [""])[0]))
+            return
+        if parsed.path == "/api/ops/health_selftest":
+            self._send_json(200, self.router.ops_health_selftest())
+            return
+        if parsed.path == "/api/ops/e2e_selftest":
+            self._send_json(200, self.router.opord_e2e_selftest())
+            return
+        if parsed.path == "/api/ops/threat_sources_selftest":
+            self._send_json(200, self.router.threat_sources_selftest())
+            return
+        if parsed.path == "/api/ops/execution_selftest":
+            self._send_json(200, self.router.execution_lifecycle_selftest())
+            return
+        if parsed.path == "/api/ops/lease_selftest":
+            self._send_json(200, self.router.opord_lease_selftest())
+            return
+        if parsed.path == "/api/leases":
+            self._send_json(200, self.router.leases_list(query.get("save_id", [""])[0]))
+            return
+        if parsed.path == "/api/jobs":
+            self._send_json(200, self.router.jobs_list(
+                query.get("save_id", [""])[0], query.get("status", [""])[0]))
+            return
         if parsed.path == "/v1/npc_identity_probe/blackboard/latest":
             self._send_json(200, self.router.blackboard_probe_latest(query.get("save_id", [""])[0]))
             return
@@ -475,6 +540,14 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
             "/api/losses": self.router.loss_record,
             "/api/world_events": self.router.world_event_add,
             "/v1/npcs/index": self.router.npc_index,
+            "/v1/job/complete": self.router.job_complete,
+            "/v1/opord/orders/pending": self.router.opord_orders_pending,
+            "/v1/opord/lease": self.router.opord_lease,
+            "/v1/opord/orders/issued": self.router.opord_order_issued,
+            "/v1/opord/order_event": self.router.opord_order_event,
+            "/v1/opord/order_failed": self.router.opord_order_failed,
+            "/v1/opord/release": self.router.opord_release,
+            "/v1/opord/force_request": self.router.opord_force_request,
             "/v1/relation_report": self.router.relation_report,
             "/v1/relations_sync": self.router.relations_sync,
             "/v1/sectors_sync": self.router.sectors_sync,

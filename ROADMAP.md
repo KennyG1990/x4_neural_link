@@ -1,5 +1,279 @@
 # X4 Neural Link + AI Influence Roadmap
 
+## ★★★ EPIC OPORD-EXEC — EXECUTION AUTHORITY (spec'd 2026-06-29, Ken/Codex — `OPORD Execution Authority Update`)
+The release gate: OPORD task → REAL X4 ship order → OBSERVED execution. Without it OPORD is a planner/market
+coordinator; with it, a command layer over the X4 sim. Split: deterministic bridge SPINE (testable) + in-game ARMS.
+- **✅ PHASE A+B DONE + selftest-verified 2026-06-29 — the bridge execution spine.** Tables `opord_asset_leases`
+  (one ACTIVE lease per ship via partial-unique index = anti-steal; statuses reserved→issued→arrived→engaged→
+  completed/failed/lost/released/interrupted) + `opord_force_requests` (durable quota demand, dedup key
+  faction+sector+role+op, escalate/cancel). Lifecycle: `pending_orders` (tasks awaiting a real order),
+  `lease_asset` (no double-lease; HIGHER priority overrides + releases the lower), `mark_order_issued`,
+  `record_order_event` (observed arrived/engaged/completed/failed/lost → drives the TASK's terminal state — evidence
+  not intent), `release_asset` (idempotent), `release_operation_leases`, force-request create/escalate/cancel/fill.
+  `conclude_operation` now ALSO releases leases + cancels force requests. MD-issuer contract endpoints (POST):
+  `/v1/opord/orders/pending|lease|orders/issued|order_event|order_failed|release`; dashboard feed `/api/leases`.
+  VALIDATE: `opord_lease_selftest` **11/11** (the 4 spec checks: lease-twice-blocked, priority-override,
+  release-idempotent, closeout-releases-leases + order lifecycle→task completion + force-request dedup/cancel);
+  execution 9/9, cleanup 9/9, e2e 10/10, memory 15/15 no regression.
+- **✅ PHASE C DONE 2026-06-29 (aiscript + report path; ◐ in-game behaviour).** `aiscripts/order.aic.opord.protectposition.xml`
+  adapted from DeadAir's protectposition: REMOVED Kha'ak requirement / infestation goalkeys / destroy_object fallback
+  / DA signals; params destination(sector+anchor)/opordradius/stance/leasetag/returnoncomplete; behaviour = move to
+  anchor (move.generic) → report `arrived` → hold + seek/engage in radius (move.seekenemies, engageonsight by stance)
+  → `on_abort` reports `interrupted` (never destroys a faction asset); `attention min="unknown"` (OOS). REPORT PATH
+  WIRED: aiscript `raise_lua_event AIChat.opord_order_event` → new Lua `AI_Influence.OpordOrderEvent` (registered
+  alongside the other AIChat.* handlers; save_id cached on the relations tick) → POST `/v1/opord/order_event` →
+  `record_order_event` drives the lease + task terminal state. VALIDATE: Forge `project/validate` = XSD-legal (only
+  single-file artifacts); order_event + pending endpoints respond live. ◐ IN-GAME: actual ship movement/engagement
+  + the order_event actually firing (runtime semantics — needs debuglog iteration). NOTE banked: aic_uix.lua's
+  RegisterEvent block (incl. the working AIChat.* bindings) sits PAST the bash-mount truncation — read it with the
+  Read tool, not bash.
+- **✅ PHASE D BUILT + Forge/selftest-validated 2026-06-29 (◐ in-game behaviour).** `md/aic_opord_execution.xml`
+  issuer: Lua `PollOpordOrders` (heartbeat) POSTs `/v1/opord/orders/pending` → relays each task to MD `On_Assign`
+  (event_ui_triggered) → `find_ship_by_true_owner` a faction combat ship → `create_order id="AICOpordProtect"`
+  (leasetag = the bridge task_id, which the aiscript echoes in reports) → `AIChat.opord_issued` → Lua chains
+  `/v1/opord/lease` then `/v1/opord/orders/issued`; no ship → `AIChat.opord_force_request` → `/v1/opord/force_request`
+  (durable quota, path 2). Bridge `record_order_event` resolves the lease by lease_id OR task_id (the aiscript's tag).
+  All handlers registered; poller on the ~2-min heartbeat. VALIDATE: Forge `project/validate` XSD-legal (only
+  single-file artifacts); lease 11/11, memory 15/15 no regression; force_request + pending endpoints live. **v1
+  SIMPLIFICATION (honest):** holds the found ship's OWN sector (proves the create_order→aiscript→report chain in-game
+  without the string↔MD-object sector/ship round-trip, which is the documented in-game-grounding gate); precise
+  target-sector targeting + ship-handle round-trip = refinement.
+- **◐ PHASE E (watchdog) — v1 via aiscript self-report; full external watchdog deferred.** The aiscript reports
+  `arrived`/`interrupted`(on_abort, when vanilla reclaims the ship)/`failed` → `/v1/opord/order_event` → lease+task
+  state. A fuller external watchdog (30-60s re-check of each lease vs live ship state + capped reissue by authority
+  tier) is ◐ — it needs ship-by-handle FFI lookup (a boundary/grounding task) + authority tiers; deferred.
+- **◐ REMAINING (in-game gate + refinements):** the LIVE proof (reload → real combat or forced event → watch a ship
+  receive `order.aic.opord.protectposition`, move, report `arrived`, op concludes/FRAGOs from observed state — needs
+  debuglog iteration on create_order/find-ship/event-firing); precise target-sector resolution; full watchdog +
+  authority tiers; dashboard execution panel (Phase F). Bridge spine + aiscript + issuer are all wired for it.
+
+## ★★★ EPIC OPORD — MILITARY OPERATIONS COMMAND LAYER (spec'd 2026-06-29, Ken — `OPORD_Update` spec sheet)
+Turn raw strategic pressure into ONE durable, valued, executable operation per threat (mission → COAs →
+deterministic wargame/doctrine score → OPORD/SMESC → tasks routed to fleet orders / job market / agreements →
+SITREP/FRAGO/AAR → world events/narrator/dashboard). Deterministic engine owns lifecycle + selection + budget +
+success-from-evidence; the LLM only writes prose. ANTI-SPAM (one op per threat_key, update don't repost) and
+ANTI-CHEAT (no ware/economy/relation changes without a vetted validator + execution evidence) are core. Spec
+mandates a strict 10-phase build order; we follow it, one scoped+validated phase at a time.
+- **✅ PHASE 1 — SCHEMA + REPOSITORY LAYER, DONE + selftest-verified 2026-06-29.** Added 4 tables to memory.py:
+  `military_operations` (header, with the **partial-unique active-threat index** = the anti-spam guarantee:
+  ≤1 active op per save+faction+threat_key, concluded ops excluded so a recurring threat re-opens),
+  `operation_coas`, `operation_tasks`, `operation_reports` + indexes. CRUD: `create_or_get_operation` (DEDUPES on
+  active threat), `update_operation`, `get/list_operation(s)`, `attach_coa/task/report`, `conclude_operation`,
+  `operation_detail` (aggregate drill-down). JSON columns auto-encode/decode. Endpoints: GET `/api/ops`,
+  `/api/ops/detail`, `/api/ops/selftest`. VALIDATE: `oport_selftest` **12/12** (create, dedupe-same-threat,
+  different-threat→new-op, json round-trip, attach COAs/tasks/reports, operation_detail aggregates, conclude→
+  terminal, recurring-threat-after-conclusion→fresh op); memory 15/15 / sweep 7/7 / bind 12/12 no regression; live
+  `/api/ops` on the real save OK. Pure backend infra (no player surface) → selftest+endpoint ARE the bar (✅, not ◐).
+- **✅ PHASE 2 — THREAT RECOGNITION, DONE + selftest-verified + wired live 2026-06-29.** `memory.recognize_threats(save_id)`
+  aggregates real `hostile_events` by (victim = DEFENDING faction, aggressor, sector) → threat_key
+  `save:faction:threat_type:target:sector_slug` → `create_or_get_operation` (warning status + warning_order_json +
+  evidence_json + urgency/importance). Criminal aggressors (Xenon/Kha'ak/pirates) → `raid_pressure`, else
+  `sector_pressure`. DEDUPE: repeated pressure UPDATES the one active op (anti-spam), not a new row. Routes GET
+  `/api/ops/recognize` + `/api/ops/recognize_selftest`; Lua `RecognizeThreats` fires ~every 8th heartbeat (~2 min)
+  off the real combat feed. VALIDATE: `threat_recognition_selftest` **9/9** (created-one, threat_key format,
+  evidence+warning present, repeat→update-same-op, new-sector→new-op, criminal→raid); oport 12/12, memory 15/15 no
+  regression; live recognize on the real save = 0 created (no recent combat — correct). ◐ INPUT-FEED LIMITATION
+  (honest): `hostile_events` is currently POSTed mainly for our ORDERED/watched ships (#66/#67), so in normal play
+  few threats surface. Next lever for visible ops = broaden the combat-event feed AND/OR add the other spec'd threat
+  sources (conflicts, war_losses, economy shortages, agreement breakdowns) — a Phase 2 EXTENSION.
+- **✅ FEED BROADENING DONE 2026-06-29 (Ken: "do 1") — ops now form from data that flows in normal play.**
+  (1a, BRIDGE, tested) `recognize_threats` now ALSO reads **economy shortages** → `supply_shortage` ops (which get
+  SUPPLY COAs: request_supplies/escort_supply_convoy/hire_contractors → supply/escort jobs) and **broken/expired
+  agreements** → `agreement_breakdown` ops vs the breaker. `threat_sources_selftest` **7/7**, e2e still 10/10.
+  (Lesson banked: a low-health shortage faction has low budget_capacity = stations×250k×health, so supply COAs can
+  price out — realistic; seed enough stations in tests.) (1b, MOD, Forge-validated, ◐ in-game) combat watcher
+  broadened — `ai_influence_combat.xml` now periodically adds the PLAYER's whole fleet to `$Watched` (not just
+  ordered ships) via `find_ship_by_true_owner`+`add_to_group`, so any combat the player's forces are in POSTs
+  hostile_events. (2, MOD, Forge-validated, ◐ in-game) DEBUG hotkey **Shift+V** "Force OPORD Threat" → injects one
+  Teladi→Argon hostile_event in the player's sector via the proven `AIChat.hostile_event`→`/v1/hostile_events` path,
+  so the whole pipeline can be proven live in-game on demand. **⚠️ 2026-06-29 (Ken): HOTKEYS DON'T WORK in Ken's
+  setup — the whole Hotkey_API is inert (even the shipping shift+c chat hotkey); chat opens via the interact-menu
+  "Speak to AI", not a key. So the Shift+V debug trigger is DEAD — do NOT build/rely on hotkeys.** Replacements that
+  WORK: (a) real combat feeds it (the player-fleet watch posts hostile_events when the player's ships fight — the
+  in-game-native path, no key); (b) a forced event via the bridge `/v1/hostile_events` (proven — save
+  `opord_live_proof` shows a fully populated op chain on the dashboard now); (c) TODO if an on-demand in-game force
+  is wanted: wire it to the WORKING chat path (a debug chat command), not a hotkey. ◐ STILL OPEN (heavier remainder):
+- **◐ DEFERRED BACKLOG — OPORD Phase 2 EXTENSIONS (revisit after the full OPORD scope is built; Ken 2026-06-29).**
+  Threat recognition logic is done + correct, but its INPUT feed is narrow. To make operations actually populate
+  from the live galaxy, broaden the threat sources:
+  1. **Broaden the combat feed** — `hostile_events` is currently POSTed mainly for our ordered/watched ships
+     (#66/#67). Add general galaxy combat detection (e.g., a broader `event_object_destroyed` watch or periodic
+     war-loss sampling) so non-player-ordered battles register as threats.
+  2. **Add the other spec'd threat sources** to `recognize_threats`: `conflicts` (active faction conflict state),
+     `war_losses`, **economy shortages** (`rollup_economy_from_stations` → `supply_shortage` threat_type),
+     **agreement breakdowns** (broken/expired `agreements` → new threat), enemy buildup (`fleet_strength` deltas),
+     contested sectors (`strategic_state`/presence), failed/unclaimed job listings.
+  3. **Sector value / "nearby"** — derive a real sector value + nearby-asset count for warning-order evidence
+     (currently uses galaxy-wide fight count as a proxy).
+  Each is additive to the existing `recognize_threats`; none blocks the downstream phases.
+- **✅ PHASE 3 — MISSION ANALYSIS, DONE + selftest-verified 2026-06-29.** `memory.analyze_mission(op_id)` derives
+  (deterministically) mission_statement / commander_intent / desired_end_state / constraints / CCIR + REAL available
+  assets (faction `fight` ships from fleet_strength, `budget_available` = capacity−spent), threat-typed (raid vs
+  sector wording), advancing status warning→analysing and preserving evidence. `analyze_pending_missions` runs it on
+  all `warning` ops. **NEW pipeline driver `advance_operations(save_id)`** runs every BUILT stage in spec order
+  (recognize→analyse→…future); the Lua heartbeat now calls ONE endpoint `/api/ops/advance` (~every 8th tick) instead
+  of a trigger per phase. Routes GET `/api/ops/advance`, `/api/ops/analyze_selftest`. VALIDATE:
+  `mission_analysis_selftest` **13/13** (mission/intent/end-state/constraints/CCIR/assets present, status analysing,
+  evidence preserved, raid variant, advance driver clean); threat 9/9, oport 12/12, memory 15/15 no regression; live
+  `/api/ops/advance` clean (0 ops — no combat). Pure backend → selftest is the bar (✅).
+- **✅ PHASE 4 — COA ENGINE, DONE + selftest-verified 2026-06-29 (the commander decides, not the LLM).** Pure
+  deterministic functions: `opord_generate_coas` (candidate COAs from threat+assets: defensive_posture, organic_patrol,
+  hire_contractors, raid_enemy_logistics, request_allied_support, seek_ceasefire[non-criminal]); `opord_screen_coa`
+  (reject on insufficient ships / unaffordable budget / can't-negotiate-criminals); `opord_wargame_coa` (deterministic
+  outcome estimate per COA profile, ship-advantage-vs-threat nudge, enemy reaction baseline); `opord_score_coa`
+  (doctrine-weighted sum over normalized dims). `OPORD_DOCTRINE` weights per spec (argon/split/teladi/default).
+  `MemoryStore.plan_operation_coas` orchestrates generate→screen→wargame→score→SELECT highest (tie→coa_type), persists
+  every COA (viable/rejected + wargame/score), marks the winner, advances analysing→coa_generated + selected_coa_id.
+  `plan_pending_coas` + folded into `advance_operations`. Route `/api/ops/coa_selftest`. VALIDATE:
+  `coa_engine_selftest` **8/8** — impossible rejected, one selected, status+selected_coa_id set, DETERMINISTIC
+  (same inputs→same COA), DOCTRINE flips it (argon→defensive_posture vs split→organic_patrol on identical assets),
+  selected marked in table, viable carry wargame; mission 13/13 / threat 9/9 / oport 12/12 / memory 15/15 no
+  regression; live advance clean. Pure backend → selftest is the bar (✅).
+- **✅ PHASE 5 — OPORD GENERATOR, DONE + selftest-verified 2026-06-29.** Pure fns `opord_build_smesc` (Situation/
+  Mission/Execution/Service-Support/Command-Signal) + `opord_build_annexes` (A_conduct / B_task_org / D_intel /
+  E_rules / RS_sustainment / Q_command) + `OPORD_PHASES` per coa_type. `MemoryStore.generate_opord` builds opord_json
+  + annexes_json from the SELECTED COA, DERIVES executable `operation_tasks` (each tagged with the selected coa_id so
+  every task maps back to the COA), reserves the COA budget (budget_reserved), advances coa_generated→opord_issued +
+  issued_at. `issue_pending_opords` folded into `advance_operations` (now recognize→analyse→COA→OPORD). Route
+  `/api/ops/opord_selftest`. VALIDATE: `opord_generator_selftest` **19/19** (all 5 SMESC sections, all 6 annexes,
+  tasks derived + mapped to selected coa_id, status opord_issued+issued_at, budget_reserved == COA budget, mission
+  player-readable); COA 8/8 / mission 13/13 / oport 12/12 / memory 15/15 no regression; live advance clean. ✅.
+- **✅ PHASE 6 — EXECUTION ROUTING, DONE + selftest-verified 2026-06-29 (ops now ACT on the world).** Built the
+  missing **`market_jobs`** table (job_key dedupe + partial-unique open-job index = ONE open job per key, anti-spam;
+  operation_id/operation_task_id parent links) + `create_or_update_job`/`list_jobs`/`update_task`. Router
+  `route_operation_task` applies the spec rule: internal-capable task + owned ships → assign FLEET (order_id
+  pending_ingame); else → job-market listing (patrol/supply/privateer, reward from `OPORD_JOB_REWARDS`, deduped);
+  consent-needing tasks → **agreement PROPOSAL** (request_allied_support→alliance, seek_ceasefire→ceasefire) linked
+  via task.agreement_id + terms.operation_id (full acceptance scoring = the separate Negotiations build). Every task
+  is linked (job_id/agreement_id/order_id) + marked issued; `route_operation` advances opord_issued→active
+  (activated_at). `route_pending_operations` folded into `advance_operations` (now a 5-stage pipeline). Routes
+  `/api/ops/route_selftest`, `/api/jobs`. VALIDATE: `execution_routing_selftest` **10/10** (patrol+ships→internal,
+  patrol w/o ships→job, supply→ONE durable deduped job, allied→agreement, ceasefire→agreement, tasks issued+linked,
+  op active); opord 19/19 / coa 8/8 / oport 12/12 / memory 15/15 no regression; live advance + /api/jobs clean. ✅.
+  Note: actual in-game FLEET order execution (order_id pending_ingame) is an MD/Lua hook for a later in-game pass;
+  the bridge decides the route + creates the job/agreement rows. **Negotiations spec** = the agreement acceptance
+  engine, still to build.
+- **✅ PHASE 7 — ASSESSMENT + FRAGO, DONE + selftest-verified 2026-06-29 (battle rhythm; nothing hangs forever).**
+  `assess_operation(op_id)` evaluates an ACTIVE op against REAL evidence: emits a SITREP; fires FRAGOs — enemy
+  reinforcement (new hostile_events in-sector since activation → allied-support agreement proposal + frago report),
+  unclaimed linked job past threshold (→ raise reward 1.5× + frago report); and concludes from evidence (pressure
+  abated + min-age → completed; still contested past max-age → failed). Thresholds = class constants
+  (MIN/MAX_ACTIVE_S, JOB_UNCLAIMED_S, REINFORCE_MAG). `assess_active_operations` folded into `advance_operations`
+  (now a 6-stage pipeline recognize→analyse→COA→OPORD→route→assess). Route `/api/ops/frago_selftest`. VALIDATE:
+  `assessment_frago_selftest` **8/8** (reinforcement FRAGO, unclaimed-job reward escalation 80k→120k, SITREP +
+  ≥2 frago reports, pressure-abated→completed, timeout→failed); route 10/10 / opord 19/19 / oport 12/12 / memory
+  15/15 no regression; live advance clean. ✅. The full planning→execution→adaptation→conclusion lifecycle now runs.
+- **✅ P7 HARDENING 2026-06-29 (Codex audit #2/#4 — close the stale-leak the system exists to prevent).**
+  `conclude_operation` now CLEANS UP on close: releases unused reserved budget (budget_reserved→budget_spent),
+  CANCELS linked open `market_jobs`, EXPIRES linked pending `agreements` — idempotent (re-conclude finds nothing
+  open). Reward escalation is GATED by the op's `budget_reserved` (capped, never raised beyond reserved; emits a
+  `budget_report` instead). VALIDATE: `opord_cleanup_selftest` **9/9** (budget_released 150k, job cancelled,
+  agreement expired, reserved→spent, idempotent 0/0, reward capped at reserved); frago 8/8 / events 7/7 / oport 12/12
+  / memory 15/15 no regression. **Codex 6-question audit resolution:** #1 alters existing job (no dup) ✅; #2 reward
+  now budget-gated ✅; #3 pressure-abated uses observed hostile-event ABSENCE + age floor ✅ (sharpen w/ conflict-
+  intensity = POST-PASS); #4 conclude cleanup ✅; #5 FRAGO world-events gated ✅ but SITREP report still per-tick =
+  ◐ POST-PASS (urgency-scaled cadence); #6 conclusion idempotent ✅. **POST-PASS backlog:** #3 conflict-intensity
+  drop signal; #5 urgency-scaled SITREP cadence; faction-LEVEL budget gate (current gate is op-reserved-scoped).
+- **✅ PHASE 8 — WORLD EVENTS + NARRATOR + NPC MEMORY, DONE (deterministic) + selftest-verified 2026-06-29; ◐ in-game.**
+  RECONCILE WIN: most of P8 already existed — `gates.py` (tiers→routes anti-spam), `add_world_event`/`world_events`
+  (the dashboard's "World Events" panel), and `build_situation_briefing` (already injects recent world_events into
+  NPC context = propagation). So P8 = WIRING: added OPORD milestone event_types to `gates.ACTION_TIER`
+  (opord_issued/operation_started/operation_failed/major_contact=strategic, operation_completed/objective_secured=
+  critical, frago_issued/after_action_report=policy, warning_order_created=local); `memory.emit_operation_event`
+  routes a milestone through a lazy `EventGate` and only fires a `world_event` when the gate passes (so a persistent
+  FRAGO can't spam the feed every assess tick), linked via `source='opord:<id>'`; wired at generate_opord
+  (opord_issued), assess (frago_issued / operation_completed / operation_failed). `list_operation_events` for the
+  drill-down. Fired events land in `world_events` → dashboard history AND NPC briefings (propagation, reconciled).
+  Route `/api/ops/events_selftest`. VALIDATE: `opord_events_selftest` **7/7** (opord_issued emits one linked event,
+  FRAGO cooldown blocks the 2nd = anti-spam, completed routes critical, lands in durable history); gates/frago/route/
+  oport/memory all green, no regression; live advance clean. **◐ IN-GAME GATE:** the on-screen news article/
+  notification + NPCs referencing an op in-character (the player-facing surface) — first in-game gate of the OPORD
+  arc. Optional refinement: tiered leadership/station-manager propagation scoping (baseline = importance-scoped
+  briefing already works); LLM news-prose wrapper.
+- **✅ PHASE 9 — DASHBOARD OPERATIONS PANEL + HEALTH WARNINGS, DONE + verified 2026-06-29.** `memory.operations_health(save_id)`
+  computes per-op warnings (Ken's list + spec's): no_selected_coa, opord_no_tasks, stale_unclaimed_job,
+  budget_reserved_no_link, **concluded_open_jobs** + **concluded_pending_agreements** (cleanup-regression detectors —
+  a live guard on the P7 hardening), repeated_fragos_no_progress, no_reports, active_too_long. Routes
+  `/api/ops/health` + `/api/ops/health_selftest`. Dashboard: new **Operations / OPORD** panel (index.html + app.js
+  `renderOps`) in the military cluster — lists every op (id/faction/status/type/sector/target/urgency/selected-COA/
+  budget res-spent/task-count) with a ⚠ warnings column + a health-warnings chip; `list_operations` now carries
+  task_count. VALIDATE: `ops_health_selftest` **7/7** (each warning fires for the right op incl. both regression
+  detectors; coherent op stays clean); cleanup 9/9 / oport 12/12 / memory 15/15 no regression; panel rendered in
+  Chrome with mock data (full row + ⚠ stale_unclaimed_job + "health warnings 1" chip), no JS errors; live
+  `/api/ops/health` clean. ◐ interactive click-to-expand drill-down (COAs/tasks/reports inline) — data feed
+  `/api/ops/detail` is built; only the expand-UI remains.
+- **✅ PHASE 10 — LIVE VALIDATION: end-to-end integration DONE 2026-06-29; ◐ in-game run is the standing gate.**
+  `run_opord_e2e_selftest` drives the REAL `advance_operations` pipeline on seeded teladi→argon pressure in Silent
+  Witness I (argon: no ships + 2 econ stations → forces the `hire_contractors`→patrol-job route) and proves the
+  phases COMPOSE against the spec's P10 acceptance: **10/10** — one operation from pressure; repeated pressure →
+  SAME op (dedup); ONE open job (no duplicate); reward escalates via FRAGO; op concludes from evidence (abated) +
+  cleans up its job; recurring threat after conclusion → a fresh op. Route `/api/ops/e2e_selftest`. Full suite green
+  (health 7/7, cleanup 9/9, oport 12/12, memory 15/15). **◐ IN-GAME GATE — run this when playing:**
+  (1) `/reloadui` to load the latest mod Lua; (2) be near / cause real Teladi-vs-Argon (or any) combat in a sector
+  so the mod POSTs `hostile_events` (note: feed is currently mostly ordered/watched ships — see the Phase 2
+  EXTENSIONS backlog; force combat with watched ships or lower thresholds to seed events); (3) wait ~2-min heartbeats
+  — the Lua `AdvanceOperations` drives the pipeline; (4) on the dashboard **Operations / OPORD** panel watch ONE op
+  appear and flow status warning→…→active, gain a job/agreement, and a SITREP/FRAGO; (5) when pressure stops, watch
+  it conclude (completed) and its job cancel; (6) confirm the logbook/World-Events panel shows opord_issued/completed
+  articles (not spam) and dashboard agrees with logbook. Acceptance = one pressure→one op, no dup jobs, reward FRAGO,
+  conclude-from-evidence, dashboard↔logbook agree.
+
+- **✅ LIVE-SERVER CHAIN PROOF 2026-06-29 (forced event through the REAL ingest path; Codex "0 live rows" addressed).**
+  POSTed 3 real-shaped events to `/v1/hostile_events` (the SAME endpoint the mod's combat handler uses) on isolated
+  save `opord_live_proof`, then `/api/ops/advance` → the live DB populated from 0: derive_conflicts logged "Teladi
+  struck Argon in Silent Witness I"; **1 operation (active, COA selected), 6 COAs, 1 task, 1 report, 1 opord
+  world_event**. Proves the whole chain runs on the RUNNING bridge+DB+dashboard, not just selftests. The ONLY thing
+  not exercised = X4 itself emitting the event (forced via the endpoint). → CONFIRMS the lone remaining gap is the
+  FEED (Phase-2 EXTENSIONS): nothing populates `hostile_events` in normal play (mod combat handler watches only
+  ordered/watched ships). Build the feed broadening → natural play proves P10 end-to-end in-game.
+
+### ★ OPORD SPEC ↔ IMPLEMENTATION DIFF (Ken 2026-06-29 — point-by-point gap register)
+Walked `OPORD_Update.md` against the build. ✅ = done+verified, ◐ = partial, ❌ = not built.
+**✅ FULLY COVERED:** data model (4 tables + indexes incl. partial-unique active-threat); threat recognition
+(hostile + economy + agreement sources); mission analysis; COA generate→screen→wargame→doctrine-score→select
+(deterministic); OPORD SMESC + all 6 annexes + task derivation; routing (internal/job/agreement); FRAGO reward
+escalation (budget-gated) + reinforcement; conclude-from-evidence WITH cleanup (release budget / cancel jobs /
+expire agreements); gated milestone world-events; dashboard panel + 9 health warnings; anti-spam (one-op-per-threat,
+dedup jobs, gated logbook); anti-cheat (no ware/economy fabrication, budget reserve, no LLM-decides).
+**◐ PARTIAL:**
+- **Task EXECUTION + success-from-evidence** — ✅ BRIDGE SIDE BUILT 2026-06-29 (#1): tasks complete from PROOF, not
+  intent — `complete_job` spends budget + completes the linked task; `assess_operation` completes OFFENSIVE tasks
+  from REAL our-kills `hostile_events` + logs a BDA report (`execution_lifecycle_selftest` 9/9). ◐ STILL IN-GAME:
+  turning internal-fleet `order_id="pending_ingame"` into a REAL X4 ship order, and the player UI calling
+  `/v1/job/complete` on contract fulfillment (+ patrol-entered-sector / delivery-observed task proofs).
+- **Job lifecycle** — ✅ create/dedup/reward-escalate + claim/complete/fail + budget SPEND on fulfillment (#1 build).
+  ◐ claimant-eligibility evaluation + in-game claim/fulfillment UI remain.
+- **FRAGO breadth** — 2 triggers (reinforcement, unclaimed-job) + reward/allied actions; missing triggers (budget
+  exceeded[≈logged], allied rejected, enemy changed target, player accepted job) + actions (withdraw, escalate-to-
+  raid, downgrade, shift sector, abort).
+- **Battle-rhythm reports** — sitrep/frago/completion/failure ✅; distinct BDA/MOP/MOE types + urgency-scaled cadence
+  ❌ (Codex #5).
+- **Lifecycle status completeness** — `frago_required` defined but unused (FRAGOs applied inline); task
+  active/completed/failed/superseded + COA candidate/not_selected not all transitioned (labeling).
+- **NPC propagation** — baseline (world_events→`build_situation_briefing`) ✅; TIERED (leadership/station/marine
+  scoping) ❌.
+- **Narrator** — deterministic milestone summaries ✅; LLM news-PROSE wrapper ❌ (optional per spec).
+- **Parent links** — `market_jobs.operation_id` is a column ✅; agreements↔op via `terms.operation_id`, world_events
+  via `source="opord:"` (work, but not dedicated columns as the spec diagrams).
+**❌ NOT BUILT:** more threat sources (failed jobs, enemy buildup, contested sectors, player actions); 2 COA types
+(delay_conserve_forces, fortify_sector); per-faction doctrine weights beyond argon/split/teladi/default;
+**Negotiations** acceptance engine (separate spec); dashboard drill-down expand-UI; in-game live run (P10 gate).
+**PRIORITIZED NEXT (from the diff):** (1) **task execution + job-fulfillment + spend** — the load-bearing gap that
+turns routed intent into real outcomes (in-game); (2) **Negotiations** acceptance engine; (3) FRAGO breadth +
+BDA/MOP/MOE + urgency cadence (post-pass); (4) cheap completeness: 2 COA types, not_selected labeling, more threat
+sources. Items 3-4 are low-risk-but-low-value (and adding COAs risks the deterministic-selection selftests, so they
+need careful re-baselining) — deferred deliberately, not forgotten.
+
+### ★ OPORD STATUS SUMMARY (2026-06-29)
+**Phases 1–10 BUILT + selftest/e2e-verified (deterministic), + the Codex #2/#4 hardening, independently re-verified.**
+The full military command substrate runs: combat → threat (deduped) → mission → COA (doctrine-scored, deterministic)
+→ OPORD/SMESC+annexes → tasks routed to fleet/jobs/agreements → SITREP/FRAGO (budget-gated) → conclude-with-cleanup
+→ gated world-events/news + NPC propagation → dashboard panel + health warnings. One in-game gate stands (P10 live
+run + P8 on-screen article/NPC-reference). **NOT done / next:** `Negotiations` spec (agreement ACCEPTANCE engine —
+P6 only creates proposals); POST-PASS backlog (Codex #3 conflict-intensity abate signal, #5 urgency-scaled SITREP
+cadence, faction-level budget gate, drill-down expand-UI); Phase-2 threat-feed EXTENSIONS (broaden combat detection
++ conflicts/economy/agreement threat sources) so ops actually populate in normal play.
+
 ## ★★★ EPIC I — SYNTHETIC PERSISTENT NPC IDENTITY LAYER (spec'd 2026-06-28, Ken) — Neural Link becomes the identity authority
 
 ### ★ NPC BLACKBOARD PERSISTENT-IDENTITY PROBE (Ken 2026-06-29) — could make identity SIMPLER than evidence-scoring

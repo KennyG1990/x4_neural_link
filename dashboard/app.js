@@ -418,6 +418,38 @@ const jlist = (a) => (Array.isArray(a) ? a.join(", ") : (a == null ? "" : String
 // percentages (e.g. a 0.8 shortage -> 80%); leave real quantities (duration_h:50) as-is.
 const jshort = (o) => { try { return o == null ? "" : Object.entries(o).map(([k, v]) => `${k}:${(typeof v === "number" && v > 0 && v <= 1) ? Math.round(v * 100) + "%" : v}`).join(", "); } catch (e) { return ""; } };
 
+function renderOps(opsResp, healthResp) {
+  // OPORD military command chain — full threat→conclusion picture + health warnings (the audit layer).
+  const ops = (opsResp && opsResp.operations) || [];
+  const warnByOp = {};
+  ((healthResp && healthResp.unhealthy) || []).forEach((h) => { warnByOp[h.op_id] = h.warnings || []; });
+  const fmt = (n) => (n == null ? "0" : Number(n).toLocaleString());
+  const body = document.getElementById("opsBody");
+  if (body) {
+    body.innerHTML = ops.map((o) => {
+      const warns = warnByOp[o.id] || [];
+      return `<tr>
+        ${td((o.id || "").replace(/^op_/, ""), "mono")}
+        ${td(o.faction_id || "")}
+        ${td(o.status || "")}
+        ${td((o.operation_type || "").replace(/_/g, " "))}
+        ${td(o.target_sector || "")}
+        ${td(o.target_faction || "")}
+        ${td(o.urgency || 0)}
+        ${td(o.selected_coa_id ? "✓" : "—")}
+        ${td(fmt(o.budget_reserved) + " / " + fmt(o.budget_spent), "mono")}
+        ${td(o.task_count != null ? o.task_count : 0)}
+        ${td(warns.length ? "⚠ " + warns.join(", ") : "", warns.length ? "warn" : "")}
+      </tr>`;
+    }).join("") || `<tr><td colspan="11" class="dim">No operations yet — they appear when factions face real threats.</td></tr>`;
+  }
+  const warnEl = document.getElementById("opsWarn");
+  if (warnEl) {
+    const total = Object.values(warnByOp).reduce((a, w) => a + w.length, 0);
+    warnEl.innerHTML = total ? `<span class="chip warn"><span>health warnings</span><strong>${total}</strong></span>` : "";
+  }
+}
+
 function renderStrategic(resp, saveId) {
   document.getElementById("strategicTitle").textContent = "Strategic Pressures — " + saveId;
   const rows = (resp && resp.strategic_state) || [];
@@ -653,7 +685,7 @@ async function refresh() {
   const u = (p) => getJson(p + (p.includes("?") ? "&" : "?") + "save_id=" + encodeURIComponent(uSave));
   const [health, telemetry, memNpcs, memMetrics, evtState, saves, factions, rels,
          strategic, incidents, economy, conflicts, sectors, fleets, agreements, worldEvents, conversations, influenceLog, p2status,
-         social, rumors, playerRole, budgets, llmBudget] = await Promise.all([
+         social, rumors, playerRole, budgets, llmBudget, ops, opsHealth] = await Promise.all([
     getJson("/health"),
     getJson("/api/telemetry?limit=100"),
     getJson("/api/memory/npcs").catch(() => ({ npcs: [] })),
@@ -678,6 +710,8 @@ async function refresh() {
     post("/v1/player/role").catch(() => ({ ok: false })),
     post("/v1/economy/budget_list").catch(() => ({ budgets: [] })),
     post("/v1/llm/budget_status").catch(() => ({ ok: false })),
+    u("/api/ops").catch(() => ({ operations: [] })),
+    u("/api/ops/health").catch(() => ({ unhealthy: [] })),
   ]);
   renderSaves(saves);
   renderMemory(memNpcs, memMetrics);
@@ -691,6 +725,7 @@ async function refresh() {
   renderSectors(sectors);
   renderFleets(fleets);
   renderAgreements(agreements);
+  renderOps(ops, opsHealth);
   renderWorldEvents(worldEvents);
   renderConversations(conversations);
   renderSocial(social, uSave);

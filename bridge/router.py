@@ -19,7 +19,11 @@ from .memory import (
     relationship_beat_line, run_relationship_beat_selftest,
     classify_tone, run_tone_reaction_selftest,
     run_blackboard_probe_selftest, run_blackboard_bind_selftest,
-    run_deceased_sweep_selftest,
+    run_deceased_sweep_selftest, run_oport_selftest, run_threat_recognition_selftest,
+    run_mission_analysis_selftest, run_coa_engine_selftest, run_opord_generator_selftest,
+    run_execution_routing_selftest, run_assessment_frago_selftest, run_opord_events_selftest,
+    run_opord_cleanup_selftest, run_ops_health_selftest, run_opord_e2e_selftest,
+    run_threat_sources_selftest, run_execution_lifecycle_selftest, run_opord_lease_selftest,
 )
 from .player2_client import Player2Client
 from .telemetry import BridgeTelemetry
@@ -355,6 +359,145 @@ class NeuralRouter:
     def deceased_sweep_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Deterministic oracle for the deceased staleness sweep."""
         return run_deceased_sweep_selftest()
+
+    def oport_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for OPORD Phase 1 (schema + repository)."""
+        return run_oport_selftest()
+
+    def ops_list(self, save_id: str = "", status: str = "") -> dict[str, Any]:
+        """List military operations for a save (optional status filter) — for the dashboard."""
+        return {"ok": True, "operations": self.memory.list_operations(save_id, status or None)}
+
+    def ops_detail(self, op_id: str = "") -> dict[str, Any]:
+        """Full operation drill-down (op + COAs + tasks + reports)."""
+        return {"ok": True, "operation": self.memory.operation_detail(op_id)}
+
+    def ops_recognize(self, save_id: str = "") -> dict[str, Any]:
+        """Phase 2: scan real hostile events → create/update deduped warning-order operations."""
+        return self.memory.recognize_threats(save_id)
+
+    def threat_recognition_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for OPORD Phase 2 threat recognition."""
+        return run_threat_recognition_selftest()
+
+    def ops_advance(self, save_id: str = "") -> dict[str, Any]:
+        """OPORD pipeline driver — run every built stage in order (recognize → analyse → …) for one save."""
+        return self.memory.advance_operations(save_id)
+
+    def mission_analysis_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for OPORD Phase 3 mission analysis."""
+        return run_mission_analysis_selftest()
+
+    def coa_engine_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for OPORD Phase 4 COA engine."""
+        return run_coa_engine_selftest()
+
+    def opord_generator_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for OPORD Phase 5 OPORD generator."""
+        return run_opord_generator_selftest()
+
+    def execution_routing_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for OPORD Phase 6 execution routing."""
+        return run_execution_routing_selftest()
+
+    def jobs_list(self, save_id: str = "", status: str = "") -> dict[str, Any]:
+        """List job-market listings for a save (optional status filter) — for the dashboard."""
+        return {"ok": True, "jobs": self.memory.list_jobs(save_id, status or None)}
+
+    def assessment_frago_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for OPORD Phase 7 assessment + FRAGO."""
+        return run_assessment_frago_selftest()
+
+    def opord_events_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for OPORD Phase 8 milestone world-events (gated, anti-spam)."""
+        return run_opord_events_selftest()
+
+    def opord_cleanup_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for the P7 hardening (conclude-cleanup + budget-gated reward)."""
+        return run_opord_cleanup_selftest()
+
+    def ops_health(self, save_id: str = "") -> dict[str, Any]:
+        """Operational health warnings for the dashboard audit panel."""
+        return self.memory.operations_health(save_id)
+
+    def ops_health_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for OPORD Phase 9 health warnings."""
+        return run_ops_health_selftest()
+
+    def opord_e2e_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """OPORD Phase 10 end-to-end integration oracle (real pipeline composition)."""
+        return run_opord_e2e_selftest()
+
+    def threat_sources_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Oracle for the P1a feed broadening (economy + agreement-breakdown threat sources)."""
+        return run_threat_sources_selftest()
+
+    def execution_lifecycle_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Oracle for the #1 execution build (job fulfillment + spend + task success from evidence)."""
+        return run_execution_lifecycle_selftest()
+
+    def job_complete(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Mark a job fulfilled (player/NPC completed the contract) → spend + task done. payload {save_id, job_id, claimant, evidence}."""
+        p = payload or {}
+        return self.memory.complete_job(str(p.get("save_id") or ""), str(p.get("job_id") or ""),
+                                        str(p.get("claimant") or ""), p.get("evidence"))
+
+    # --- OPORD Execution Authority: the MD issuer ↔ bridge contract ---------------------------------
+    def opord_orders_pending(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Tasks awaiting a real ship order (the MD issuer polls this). payload {save_id}."""
+        return self.memory.pending_orders(str((payload or {}).get("save_id") or ""))
+
+    def opord_lease(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """MD claims a real ship for a task. payload {save_id, operation_id, task_id, faction, ship_runtime_id,
+        ship_name?, ship_macro?, ship_class?, sector?, order_kind?, priority?, original_order_summary?}."""
+        p = payload or {}
+        return self.memory.lease_asset(str(p.get("save_id") or ""), str(p.get("operation_id") or ""),
+                                       str(p.get("task_id") or ""), str(p.get("faction") or ""),
+                                       str(p.get("ship_runtime_id") or ""), str(p.get("ship_name") or ""),
+                                       str(p.get("ship_macro") or ""), str(p.get("ship_class") or ""),
+                                       str(p.get("sector") or ""), str(p.get("order_kind") or "protectposition"),
+                                       int(p.get("priority") or 0), str(p.get("original_order_summary") or ""))
+
+    def opord_order_issued(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """MD issued the in-game create_order. payload {save_id, lease_id, assigned_order_id}."""
+        p = payload or {}
+        return self.memory.mark_order_issued(str(p.get("save_id") or ""), str(p.get("lease_id") or ""),
+                                             str(p.get("assigned_order_id") or ""))
+
+    def opord_order_event(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Watchdog reports an observed order event. payload {save_id, lease_id, event, evidence}."""
+        p = payload or {}
+        return self.memory.record_order_event(str(p.get("save_id") or ""), str(p.get("lease_id") or ""),
+                                              str(p.get("event") or ""), p.get("evidence"))
+
+    def opord_order_failed(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Watchdog reports the order failed/lost. payload {save_id, lease_id, reason}."""
+        p = payload or {}
+        return self.memory.record_order_event(str(p.get("save_id") or ""), str(p.get("lease_id") or ""),
+                                              "failed", str(p.get("reason") or ""))
+
+    def opord_release(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Release a lease. payload {save_id, lease_id, reason}."""
+        p = payload or {}
+        return self.memory.release_asset(str(p.get("save_id") or ""), str(p.get("lease_id") or ""),
+                                         str(p.get("reason") or ""))
+
+    def leases_list(self, save_id: str = "") -> dict[str, Any]:
+        return {"ok": True, "leases": self.memory.list_leases(save_id)}
+
+    def opord_force_request(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """No ship available → durable force demand. payload {save_id, operation_id, task_id, faction, sector,
+        ship_role, ship_size?, quantity?, priority?, reward_budget?}."""
+        p = payload or {}
+        return self.memory.create_or_update_force_request(
+            str(p.get("save_id") or ""), str(p.get("operation_id") or ""), str(p.get("task_id") or ""),
+            str(p.get("faction") or ""), str(p.get("sector") or ""), str(p.get("ship_role") or "patrol"),
+            str(p.get("ship_size") or ""), int(p.get("quantity") or 1), int(p.get("priority") or 0),
+            int(p.get("reward_budget") or 0))
+
+    def opord_lease_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for the OPORD Execution Authority lease/order spine."""
+        return run_opord_lease_selftest()
 
     def identity_promote(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Promote an identity's tracking priority. payload: {persistent_npc_key|npc_key, reason}."""
