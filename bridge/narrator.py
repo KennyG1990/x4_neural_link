@@ -20,14 +20,22 @@ from typing import Any, Callable, Optional
 # Event types worth narrating as HISTORY (a thing that happened in the galaxy). Internal mood "reaction" rows
 # and trivial no-ops are NOT history.
 _WORTHY_TYPES = {"battle", "war", "conflict", "diplomatic", "sector_change", "economic_threshold",
-                 "agreement", "ceasefire", "loss", "relation_shift", "betrayal", "death"}
+                 "agreement", "ceasefire", "loss", "relation_shift", "betrayal", "death",
+                 # OPORD milestones (spec OPORD_Update §Narrator): operations become one-article history arcs.
+                 "warning_order_created", "opord_issued", "operation_started", "major_contact",
+                 "objective_secured", "frago_issued", "operation_completed", "operation_failed",
+                 "after_action_report"}
 _SKIP_SOURCES = {"reaction"}          # the L3 emotional-reaction rows are opinions, not history
 _MIN_IMPORTANCE = 3                   # only meaningful events become articles
 # Thematic topic (Codex output has category:"Political" etc.) — distinct from the 'news' logbook tab.
 _TOPIC_MAP = {"battle": "Military", "war": "Military", "conflict": "Military", "loss": "Military",
               "diplomatic": "Political", "agreement": "Political", "ceasefire": "Political",
               "relation_shift": "Political", "betrayal": "Political", "death": "Political",
-              "economic_threshold": "Economic", "sector_change": "Territorial"}
+              "economic_threshold": "Economic", "sector_change": "Territorial",
+              "warning_order_created": "Military", "opord_issued": "Military", "operation_started": "Military",
+              "major_contact": "Military", "objective_secured": "Military", "frago_issued": "Military",
+              "operation_completed": "Military", "operation_failed": "Military",
+              "after_action_report": "Military"}
 
 
 def _parse_json_obj(raw: Any) -> dict:
@@ -329,6 +337,11 @@ class _FakeMem:
              "secondary_faction": "khaak", "sector_id": "", "importance": 3, "source": "reaction"},  # must be SKIPPED
             {"id": 13, "event_type": "diplomatic", "summary": "boron observes quietly", "primary_faction": "boron",
              "secondary_faction": "", "sector_id": "", "importance": 1, "source": "engine"},  # below min importance
+            # OPORD milestone (spec §Narrator): must be article-worthy and cluster into the same argon/khaak arc
+            {"id": 14, "event_type": "opord_issued",
+             "summary": "argon High Command issued a patrol operation against khaak pressure",
+             "primary_faction": "argon", "secondary_faction": "khaak", "sector_id": "hat1", "importance": 3,
+             "source": "opord:op_test"},
         ]
 
     def list_world_events(self, s, limit=120, min_importance=1):
@@ -354,6 +367,11 @@ def run_narrator_selftest() -> dict:
     # cause-gating: the reaction row + the low-importance row must NOT spawn their own article
     titles = " ".join(x["title"] + x["body"] for x in arts).lower()
     ok("skips_reaction_and_trivial", "boron" not in titles and "resentment" not in titles, titles[:120])
+    # OPORD milestone events are article-worthy (spec §Narrator) — the issued operation joins the war-arc cluster
+    n3 = Narrator(_FakeMem())
+    groups = n3._cluster(n3.memory.list_world_events("s", min_importance=_MIN_IMPORTANCE))
+    ok("opord_milestone_clustered", any(any(e.get("event_type") == "opord_issued" for e in g.get("events", []))
+                                        for g in groups), [len(g.get("events", [])) for g in groups])
     # cursor: a second pass with no new events yields nothing
     ok("cursor_dedup", n.run_pass("s", chat_fn=None) == [], None)
     # no events -> no article (cause-gated)

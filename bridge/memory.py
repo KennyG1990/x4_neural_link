@@ -3315,7 +3315,12 @@ class MemoryStore:
         except Exception:
             step = 0.0
         step = max(-5.0, min(5.0, step))  # DeadAir step bound (±5)
-        cur = float((self.get_relationship(save_id, a, b) or {}).get("trust") or 0)
+        cur_raw = float((self.get_relationship(save_id, a, b) or {}).get("trust") or 0)
+        # Band-normalize FIRST: the store's trust scale is ±100 (locked volatility), but the DeadAir diplomatic
+        # band is ±25. Computing the step against raw out-of-band trust AMPLIFIED it (live 2026-07-01: cur=67,
+        # step=-5 → clamped_step=-42 → relation -0.42 emitted vs the documented ±0.05 max). Viewing the standing
+        # through the band guarantees |clamped_step| ≤ |step| ≤ 5 always.
+        cur = max(-25.0, min(25.0, cur_raw))
         result = max(-25.0, min(25.0, cur + step))  # DeadAir ±25 diplomatic band
         clamped = result - cur
         if clamped == 0 and step != 0:
@@ -4222,6 +4227,81 @@ class MemoryStore:
                                     (save_id,)).fetchall()
         return [self._decode_op_row(r) for r in rows]
 
+    # --- FRAGO reward escalation for stale open market jobs (spec: OPORD_Update §FRAGO + Job Market) --------
+    JOB_STALE_S = 900.0          # open + untouched this long => a real escalation decision is due
+    JOB_RAISE_FRACTION = 0.25    # engine-computed legal raise: +25% (min +5000), capped by faction budget headroom
+
+    def list_stale_open_jobs(self, save_id: str, stale_s: Optional[float] = None) -> list[dict]:
+        """Open market jobs with no update for JOB_STALE_S — candidates for a Player2 escalation decision."""
+        cutoff = time.time() - float(self.JOB_STALE_S if stale_s is None else stale_s)
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM market_jobs WHERE save_id=? AND status='open' AND updated_at<=? "
+                                "ORDER BY urgency DESC, updated_at ASC", (save_id, cutoff)).fetchall()
+        return [self._decode_op_row(r) for r in rows]
+
+    def job_escalation_options(self, save_id: str, job: dict) -> tuple[list[dict], int]:
+        """Engine-side legality: compute the bounded option menu for one stale job. The RAISE amount is
+        deterministic (+25%, min +5000) and only offered if the issuing faction's budget headroom covers the
+        INCREMENT (words≠resources). Player2 only ever picks among these; it never invents an amount."""
+        reward = int(job.get("reward") or 0)
+        raise_to = max(int(reward * (1.0 + self.JOB_RAISE_FRACTION)), reward + 5000)
+        fid = str(job.get("issuing_faction") or "")
+        headroom = max(0.0, self.budget_capacity(save_id, fid) - self.budget_spent(save_id, fid))
+        options: list[dict] = []
+        if (raise_to - reward) <= headroom:
+            options.append({"key": f"raise:{raise_to}",
+                            "label": f"Raise the reward to {raise_to:,} credits to attract a claimant"})
+        options.append({"key": "hold", "label": "Hold the listing unchanged and wait"})
+        options.append({"key": "cancel", "label": "Withdraw the listing (need no longer worth the price)"})
+        return options, raise_to
+
+    def apply_job_escalation(self, save_id: str, job_id: str, choice: str) -> dict:
+        """Deterministic executor for a Player2 job-escalation verdict. raise:<n> re-prices (bounded upstream),
+        cancel closes, hold snoozes (touch updated_at). Emits a world_event ONLY on material change (raise/cancel)
+        — the anti-spam announce rule. Returns {ok, action, news?}."""
+        now = time.time()
+        result: dict[str, Any]
+        event: Optional[dict] = None
+        # NOTE: self._lock is NON-reentrant — add_world_event takes it too, so events are emitted AFTER the
+        # with-block, never inside it (a nested call deadlocks the request thread; learned live 2026-07-01).
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM market_jobs WHERE save_id=? AND id=? AND status='open'",
+                               (save_id, job_id)).fetchone()
+            if not row:
+                return {"ok": False, "reason": "job not open"}
+            job = dict(row)
+            if choice.startswith("raise:"):
+                try:
+                    new_reward = int(choice.split(":", 1)[1])
+                except Exception:
+                    return {"ok": False, "reason": "bad raise amount"}
+                if new_reward <= int(job.get("reward") or 0):
+                    return {"ok": False, "reason": "raise must increase reward"}
+                conn.execute("UPDATE market_jobs SET reward=?, urgency=urgency+1, updated_at=? WHERE id=?",
+                             (new_reward, now, job_id))
+                conn.commit()
+                news = (f"Contracts: {job.get('issuing_faction')} raises the "
+                        f"{job.get('job_type')} contract reward to {new_reward:,} credits.")
+                event = {"summary": news, "importance": 2}
+                result = {"ok": True, "action": "raised", "reward": new_reward, "news": news}
+            elif choice == "cancel":
+                conn.execute("UPDATE market_jobs SET status='cancelled', updated_at=? WHERE id=?", (now, job_id))
+                conn.commit()
+                news = (f"Contracts: {job.get('issuing_faction')} withdraws its "
+                        f"{job.get('job_type')} contract.")
+                event = {"summary": news, "importance": 1}
+                result = {"ok": True, "action": "cancelled", "news": news}
+            else:
+                # hold — snooze one stale window, announce nothing (no material change)
+                conn.execute("UPDATE market_jobs SET updated_at=? WHERE id=?", (now, job_id))
+                conn.commit()
+                result = {"ok": True, "action": "held"}
+        if event:
+            self.add_world_event(save_id, event_type="economy", summary=event["summary"],
+                                 primary_faction=str(job.get("issuing_faction") or ""),
+                                 importance=event["importance"], source="job_escalation")
+        return result
+
     def update_task(self, task_id: str, status: Optional[str] = None, **fields) -> dict:
         sets, vals = [], []
         if status:
@@ -4327,6 +4407,10 @@ class MemoryStore:
             out.append({"task_id": r["task_id"], "operation_id": r["operation_id"], "faction": r["faction_id"],
                         "task_type": r["task_type"], "sector": r["target_sector"] or r["op_sector"],
                         "target_faction": r["target_faction"],
+                        # posture derives from the Player2-selected task type (execution semantics, deterministic):
+                        # offensive task types engage on sight; holds/patrols engage on contact only.
+                        "stance": ("aggressive" if r["task_type"] in ("engage_hostiles", "raid_enemy_logistics")
+                                   else "defensive"),
                         "priority": max(int(r["priority"] or 0), int(r["urgency"] or 0))})
         return {"ok": True, "pending": out}
 
@@ -7967,6 +8051,11 @@ def run_relation_move_validator_selftest() -> dict:
         chk("unknown_rejected", store.validate_relation_move(sid, "argon", "boron", 5.0)["ok"] is False, "")
         r5 = store.validate_relation_move(sid, "argon", "teladi", 50.0)
         chk("step_bounded_to_5", r5["ok"] and r5["clamped_step"] == 5.0, str(r5))
+        # out-of-band stored trust (store scale ±100) must NOT amplify the emitted step (the -42 live defect)
+        store.adjust_relationship(sid, "teladi", "argon", dtrust=67)
+        rob = store.validate_relation_move(sid, "teladi", "argon", -5.0)
+        chk("out_of_band_cur_not_amplified", rob["ok"] and rob["clamped_step"] == -5.0 and rob["result"] == 20.0,
+            str(rob))
         # push to the band limit, then a further move is a rejected no-op
         store.adjust_relationship(sid, "argon", "teladi", dtrust=25)
         rlim = store.validate_relation_move(sid, "argon", "teladi", 5.0)

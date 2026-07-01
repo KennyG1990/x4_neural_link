@@ -263,6 +263,16 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/ops/route_decision_selftest":
             self._send_json(200, self.router.route_decision_selftest())
             return
+        if parsed.path == "/api/ops/gameplay_announce_once_selftest":
+            self._send_json(200, self.router.gameplay_announce_once_selftest())
+            return
+        if parsed.path == "/api/ops/job_escalation_selftest":
+            self._send_json(200, self.router.job_escalation_selftest())
+            return
+        if parsed.path == "/api/ops/escalate_jobs_llm":
+            self._send_json(200, self.router.escalate_stale_jobs_llm(
+                query.get("save_id", [""])[0], int((query.get("max_n", ["2"])[0]) or 2)))
+            return
         if parsed.path == "/api/ops/propose_deals_llm":
             self._send_json(200, self.router.propose_deals_llm(
                 query.get("save_id", [""])[0], int((query.get("max_n", ["8"])[0]) or 8)))

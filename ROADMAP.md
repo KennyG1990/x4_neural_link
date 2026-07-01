@@ -1,5 +1,195 @@
 # X4 Neural Link + AI Influence Roadmap
 
+### #75 MISSION OFFERS AS THE PLAYER CLAIM-SURFACE OVER market_jobs — SPEC'D 2026-07-01 (Ken decision)
+- DECISION (Ken, screenshots 2026-07-01): jobs are "technically missions" for the player. The universal work
+  object is the market_jobs ROW (one listing, dedupe key, budget-backed reward); surfaces are per-actor APIs —
+  the vanilla MISSION OFFER UI for the player, bridge decisions for NPC/faction claimants. Claiming is
+  first-come-first-served (claim_job already locks the row).
+- SCOPE (sub-tasks G1–G6, execute in order; each is one bounded workflow unit):
+  G1 bridge: /v1/jobs/offers poll route — player-ELIGIBLE open jobs (visibility=public, standing gate) with
+     claim/reward state, + selftest. Pattern: opord orders/pending poll.
+  G2 RESEARCH (ground, don't invent): how vanilla + DeadAir author dynamic mission OFFERS in MD (offer cue,
+     briefing, objectives, accept/abort/completion hooks). Deliverable: recipe note in the wiki
+     (reference-mods.md addendum) BEFORE any authoring.
+  G3 MD (Forge-authored): aic_contracts mission library — materialize each eligible job as an offer (title/
+     briefing/faction/reward from job fields); ACCEPT → Lua POST /v1/jobs/claim; ABORT → release. Validate via
+     Forge project/validate; deploy fs/write.
+  G4 completion evidence: patrol = time-held-in-sector (reuse protectposition arrival/hold telemetry); supply =
+     ware delivery observed → POST complete_job → vetted payout from reserved budget + logbook completion line.
+  G5 lifecycle sync: FRAGO escalation updates the live offer's reward; NPC claim/cancel/expiry WITHDRAWS the
+     offer (no orphaned offers). Selftest each transition.
+  G6 E2E in-game gate: see the offer in the Mission Offers tab, Accept, complete, get PAID (player credits up,
+     faction budget_spent up, ledger row) — screenshot proof; then a second offer claimed by an NPC disappears
+     from the tab.
+- ANTI-GOALS: no direct-to-player nag comms (killed in #74); no offer without an open job row; no payout without
+  claim + evidence + reservation (vetted-transfer rules).
+
+### #74 FIX repeated PATROL/SUPPLY REQUEST message spam — announce-once via the job market — ✅ verified 2026-07-01
+- ROOT CAUSE (Ken's Messages screenshot: same request every ~5-15 min): `gameplay_generation_tick` (200s cooldown)
+  enqueued a patrol/supply player communiqué UNCONDITIONALLY each tick — no dedupe, no job linkage; the same
+  most-pressing sector/shortage kept winning → identical message forever. The announcement channel was being used
+  as the work object.
+- FIX (doctrine: the job row is the system of record; messages are notifications): the tick now routes the need
+  through `create_or_update_job` (job_key dedupe) and sends a communiqué ONLY when the row was CREATED
+  ("<FACTION> PATROL/SUPPLY CONTRACT POSTED", carries job_id). Repeat needs silently refresh the open row; later
+  material changes announce via the #71 FRAGO escalation news (raise/withdraw). On-demand proving routes
+  (/v1/offers/patrol etc.) unchanged.
+- VALIDATED (cited): NEW gameplay_announce_once_selftest **3/3** (two ticks, same need → ONE open job, ONE comm,
+  second tick reports deduped); regression job_escalation 6/6, patrol_offer selftest green. LIVE effect from the
+  next daemon tick: Messages shows one CONTRACT POSTED per distinct need. SYNERGY: posted jobs that stay unclaimed
+  now flow into the Player2 escalation loop automatically.
+- NEXT (task G, spec'd): materialize eligible open jobs as real X4 MISSION OFFERS (player claim-surface; NPCs keep
+  consuming the same table via the bridge) — accept→claim_job, evidence→complete_job→vetted payout.
+
+### #73 Narrator narrates OPORD milestones — ✅ verified 2026-07-01
+- RECONCILE (extend, don't rebuild): the SPEC 2b narrator already clusters world_events into history articles and
+  rides the drain articles channel → in-game log_article path — the ONLY gap was worthiness: `_WORTHY_TYPES`
+  excluded every operation milestone type. EXTENDED _WORTHY_TYPES + _TOPIC_MAP (→ Military) with the spec's
+  §Narrator trigger list: warning_order_created, opord_issued, operation_started, major_contact,
+  objective_secured, frago_issued, operation_completed, operation_failed, after_action_report. Milestone events
+  already flow through emit_operation_event's gate (tier/cooldown/dedup), so no spam risk.
+- VALIDATED: narrator selftest (route /v1/narrator/selftest) **11/11** incl. new `opord_milestone_clustered`
+  (an opord_issued event joins the war-arc cluster). Articles reach the game on the daemon's next narrator pass
+  (real-LLM prose when Player2 is up; deterministic composer otherwise — composition, not decision, so the
+  offline fallback is doctrine-legal).
+
+### #72 OPORD stance threaded poll→assign — ✅ bridge-verified 2026-07-01 (Lua hop rides next reload)
+- pending_orders now derives posture from the Player2-selected task type (engage_hostiles/raid_enemy_logistics →
+  aggressive; holds/patrols → defensive) and ships it in the pending payload; aic_uix.lua passes `t.stance or
+  "defensive"` (fallback = old behavior, so the un-reloaded game is unaffected). MD On_Assign already read
+  $d.$stance → maps to the order's `aggressive` bool (#69).
+- VALIDATED: isolated-save probe shows `"stance":"defensive"` for patrol_sector in the pending payload;
+  execution_selftest 9/9. ◐ the Lua pass-through takes effect on the next game reload (verify one aggressive-type
+  task then). Residue: throwaway probe save `stance_probe_*` rows (ignorable).
+
+### #71 FRAGO reward escalation for stale market jobs — ✅ live-verified 2026-07-01
+- SPEC (OPORD_Update §FRAGO + Job Market; per the spec-reconciliation note the DECISION is Player2's): a stale
+  OPEN market job (untouched ≥ JOB_STALE_S=900s) gets a bounded Player2 decision — RAISE (engine-priced +25%
+  min +5000, offered ONLY if the increment fits faction budget headroom = budget_capacity−budget_spent,
+  words≠resources) / HOLD (snooze one window, no announcement) / CANCEL (withdraw). Engine detects, prices,
+  executes; Player2 only chooses; defer-on-fail leaves the job stale for retry.
+- BUILT: memory.list_stale_open_jobs / job_escalation_options / apply_job_escalation (announce ONLY material
+  changes — world_event source=job_escalation + news line); router.escalate_stale_jobs_llm (decide() adapter,
+  decision_type=job_escalation, audited + finalized); wired into decision_tick STRATEGIC tier (max_n=2) and
+  _drain_from_tick news (logbook shows "Contracts: X raises…/withdraws…"). Routes:
+  /api/ops/job_escalation_selftest, /api/ops/escalate_jobs_llm.
+- VALIDATED (cited): job_escalation_selftest **6/6** (fresh-not-stale, raise repriced 100k→125k + ONE event +
+  news, hold snoozed + NO event, cancel withdrawn + event, defer untouched-still-stale). Regression:
+  route_decision 3/3, decision_tick 4/4, actions 18/18. LIVE (real Player2, active save): evaluated real stale
+  escort job_f16b689124 → chose HOLD (in character, zero spam emitted). In-game logbook line rides the existing
+  proven news path on the next material change.
+- ✗→FIXED during build (cost ~10 min): first version called add_world_event INSIDE the `with self._lock` block —
+  **MemoryStore._lock is a NON-reentrant threading.Lock**, so the selftest deadlocked its request thread (fetch
+  hung → CDP timeouts). Fix: emit events AFTER the lock block; comment added at the site. RULE BANKED: never call
+  another store method while holding self._lock.
+
+### #70b POLL DEFECT FIXED + ORDER RUNNING ON A REAL SHIP — ✅ live-verified 2026-07-01 (ship-on-screen ◐)
+- FIX (aic_uix.lua): (1) STAGGERED the OPORD calls off the %8==0 econ-tick burst — AdvanceOperations → %8==3,
+  PollOpordOrders → %8==5 (same cadence, no longer the tail of a 7-request djfhe burst); (2) every silent
+  early-return in PollOpordOrders now logs ("djfhe request unavailable" / "err" / "unusable response" /
+  "pending=N"). Synced to the F: workspace copy.
+- VALIDATED LIVE (cited, debuglog 5380.18–5380.28 after F5/F9 reload): `opord poll: POST sent` → bridge instrument
+  logged the game's poll (runtime/logs/opord_poll.log) → `opord poll: pending=1` → `AIC On_Assign ENTER fid=argon
+  task=task_6fb9d6cbfb known=yes` (new unconditional entry log — the old debug_text sat inside the do_if, silent on
+  guard failure) → `AIC OPORD issue fid=argon cands=603 ship=OEB-531` → **ZERO aiscript runtime errors** (the #69
+  destination fix holds live) → zero lease/issue errors → pending drained to 0. The full chain injected-threat →
+  Player2 COA → Player2 routing → poll → MD ship pick → create_order → running order is now LIVE end to end.
+- ⚠ UNEXPLAINED (watch item): during the PREVIOUS reload window, two polls returned pending=1 but On_Assign never
+  fired (no ENTER possible then — the log was added after — but the OLD inside-guard debug_text was also absent, and
+  drain log_* UI events DID work). After this reload the identical event path works. Mechanism not identified;
+  recurrence would point at a UI-event registration race right after quickload. If it recurs: add a Lua-side log
+  around AddUITriggeredEvent and check whether the FIRST post-load poll differs from later ones.
+- ✅ CLOSED 2026-07-01 (natural-cadence proof, zero manual driving): opord_poll.log shows 10 game polls at ~120s
+  cadence over 18 min; pending drained 1→0 at the consume; **lease_a60d1e26e2 status='arrived'** — OEB-531 ("ARG
+  Fighter Squadron Elite Vanguard") flew to its anchor and the aiscript's order_event reported back (game →
+  Lua → bridge); task_6fb9d6cbfb status='active'. The full loop — threat → Player2 COA → Player2 routing → poll →
+  MD ship pick → create_order → ship flies → arrival evidence — is LIVE and self-driving. Residue: LGV-705's
+  pre-fix lease stuck at 'issued' (its order died on the destination bug — expected orphan, note for cleanup).
+  ◐ remaining only: strip TEMP diagnostics after a stability window (tracked as its own task).
+
+### #70 OPORD FULL LIVE-LOOP — chain proven to create_order ✅; destination-param fix ✅; poll-liveness defect found ◐ 2026-07-01
+- ✅ PROVEN LIVE end-to-end to the order (all real components, no stubs): injected hostile event via
+  `/v1/hostile_events` (teladi→argon, Black Hole Sun IV — the same route the debug hotkey's Lua uses) → conflict
+  derived ("teladi struck argon…") → `ops/advance` recognized → **operation op_argon_6aeb4752b5 created** →
+  analyzed → COA planned → **Player2 SELECTED the COA live** (select_coas_llm, 7.2s, coa_cef1ba08d5) → **Player2
+  routed the task** (task_routing decision) → pending fleet order → game's Lua poller consumed it → **MD On_Assign
+  found a real ship (647 argon candidates → LGV-705) and executed create_order AICOpordProtect** (debuglog: "AIC
+  OPORD issue fid=argon cands=647 ship=LGV-705"). World event surfaced: "argon High Command issued an operation in
+  Black Hole Sun IV against teladi."
+- ✗→FIXED: the aiscript then errored — `Property lookup failed: $destination.{1}/{2}` — MD passed a bare position;
+  position-type order params take **[space, position]** (grounded: DeadAir deadairdynamicuniverse.xml:12175
+  `value="[$LocSector, …]"`). Fixed aic_opord_execution.xml (`[$ship.sector, $anchor]`), Forge-validated (0/0/0),
+  synced to the F: workspace copy, game reloaded clean (game-log/status "clean", erroring cues []).
+- ✗ NEW DEFECT (◐ blocks the ship-moves proof): post-quickload, the game's `PollOpordOrders` NEVER reaches the
+  bridge — proven by a TEMP instrument in `router.opord_orders_pending` appending to
+  `runtime/logs/opord_poll.log`: zero game polls in 10+ min while the 15s worldsync POSTs flow. A forced pending
+  order (`/api/ops/debug_force_order`, task_6fb9d6cbfb) sits unconsumed. HYPOTHESES: (a) djfhe_http request-pool
+  exhaustion at the %8 econ-tick burst tail (PollOpordOrders is the LAST of ~10 requests fired that tick;
+  `newRequest()` returning nil is silently swallowed); (b) the `_econTick % 8` chain (aic_uix.lua:456-466) doesn't
+  advance/fire as expected post-reload. NEXT: Lua-side instrumentation (log before `newRequest` in
+  PollOpordOrders + log the tick counter), or de-burst the poll (move it off the %8 tick / stagger by one tick).
+- DIAG RESIDUE (intentional, remove when #70 closes): the TEMP poll-logger in `router.opord_orders_pending`;
+  one junk empty force_request row `freq_b8eee7a420` (created by a mistaken probe POST — the force_request route
+  CREATES on POST; there is no list/GET variant); the forced test order task_6fb9d6cbfb (op_argon_6d827f1a1d)
+  still pending_ingame.
+- GOTCHAS BANKED: (a) bridge stdout does NOT reach deploy.log (PS transcript captures host output only) — file-append
+  is the reliable bridge-side instrument; (b) `/v1/opord/*` routes are POST-only ({ok:false,"not found"} on GET);
+  (c) `/v1/opord/force_request` has create-on-POST semantics — never probe it blind.
+
+### #69 IN-GAME VISUAL VERIFICATION PASS — logbook surfaces ✅ SEEN ON SCREEN 2026-07-01; two load defects found+fixed (◐ reload)
+- ✅ **THE KEYSTONE ◐ IS FLIPPED for the player surfaces.** Foregrounded X4 (computer-use) on the live save with the
+  daemon running; the in-game LOGBOOK shows, rendered on screen (screenshot taken 16:52): **"Overheard — argon/
+  antigone" NPC>NPC scene lines** (#62/#63 in-game gate MET), **"Command: <faction> commits to a course of action"**
+  COA decisions (#67 in-game gate MET), **news updates** (Antigone mounting defence), and the [AI TEST] war/relation
+  test entries. The daemon picked argon↔antigone as the topical pair FROM the world_event my earlier forced scene
+  persisted — topical-pair selection proven live end-to-end. Ken confirmed the envelope-! icon = MESSAGES (high/low
+  priority) vs the Logbook list.
+- Cadence context: daemon's first post-gameload strategic tick delivered the batch; forced /api/ops/decision_tick
+  correctly returned fired:[] between tiers (healthy gate). Dedup audit BEFORE counts (same save): 2 agreements both
+  `refused` (concluded), 50 decision_records across 6 types, ZERO duplicate-key agreements — no lifecycle spam.
+- ✗→FIXED two REAL in-game load errors found by the Forge debug-log watcher (game-log/status: 16 issues = 11
+  benign signature notices + 5 real):
+  (a) `On_DebugThreat` (ai_influence_hotkey.xml:25) instantiated with NO event condition → added bare
+      `<event_cue_signalled />` (standard externally-signalled-cue idiom; the Hotkey_API signals it).
+  (b) `order.aic.opord.protectposition.xml` params (13–16) — the ORDER NEVER REGISTERED in-game: non-internal
+      params lacked `text` attrs; `type="text"` is NOT a legal order-param type (grounded against DeadAir
+      order.da.infestation.protectposition: only position/object/number/bool + text="{page,id}"). FIX: `stance`
+      (text) → `aggressive` (bool), `leasetag` (text) → number (the bridge task id is numeric), text attrs added,
+      engageonsight now `$aggressive`; MD creator aic_opord_execution.xml updated in lockstep ($stance=='aggressive'
+      → bool param; $task default '' → 0).
+- VALIDATED (cited): Forge `project/validate` on all 15 files (11 MD/content + ui.xml + 3 Lua): **structuralErrors 0,
+  unresolvedCueRefs 0, mdLuaMissingRegisters 0**; single remaining finding `lua_md.missing_listener "ai_influence.log_"`
+  is a KNOWN analyzer false positive (dynamic `log_<category>` names — Forge tool-improvement logged in the Forge
+  ROADMAP). Forge workspace copy (F:\DEV_ENV\projects\Mods\X4Mods\x4_ai_influence) was STALE (no aiscripts/, no
+  opord_execution.xml) — synced G→F, sizes verified (aic_uix.lua 71803 both sides).
+- ✅ RELOAD-VERIFIED 2026-07-01 21:06Z (quicksave F5 → quickload F9 driven via computer-use, per Ken's method):
+  `game-log/status` after the reload = **status "clean"** — "No recent X4 errors or warnings mentioning
+  x4_ai_influence"; erroring cues **[]** (On_DebugThreat error gone); the 4 order-param errors GONE (the OPORD
+  order now registers). Remaining 11 issues are all benign unsigned-mod signature notices. Both load defects are
+  closed end-to-end.
+- ◐ STILL OPEN (next keystone): the full OPORD live-loop proof — Shift+V debug threat → operation forms → Player2
+  COA → opord_assign → create_order AICOpordProtect → ship visibly moves/holds anchor → order-event reports back
+  to the bridge. The order registering was the blocker; now testable. Relation-shift visual: no vanilla UI surface
+  shows faction↔faction standing; the visible consequence is FLEET REACTION, which rides this same order path.
+
+### #68 FIX validate_relation_move band amplification (scale-mixing defect) — ✅ live-verified 2026-07-01
+- FOUND live (forced /api/ops/scheduled_scene on the active save, argon↔antigone): emitted
+  `adjust_relation relation:-0.42` — 8.4× the documented ±0.05 max. ROOT CAUSE: scale mixing in
+  `memory.validate_relation_move` — the store's trust scale is ±100 (locked volatility, adjust_relationship),
+  the DeadAir diplomatic band is ±25; `clamped_step = clamp(cur+step,±25) − cur` AMPLIFIES the step whenever
+  stored trust is outside the band (live: cur=67, step=−5 → −42). The 6/6 selftest never seeded out-of-band trust.
+- FIX (memory.py): band-normalize first — `cur = clamp(cur_raw, ±25)` before computing result/clamped_step →
+  guarantees |clamped_step| ≤ |step| ≤ 5 always. Band-limit no-op rejection semantics preserved.
+- VALIDATED (cited by name): relation_move_validator_selftest **7/7** (new check `out_of_band_cur_not_amplified`:
+  trust=67, step −5 → clamped −5, result 20), faction_scene_scheduler_selftest 5/5, actions_selftest 18/18.
+  LIVE re-proof on the active save, same pair: emitted relation now **−0.05** (bounded=true).
+- ⚠ EXPOSURE NOTE: the daemon's first post-gameload strategic tick (pre-fix) may have delivered ONE amplified
+  adjust_relation to the running game before the fix reloaded. Attitude-only, self-limiting (the shadow store was
+  snapped toward the band by the same defect). No repeat possible post-fix.
+- GOTCHAS BANKED: (a) host file-tool edits don't always trip the run+watch watcher — `touch` the file via the
+  bash mount to force the reload; (b) deploy.log transcript BUFFERS — verify a reload by selftest shape (check
+  count/names), not the log; (c) `/api/ops/decision_tick` returning fired:[] means tiers are self-gated, not broken.
+
 ### #49 OC2 — Job Market + chat deals via Negotiations; resume OPORD via outcomes — ✅ SUPERSEDED/verified 2026-06-30
 - RECONCILE verdict: OC2's scope is already covered by shipped infra — building it would be a redundant defect. Cited
   coverage (all green): (1) **job outcomes resume OPORD** — `complete_job` completes the linked operation_task when

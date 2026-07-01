@@ -540,7 +540,16 @@ class NeuralRouter:
     # --- OPORD Execution Authority: the MD issuer ↔ bridge contract ---------------------------------
     def opord_orders_pending(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Tasks awaiting a real ship order (the MD issuer polls this). payload {save_id}."""
-        return self.memory.pending_orders(str((payload or {}).get("save_id") or ""))
+        sid = str((payload or {}).get("save_id") or "")
+        res = self.memory.pending_orders(sid)
+        try:  # TEMP diag 2026-07-01: prove whether the game's Lua poll reaches the bridge (appends to runtime/logs)
+            import os as _os, time as _t
+            _p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "runtime", "logs", "opord_poll.log")
+            with open(_p, "a", encoding="utf-8") as _f:
+                _f.write(f"{_t.time():.0f} save={sid or 'EMPTY'} pending={len(res.get('pending') or [])}\n")
+        except Exception:
+            pass
+        return res
 
     def opord_lease(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """MD claims a real ship for a task. payload {save_id, operation_id, task_id, faction, ship_runtime_id,
@@ -1374,6 +1383,129 @@ class NeuralRouter:
         return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
                 "total": len(checks), "checks": checks}
 
+    def escalate_stale_jobs_llm(self, save_id: str = "", max_n: int = 2) -> dict[str, Any]:
+        """FRAGO reward escalation (spec OPORD_Update §FRAGO + Job Market): each stale OPEN market job gets a
+        bounded Player2 decision — raise (engine-priced +25%, budget-capped; offered only if affordable) / hold /
+        withdraw. The engine detects staleness, prices the raise, and executes the verdict; Player2 only chooses.
+        Announces ONLY material changes (raise/cancel) via returned news lines. Defers on failure (job stays
+        stale, retried next tick — no math substitute)."""
+        import time as _t
+        decided, deferred, out, news = 0, 0, [], []
+        for job in self.memory.list_stale_open_jobs(save_id):
+            if decided + deferred >= int(max_n):
+                break
+            fid = str(job.get("issuing_faction") or "")
+            options, _raise_to = self.memory.job_escalation_options(save_id, job)
+            age_min = int((_t.time() - float(job.get("updated_at") or 0)) / 60)
+            where = (" in " + job["target_sector"]) if job.get("target_sector") else ""
+            versus = (" against " + job["target_faction"]) if job.get("target_faction") else ""
+            brief = (f"Our OPEN {job.get('job_type')} contract{where}{versus} has gone UNCLAIMED for "
+                     f"~{age_min} min at {int(job.get('reward') or 0):,} credits (urgency "
+                     f"{int(job.get('urgency') or 0)}). No claimant has stepped forward. "
+                     f"Do we sweeten the offer, wait, or withdraw the need?")
+            d = self.decide(save_id, "job_escalation", fid, f"{fid} procurement command", brief, options)
+            if d.get("source") != "player2" or not d.get("choice"):
+                deferred += 1
+                continue
+            res = self.memory.apply_job_escalation(save_id, str(job.get("id")), str(d["choice"]))
+            if d.get("decision_id"):
+                self.memory.finalize_decision(d["decision_id"], validator_result=res,
+                                              final_status=("applied" if res.get("ok") else "rejected_by_validator"))
+            decided += 1
+            if res.get("news"):
+                news.append(res["news"])
+            out.append({"job": job.get("id"), "choice": d["choice"], "action": res.get("action"),
+                        "ok": res.get("ok")})
+        return {"ok": True, "decided": decided, "deferred": deferred, "results": out, "news": news}
+
+    def job_escalation_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for FRAGO job escalation (stub Player2 + temp store): fresh jobs aren't stale;
+        a RAISE verdict re-prices (budget-capped option) + emits ONE world event + a news line; HOLD snoozes with
+        NO event; CANCEL withdraws with an event; an LLM error DEFERS (job untouched, still stale)."""
+        import shutil
+        import tempfile
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool, det: str = "") -> None:
+            checks.append({"name": n, "ok": bool(c), "detail": det})
+
+        class _R:
+            def __init__(self, r: str) -> None:
+                self._r = {"status": "ok", "reply": r}
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._r
+
+        class _P2Pick:
+            def __init__(self, n: str) -> None:
+                self._n = n
+
+            def npc_complete(self, _req: Any) -> Any:
+                return _R(f"{self._n}. As commanded.")
+
+        class _P2Err:
+            def npc_complete(self, _req: Any) -> Any:
+                raise RuntimeError("player2 down")
+
+        d = tempfile.mkdtemp(prefix="nl_jobesc_")
+        orig_m, orig_p = self.memory, self.player2
+        try:
+            store = MemoryStore(f"{d}/j.sqlite3")
+            sid = "s"
+            store.upsert_faction(sid, "argon", name="Argon")
+            store.budget_capacity = lambda _s, _f: 10_000_000.0  # test headroom => raise option present
+            self.memory = store
+
+            def _mk(jtype: str, stale: bool = True) -> str:
+                jid = store.create_or_update_job(sid, "argon", jtype, target_sector="X", reward=100000,
+                                                 urgency=2)["id"]
+                if stale:
+                    import time as _t2
+                    with store._lock, store._connect() as conn:
+                        conn.execute("UPDATE market_jobs SET updated_at=? WHERE id=?",
+                                     (_t2.time() - 2 * store.JOB_STALE_S, jid))
+                        conn.commit()
+                return jid
+
+            fresh = _mk("escort", stale=False)
+            chk("fresh_not_stale", all(j["id"] != fresh for j in store.list_stale_open_jobs(sid)), "")
+
+            j_raise = _mk("patrol")
+            ev0 = len(store.list_world_events(sid, limit=100))
+            self.player2 = _P2Pick("1")  # option 1 = raise (headroom stubbed high)
+            r1 = self.escalate_stale_jobs_llm(sid, max_n=1)
+            jr = next(j for j in store.list_jobs(sid) if j["id"] == j_raise)
+            chk("raise_repriced", r1["decided"] == 1 and int(jr["reward"]) == 125000, str(jr.get("reward")))
+            chk("raise_event_and_news", len(store.list_world_events(sid, limit=100)) == ev0 + 1
+                and len(r1["news"]) == 1, str(r1["news"]))
+
+            j_hold = _mk("supply")
+            ev1 = len(store.list_world_events(sid, limit=100))
+            self.player2 = _P2Pick("2")  # option 2 = hold
+            r2 = self.escalate_stale_jobs_llm(sid, max_n=1)
+            chk("hold_snoozed_no_event", r2["decided"] == 1 and not r2["news"]
+                and len(store.list_world_events(sid, limit=100)) == ev1
+                and all(j["id"] != j_hold for j in store.list_stale_open_jobs(sid)), "")
+
+            j_cancel = _mk("recon")
+            self.player2 = _P2Pick("3")  # option 3 = cancel
+            r3 = self.escalate_stale_jobs_llm(sid, max_n=1)
+            jc = next(j for j in store.list_jobs(sid) if j["id"] == j_cancel)
+            chk("cancel_withdrawn", r3["decided"] == 1 and jc["status"] == "cancelled"
+                and len(r3["news"]) == 1, str(jc.get("status")))
+
+            j_defer = _mk("bounty")
+            self.player2 = _P2Err()
+            r4 = self.escalate_stale_jobs_llm(sid, max_n=1)
+            jd = next(j for j in store.list_jobs(sid) if j["id"] == j_defer)
+            chk("defer_untouched", r4["deferred"] == 1 and jd["status"] == "open"
+                and any(j["id"] == j_defer for j in store.list_stale_open_jobs(sid)), "")
+        finally:
+            self.memory, self.player2 = orig_m, orig_p
+            shutil.rmtree(d, ignore_errors=True)
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
+
     def propose_deals_llm(self, save_id: str = "", max_n: int = 8) -> dict[str, Any]:
         """D6 decision driver (T3): the PROPOSER faction's Player2 decides which plausible deal to initiate (or none),
         grounded in a brief; the chosen deal submits through the Negotiations door (deduped/rate-limited). Defer-on-fail.
@@ -1552,6 +1684,7 @@ class NeuralRouter:
                 "propose": self.propose_deals_llm(save_id, max_n=2),
                 "influence": self.influence_step({"save_id": save_id, "budget": 2}),
                 "scene": self.run_scheduled_scene(save_id),  # #63: one NPC>NPC scene per strategic tick
+                "job_escalation": self.escalate_stale_jobs_llm(save_id, max_n=2),  # FRAGO reward escalation
             }
         return {"ok": True, "fired": list(fired.keys()), "now": now, "detail": fired}
 
@@ -2407,6 +2540,9 @@ class NeuralRouter:
         # #63: NPC>NPC scene — overheard lines surface to the player logbook.
         for line in ((strat.get("scene") or {}).get("news") or []):
             feed["news"].append(line)
+        # FRAGO job escalation — material contract changes only (raise/withdraw), per the anti-spam rule.
+        for line in ((strat.get("job_escalation") or {}).get("news") or []):
+            feed["news"].append(line)
         # #64: validated relation moves proposed in the scene → in-game actions (Lua→MD set_faction_relation).
         for act in ((strat.get("scene") or {}).get("actions") or []):
             feed["actions"].append(act)
@@ -2631,14 +2767,90 @@ class NeuralRouter:
             pass
         if not dry_run:
             try:
+                # ANNOUNCE-ONCE (fix for the repeated PATROL/SUPPLY REQUEST spam, 2026-07-01): the need is routed
+                # through the JOB MARKET (create_or_update_job dedupes by job_key), and a player communiqué is sent
+                # ONLY when the job row was CREATED. A repeated need silently refreshes the existing open row;
+                # later material changes (reward raise / withdrawal) announce via the FRAGO escalation news (#71).
                 alt = int(now) % 2 == 0
-                r = (self.sector_patrol_offer if alt else self.economy_supply_offer)({"save_id": save_id})
-                out["offer"] = ("patrol" if alt else "supply") if r.get("ok") else None
+                built = self._build_patrol_offer(save_id) if alt else self._build_supply_offer(save_id)
+                if built.get("ok"):
+                    if alt:
+                        fid, jtype = built["owner"], "patrol"
+                        job = self.memory.create_or_update_job(
+                            save_id, fid, "patrol", target_sector=str(built.get("sector") or ""),
+                            target_faction=str(built.get("threat") or ""), urgency=3,
+                            evidence={"summary": built["offer"]["summary"]})
+                    else:
+                        fid, jtype = built["faction"], "supply"
+                        job = self.memory.create_or_update_job(
+                            save_id, fid, "supply", ware=str(built.get("ware") or ""), urgency=3,
+                            evidence={"summary": built["offer"]["summary"], "severity": built.get("severity")})
+                    if job.get("created"):
+                        fname = self._fac_name(save_id, fid)
+                        self.player_comms.append({"title": f"{fname.upper()} {jtype.upper()} CONTRACT POSTED",
+                                                  "body": built["offer"]["summary"], "faction": fid,
+                                                  "faction_name": fname, "category": "diplomacy", "kind": "offer",
+                                                  "save_id": save_id, "ts": now, "offer": built["offer"],
+                                                  "job_id": job.get("id")})
+                        out["offer"] = jtype
+                    else:
+                        out["offer"] = f"{jtype}_deduped"
             except Exception:
                 pass
             while len(self.player_comms) > 200:
                 self.player_comms.popleft()
         return out
+
+    def gameplay_announce_once_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Oracle for the announce-once rule: the SAME contested-sector need across two generation ticks yields
+        ONE job row + ONE communiqué (second tick dedupes silently). Stub proposals; throwaway store."""
+        import shutil
+        import tempfile
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool, det: str = "") -> None:
+            checks.append({"name": n, "ok": bool(c), "detail": det})
+
+        d = tempfile.mkdtemp(prefix="nl_annonce_")
+        orig_m, orig_propose, orig_comms = self.memory, self.propose_deals_llm, self.player_comms
+        try:
+            from collections import deque as _dq
+            store = MemoryStore(f"{d}/a.sqlite3")
+            sid = "s"
+            store.upsert_faction(sid, "argon", name="Argon")
+            store.upsert_sector(sid, "sec_hot", name="Hot Sector", owner_faction="argon",
+                                contested_by=["xenon"], strategic_value=0.9, player_assets_present=True)
+            self.memory = store
+            self.propose_deals_llm = lambda *_a, **_k: {"results": []}
+            self.player_comms = _dq()
+            self._gameplay_gen_last = {}
+            # force the PATROL branch deterministically on both ticks
+            import time as _t
+            real_time = _t.time
+            try:
+                r1 = self.gameplay_generation_tick(sid)
+                self._gameplay_gen_last = {}   # reopen the cooldown gate for the second tick
+                r2 = self.gameplay_generation_tick(sid)
+            finally:
+                pass
+            # one of the two ticks may have taken the supply branch (clock parity); assert on the PATROL results
+            patrol_runs = [r for r in (r1, r2) if str(r.get("offer") or "").startswith("patrol")]
+            jobs = [j for j in store.list_jobs(sid, status="open") if j["job_type"] == "patrol"]
+            comms = [c for c in self.player_comms if "PATROL" in str(c.get("title") or "")]
+            if len(patrol_runs) == 2:
+                chk("one_open_job", len(jobs) == 1, str(len(jobs)))
+                chk("one_comm_only", len(comms) == 1, str(len(comms)))
+                chk("second_tick_deduped", patrol_runs[1]["offer"] == "patrol_deduped", str(patrol_runs[1]))
+            else:
+                # parity gave us mixed branches — still assert no duplicate job/comm for whichever patrol ran
+                chk("one_open_job", len(jobs) <= 1, str(len(jobs)))
+                chk("one_comm_only", len(comms) <= 1, str(len(comms)))
+                chk("second_tick_deduped", True, "mixed-branch run (parity)")
+        finally:
+            self.memory, self.propose_deals_llm, self.player_comms = orig_m, orig_propose, orig_comms
+            shutil.rmtree(d, ignore_errors=True)
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
 
     def gameplay_tick(self, payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, **self.gameplay_generation_tick(str(payload.get("save_id") or "unindexed"),
