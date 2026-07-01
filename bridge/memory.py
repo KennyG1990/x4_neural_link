@@ -300,6 +300,62 @@ class MemoryStore:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_agreements_save ON agreements(save_id, status)")
+            # ---- Negotiations N1: durable agreement identity + dedup (idempotent migration) ----
+            _agr_cols = {r[1] for r in conn.execute("PRAGMA table_info(agreements)").fetchall()}
+            for _col, _ddl in (("agreement_key", "TEXT"), ("kind", "TEXT"), ("operation_id", "TEXT"),
+                               ("operation_task_id", "TEXT"), ("request_count", "INTEGER DEFAULT 1"),
+                               ("last_requested_at", "REAL"), ("urgency", "INTEGER DEFAULT 0"),
+                               ("offered_value", "INTEGER DEFAULT 0"), ("context_json", "TEXT")):
+                if _col not in _agr_cols:
+                    conn.execute(f"ALTER TABLE agreements ADD COLUMN {_col} {_ddl}")
+            # backfill agreement_key for legacy rows (compute from type/parties/terms)
+            for _r in conn.execute("SELECT id, save_id, type, party_a, party_b, terms_json FROM agreements "
+                                   "WHERE agreement_key IS NULL OR agreement_key=''").fetchall():
+                try:
+                    _t = json.loads(_r[5]) if _r[5] else {}
+                except Exception:
+                    _t = {}
+                _k = ":".join([_r[1] or "", _r[2] or "", _r[3] or "", _r[4] or "",
+                               str(_t.get("operation_id") or ""), str(_t.get("operation_task_id") or ""),
+                               str(_t.get("kind") or "")])
+                conn.execute("UPDATE agreements SET agreement_key=?, kind=COALESCE(kind, ?), "
+                             "operation_id=COALESCE(operation_id, ?), operation_task_id=COALESCE(operation_task_id, ?) "
+                             "WHERE id=?",
+                             (_k, str(_t.get("kind") or "") or None, str(_t.get("operation_id") or "") or None,
+                              str(_t.get("operation_task_id") or "") or None, _r[0]))
+            # collapse existing duplicate OPEN agreements: keep the earliest per key, supersede the rest
+            conn.execute(
+                "UPDATE agreements SET status='superseded', resolved_at=? "
+                "WHERE status IN ('proposed','pending','pending_response','countered','no_counterparty') "
+                "AND id NOT IN (SELECT MIN(id) FROM agreements "
+                "  WHERE status IN ('proposed','pending','pending_response','countered','no_counterparty') "
+                "  GROUP BY agreement_key)",
+                (time.time(),))
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_agreements_open ON agreements(agreement_key) "
+                         "WHERE status IN ('proposed','pending','pending_response','countered','no_counterparty')")
+            # ---- Decision records: audit log of every Player2 Decision Adapter call (spec §12) ----
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS decision_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    save_id TEXT NOT NULL,
+                    decision_type TEXT,
+                    subject_faction TEXT,
+                    linked_operation_id TEXT,
+                    linked_offer_id INTEGER,
+                    brief TEXT,
+                    options_json TEXT,
+                    advisory_json TEXT,
+                    request_id TEXT,
+                    raw_response TEXT,
+                    parsed_choice TEXT,
+                    validator_result TEXT,
+                    final_status TEXT,
+                    source TEXT,
+                    created_at REAL NOT NULL,
+                    decided_at REAL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_decisions_save ON decision_records(save_id, id)")
             # ---- Economy MEANING per faction (NOT a commodity market) ----------
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS economy (
@@ -3235,6 +3291,78 @@ class MemoryStore:
             return "amicable"
         return "watchful"
 
+    # DeadAir dynamicwardiplomacy.xml: factions that are NOT diplomatic actors — never a legal relation-move target.
+    RELATION_EXCLUDED_FACTIONS = {"civilian", "criminal", "khaak", "smuggler", "visitor", "xenon", "ownerless", "yaki"}
+
+    def validate_relation_move(self, save_id: str, actor: str, target: str, step: float = 5.0) -> dict:
+        """DeadAir-grounded eligibility+bounds gate for a Player2-PROPOSED relation change (the model in
+        dynamicwardiplomacy.xml the bridge previously lacked): both must be real, distinct, diplomatic factions
+        (neither in the excluded set), and the move is bounded — |step| ≤ 5 with the resulting standing clamped to the
+        ±25 diplomatic band. Attitude-only (anti-cheat OK: intent→attitude, never resources). The engine VALIDATES;
+        Player2 only proposed. Returns {ok, clamped_step, result, reason}."""
+        a = str(actor or "").strip().lower()
+        b = str(target or "").strip().lower()
+        if not a or not b or a == b:
+            return {"ok": False, "reason": "need two distinct factions"}
+        if a in self.RELATION_EXCLUDED_FACTIONS or b in self.RELATION_EXCLUDED_FACTIONS:
+            bad = a if a in self.RELATION_EXCLUDED_FACTIONS else b
+            return {"ok": False, "reason": f"excluded (non-diplomatic) faction: {bad}"}
+        known = {f.get("faction_id") for f in self.list_factions(save_id)}
+        if a not in known or b not in known:
+            return {"ok": False, "reason": "unknown faction (not in this save)"}
+        try:
+            step = float(step or 0)
+        except Exception:
+            step = 0.0
+        step = max(-5.0, min(5.0, step))  # DeadAir step bound (±5)
+        cur = float((self.get_relationship(save_id, a, b) or {}).get("trust") or 0)
+        result = max(-25.0, min(25.0, cur + step))  # DeadAir ±25 diplomatic band
+        clamped = result - cur
+        if clamped == 0 and step != 0:
+            return {"ok": False, "clamped_step": 0.0, "result": result, "reason": "at diplomatic band limit (±25)"}
+        return {"ok": True, "clamped_step": clamped, "result": result, "reason": "ok"}
+
+    def faction_doctrine_brief(self, save_id: str, faction_id: str) -> str:
+        """#53 — a compact Worldview line for the faction ACTOR in any decision (decide / decide_actions), composed
+        from the SAME canon source NPC chat uses: FACTION_PERSONA (aggr/econ/risk/dipl + goal) → trait adjectives,
+        the standing goal, and the live mood. This makes strategic faction decisions doctrine-flavored, not generic
+        'decide in character'. Deterministic; no LLM. Mirrors persona.PersonaCardBuilder._persona_traits thresholds."""
+        fid = str(faction_id or "").strip().lower()
+        if not fid:
+            return ""
+        aggr, econ, risk, dipl, goal = self.FACTION_PERSONA.get(fid, self.FACTION_PERSONA_DEFAULT)
+        aggr, econ, risk, dipl = float(aggr), float(econ), float(risk), float(dipl)
+        traits: list[str] = []
+        traits.append("aggressive and quick to anger" if aggr >= 0.6
+                      else ("measured and slow to provoke" if aggr <= 0.35 else "firm but controlled"))
+        if dipl >= 0.65:
+            traits.append("diplomatic")
+        elif dipl <= 0.3:
+            traits.append("uncompromising")
+        if econ >= 0.8:
+            traits.append("pragmatic and profit-minded")
+        if risk >= 0.65:
+            traits.append("bold")
+        elif risk <= 0.35:
+            traits.append("cautious")
+        # live mood: prefer the stored (heartbeat-derived) value, else derive on the fly, else a calm baseline.
+        mood = ""
+        try:
+            fac = self.get_faction(save_id, fid) or {}
+            mood = str(fac.get("mood") or "")
+            if not mood:
+                mood = self._derive_mood(self.derive_pressures(save_id, fid) or {})
+        except Exception:
+            mood = ""
+        name = (self.FACTION_NAMES.get(fid) or (self.get_faction(save_id, fid) or {}).get("name")
+                or fid.replace("_", " ").title())
+        line = f"You are the leadership of {name}: {', '.join(traits)}."
+        if goal:
+            line += f" Your standing goal: {goal}"
+        if mood:
+            line += f" Your current mood: {mood}."
+        return line
+
     def derive_all_pressures(self, save_id: str) -> dict:
         """Tier-3 strategic deriver (the keystone). Recompute EVERY known faction's strategic_state
         pressures from the live substrate (economy / active conflicts / windowed war-losses / contested
@@ -3395,8 +3523,25 @@ class MemoryStore:
 
     # --- Agreements / promises / deals ----------------------------------------
 
+    _AGR_TERMINAL = ("kept", "broken", "expired", "fulfilled", "cancelled", "rejected",
+                     "refused", "superseded", "transitioned")
+
     def add_agreement(self, save_id: str, party_a: str, party_b: str, type: str = "",
                       terms: Any = None, deadline: float = 0.0, status: str = "pending") -> dict:
+        """NEGOTIATIONS INVARIANT: no OPEN/active deal may be appended without going through the dedupe/identity door.
+        Any non-terminal status is redirected to create_or_update_agreement (one open offer per agreement_key) — so
+        EVERY caller (generate_agreements, OPORD ceasefire/allied, etc.) deduplicates at the API level, not per-site.
+        Only terminal/historical records (kept/broken/expired/…) insert directly."""
+        if status not in self._AGR_TERMINAL:
+            t = terms if isinstance(terms, dict) else {}
+            res = self.create_or_update_agreement(
+                save_id, party_a, party_b, type=type, kind=str(t.get("kind") or ""),
+                operation_id=str(t.get("operation_id") or ""),
+                operation_task_id=str(t.get("operation_task_id") or ""),
+                terms=terms, deadline=deadline, status=status)
+            return {"id": res["id"], "save_id": save_id, "party_a": party_a, "party_b": party_b,
+                    "type": type, "status": status, "agreement_key": res.get("agreement_key"),
+                    "created": res.get("created"), "request_count": res.get("request_count")}
         now = time.time()
         with self._lock, self._connect() as conn:
             cur = conn.execute("""
@@ -3410,6 +3555,334 @@ class MemoryStore:
             agreement_id = cur.lastrowid
         return {"id": agreement_id, "save_id": save_id, "party_a": party_a,
                 "party_b": party_b, "type": type, "status": status}
+
+    @staticmethod
+    def _agreement_key(save_id: str, type_: str, party_a: str, party_b: str,
+                       operation_id: str = "", operation_task_id: str = "", kind: str = "") -> str:
+        """Deterministic identity for an agreement (Negotiations §1): one OPEN agreement per key."""
+        return ":".join([save_id or "", type_ or "", party_a or "", party_b or "",
+                         operation_id or "", operation_task_id or "", kind or ""])
+
+    _AGR_OPEN = ("proposed", "pending", "pending_response", "countered", "no_counterparty")
+
+    def create_or_update_agreement(self, save_id: str, party_a: str, party_b: str, type: str = "",
+                                   kind: str = "", operation_id: str = "", operation_task_id: str = "",
+                                   terms: Any = None, deadline: float = 0.0, status: str = "pending",
+                                   urgency: int = 0, offered_value: int = 0, context: Any = None) -> dict:
+        """Upsert an agreement by its deterministic agreement_key (Negotiations §1, §7, §8): ONE open agreement per
+        key. A repeat request UPDATES the existing open row (bumps request_count, refreshes urgency/offer/context)
+        instead of inserting a duplicate — the anti-spam backbone for OPORD allied-support / negotiation requests."""
+        now = time.time()
+        key = self._agreement_key(save_id, type, party_a, party_b, operation_id, operation_task_id, kind)
+        ph = ",".join("?" * len(self._AGR_OPEN))
+        with self._lock, self._connect() as conn:
+            row = conn.execute(f"SELECT id, request_count FROM agreements WHERE save_id=? AND agreement_key=? "
+                               f"AND status IN ({ph}) ORDER BY id LIMIT 1",
+                               (save_id, key, *self._AGR_OPEN)).fetchone()
+            if row:
+                rc = int(row["request_count"] or 1) + 1
+                conn.execute("UPDATE agreements SET request_count=?, last_requested_at=?, urgency=?, offered_value=?, "
+                             "context_json=COALESCE(?, context_json), terms_json=COALESCE(?, terms_json), "
+                             "deadline=CASE WHEN ?>0 THEN ? ELSE deadline END WHERE id=?",
+                             (rc, now, int(urgency or 0), int(offered_value or 0),
+                              json.dumps(context) if context is not None else None,
+                              json.dumps(terms) if terms is not None else None,
+                              float(deadline or 0), float(deadline or 0), row["id"]))
+                conn.commit()
+                return {"ok": True, "id": row["id"], "created": False, "updated": True,
+                        "agreement_key": key, "request_count": rc, "party_b": party_b, "status": status}
+            cur = conn.execute(
+                "INSERT INTO agreements (save_id, party_a, party_b, type, kind, operation_id, operation_task_id, "
+                "agreement_key, terms_json, context_json, deadline, status, urgency, offered_value, request_count, "
+                "last_requested_at, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)",
+                (save_id, party_a, party_b, type, kind, operation_id, operation_task_id, key,
+                 json.dumps(terms) if terms is not None else None,
+                 json.dumps(context) if context is not None else None,
+                 float(deadline or 0), status, int(urgency or 0), int(offered_value or 0), now, now))
+            conn.commit()
+            return {"ok": True, "id": cur.lastrowid, "created": True, "updated": False,
+                    "agreement_key": key, "request_count": 1, "party_b": party_b, "status": status}
+
+    def select_support_counterparty(self, save_id: str, requester: str, enemy: str = "", sector: str = "") -> str:
+        """Pick a REAL ally for an allied-support request (Negotiations §2): a non-criminal faction (not the requester
+        or the enemy) with a non-hostile relation to the requester, ranked by trust + a shared-enemy bonus - its
+        resentment. Returns '' if none qualify (caller records no_counterparty instead of an anonymous spam row)."""
+        best, best_score = "", -1e18
+        for f in self.list_factions(save_id):
+            fid = f.get("faction_id") or ""
+            if not fid or fid == requester or fid == enemy or fid in self.CRIMINAL_FACTIONS:
+                continue
+            rel = self.get_relationship(save_id, fid, requester) or {}
+            trust = float(rel.get("trust") or 0)
+            if trust < 0:  # distrustful / hostile -> won't ally
+                continue
+            resentment = float(rel.get("resentment") or 0)
+            shared = 0.0
+            if enemy:
+                er = self.get_relationship(save_id, fid, enemy) or {}
+                if float(er.get("trust") or 0) < 0 or float(er.get("resentment") or 0) > 0:
+                    shared = 20.0
+            score = trust * 0.25 + shared - resentment * 0.2
+            if score > best_score:
+                best_score, best = score, fid
+        return best
+
+    _KIND_TO_TYPE = {"allied_support": "alliance", "patrol_cooperation": "patrol_cooperation",
+                     "ceasefire_payment": "ceasefire", "ceasefire": "ceasefire", "seek_ceasefire": "ceasefire",
+                     "non_aggression": "non_aggression", "trade_pact": "trade", "trade": "trade",
+                     "transit_rights": "transit", "reparations": "reparations",
+                     "territory_claim": "territory_claim", "access_rights": "access"}
+
+    def submit_negotiation_intent(self, save_id: str, source: str, kind: str, proposer: str, recipient: str = "",
+                                  operation_id: str = "", operation_task_id: str = "", terms: Any = None,
+                                  context: Any = None, deadline: float = 0.0, urgency: int = 0,
+                                  offered_value: int = 0, enemy: str = "", sector: str = "",
+                                  require_counterparty: bool = False) -> dict:
+        """THE single public door for creating a deal. Negotiations is the universal transaction layer: OPORD, the
+        job market, and chat all SUBMIT an intent here (source tags the origin); Negotiations owns dedupe, counterparty
+        selection, valuation, and lifecycle. No subsystem builds its own agreement model. Returns the (deduped) offer."""
+        type_ = self._KIND_TO_TYPE.get(kind, kind or "")
+        if not recipient and require_counterparty:
+            recipient = self.select_support_counterparty(save_id, proposer, enemy, sector)
+        # NF1 keeps the existing open status 'pending' (conclude/health/cleanup key on it); the richer canonical
+        # lifecycle (proposed→pending_response→accepted/…) is NF2's job, applied system-wide there.
+        status = "pending" if (recipient or not require_counterparty) else "no_counterparty"
+        ctx = dict(context or {})
+        ctx.setdefault("source", source)
+        ctx.setdefault("kind", kind)
+        ctx.setdefault("proposer", proposer)
+        ctx.setdefault("recipient", recipient)
+        if enemy:
+            ctx.setdefault("enemy", enemy)
+        if sector:
+            ctx.setdefault("sector", sector)
+        return self.create_or_update_agreement(
+            save_id, proposer, recipient, type=type_, kind=kind, operation_id=operation_id,
+            operation_task_id=operation_task_id, terms=terms, deadline=deadline, status=status,
+            urgency=urgency, offered_value=offered_value, context=ctx)
+
+    # NF2 acceptance bands (Codex/WH3): >=70 accept · 45-69 counter · 25-44 refuse · <25 refuse harshly
+    def score_agreement_acceptance(self, save_id: str, agreement: dict) -> dict:
+        """Deterministic acceptance score for an OPEN offer, from the RECIPIENT's point of view. Reads the SHARED
+        models — relationships (trust/resentment/debt toward the requester) + strategic_state (the recipient's own
+        war-load/losses) — NOT a bespoke pressure calc. The LLM never decides acceptance; this does. Returns
+        {score, decision, factors}."""
+        requester = agreement.get("party_a") or ""
+        recipient = agreement.get("party_b") or ""
+        if not recipient:
+            return {"score": 0.0, "decision": "no_counterparty", "factors": {}}
+        try:
+            ctx = json.loads(agreement.get("context_json") or "{}") or {}
+        except Exception:
+            ctx = {}
+        enemy = ctx.get("enemy") or agreement.get("target_faction") or ""
+        risk = float(ctx.get("risk") or 0)
+        offered = float(agreement.get("offered_value") or ctx.get("offered_value") or 0)
+        rel = self.get_relationship(save_id, recipient, requester) or {}
+        trust = float(rel.get("trust") or 0)
+        resentment = float(rel.get("resentment") or 0)
+        debt = float(rel.get("debt") or 0)          # recipient owes requester a favor → more willing
+        st = self.get_strategic_state(save_id, recipient) or {}
+        war_load = float(st.get("military_pressure") or 0)   # 0..1 own war involvement (overcommitment)
+        losses = float(st.get("recent_losses") or 0)         # 0..1 recently bloodied → cautious
+        shared = 0.0
+        if enemy:
+            er = self.get_relationship(save_id, recipient, enemy) or {}
+            if float(er.get("trust") or 0) < 0 or float(er.get("resentment") or 0) > 0:
+                shared = 20.0
+        factors = {
+            "base": 50.0, "trust": round(trust * 0.25, 1), "shared_enemy": shared,
+            "offer": round(min(20.0, offered / 10000.0), 1), "debt": round(debt * 0.1, 1),
+            "war_load_penalty": round(-war_load * 30.0, 1), "losses_penalty": round(-losses * 20.0, 1),
+            "resentment_penalty": round(-resentment * 0.2, 1), "risk_penalty": round(-risk * 30.0, 1),
+        }
+        score = round(sum(factors.values()), 1)
+        decision = ("accept" if score >= 70 else "counter" if score >= 45
+                    else "refuse" if score >= 25 else "refuse_harshly")
+        return {"score": score, "decision": decision, "factors": factors}
+
+    _AGR_EVALUATABLE = ("pending", "proposed", "pending_response")
+
+    def evaluate_open_offers(self, save_id: str, max_eval: int = 100) -> dict:
+        """NF2 resolution driver: score every open offer that has a real counterparty and transition it
+        (accept→accepted, counter→countered, refuse/refuse_harshly→refused), recording score+factors+decision in
+        context_json. Deterministic; runs on the heartbeat (via advance_operations). Counteroffers are left for the
+        requester (OPORD/OC) to answer; no-counterparty offers are skipped. (Consequences/budget = NF3/OC.)"""
+        ph = ",".join("?" * len(self._AGR_EVALUATABLE))
+        res = {"ok": True, "evaluated": 0, "accept": 0, "counter": 0, "refuse": 0, "refuse_harshly": 0}
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM agreements WHERE save_id=? AND status IN ({ph}) "
+                f"AND party_b IS NOT NULL AND party_b != '' ORDER BY id LIMIT ?",
+                (save_id, *self._AGR_EVALUATABLE, int(max_eval))).fetchall()
+        for row in rows:
+            ag = dict(row)
+            sc = self.score_agreement_acceptance(save_id, ag)
+            decision = sc["decision"]
+            if decision == "no_counterparty":
+                continue
+            new_status = {"accept": "accepted", "counter": "countered",
+                          "refuse": "refused", "refuse_harshly": "refused"}[decision]
+            try:
+                ctx = json.loads(ag.get("context_json") or "{}") or {}
+            except Exception:
+                ctx = {}
+            now = time.time()
+            ctx["acceptance"] = {"score": sc["score"], "decision": decision,
+                                 "factors": sc["factors"], "evaluated_at": now}
+            resolved = now if new_status in ("accepted", "refused") else None
+            with self._lock, self._connect() as conn:
+                conn.execute("UPDATE agreements SET status=?, context_json=?, "
+                             "resolved_at=COALESCE(?, resolved_at) WHERE id=?",
+                             (new_status, json.dumps(ctx), resolved, ag["id"]))
+                conn.commit()
+            res["evaluated"] += 1
+            res[decision] += 1
+        return res
+
+    def build_negotiation_situation(self, save_id: str, agreement: dict) -> dict:
+        """Deterministic SUMMARIZER → the grounded brief the Player2 faction-actor decides over (Codex loop step 2).
+        The engine sets the scene — who/what/terms + the recipient's relationship, war-pressures, faction
+        doctrine/personality/mood + an ADVISORY math score — but does NOT decide. The thinking entity decides."""
+        requester = agreement.get("party_a") or ""
+        recipient = agreement.get("party_b") or ""
+        try:
+            ctx = json.loads(agreement.get("context_json") or "{}") or {}
+        except Exception:
+            ctx = {}
+        rel = self.get_relationship(save_id, recipient, requester) or {}
+        st = self.get_strategic_state(save_id, recipient) or {}
+        fac = next((f for f in self.list_factions(save_id) if f.get("faction_id") == recipient), {}) or {}
+        try:
+            advisory = self.score_agreement_acceptance(save_id, agreement)
+        except Exception:
+            advisory = {"score": None, "decision": None}
+        return {
+            "agreement_id": agreement.get("id"), "kind": agreement.get("kind") or agreement.get("type"),
+            "requester": requester, "recipient": recipient, "enemy": ctx.get("enemy") or "",
+            "sector": ctx.get("sector") or "", "reason": ctx.get("reason") or "",
+            "offered_value": int(agreement.get("offered_value") or 0),
+            "urgency": int(agreement.get("urgency") or 0), "request_count": int(agreement.get("request_count") or 1),
+            "relationship": {"trust": rel.get("trust"), "resentment": rel.get("resentment"),
+                             "debt": rel.get("debt"), "fear": rel.get("fear")},
+            "recipient_state": {"military_pressure": st.get("military_pressure"),
+                                "recent_losses": st.get("recent_losses"),
+                                "economic_pressure": st.get("economic_pressure")},
+            "doctrine": {"mood": fac.get("mood"), "biases": fac.get("biases"), "values": fac.get("values"),
+                         "current_goal": fac.get("current_goal"), "summary": fac.get("summary")},
+            "advisory_score": advisory.get("score"), "advisory_decision": advisory.get("decision"),
+        }
+
+    _OFFER_DECISIONS = {"accept": "accepted", "counter": "countered", "refuse": "refused",
+                        "refuse_harshly": "refused", "defer": "pending"}
+
+    def apply_offer_decision(self, save_id: str, agreement_id: int, decision: str, reason: str = "",
+                             source: str = "player2", counter: Any = None) -> dict:
+        """RECORD a decision the Player2 actor made on an offer (status + in-character reason + source + any counter
+        terms). DELIBERATELY does NOT mutate relations/credits/ships — those are validator-gated execution effects
+        (NF3/OC). Player2 decides intent; the engine records it; validated execution applies the real effects."""
+        new_status = self._OFFER_DECISIONS.get(decision, "pending")
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT context_json FROM agreements WHERE save_id=? AND id=?",
+                               (save_id, agreement_id)).fetchone()
+            try:
+                ctx = json.loads((row["context_json"] if row else None) or "{}") or {}
+            except Exception:
+                ctx = {}
+            ctx["decision"] = {"decision": decision, "reason": (reason or "")[:400], "source": source,
+                               "counter": counter, "decided_at": now}
+            resolved = now if new_status in ("accepted", "refused") else None
+            conn.execute("UPDATE agreements SET status=?, context_json=?, resolved_at=COALESCE(?, resolved_at) "
+                         "WHERE save_id=? AND id=?",
+                         (new_status, json.dumps(ctx), resolved, save_id, agreement_id))
+            conn.commit()
+        return {"ok": True, "id": agreement_id, "status": new_status, "decision": decision, "source": source}
+
+    def apply_relationship_consequence(self, save_id: str, requester: str, recipient: str, decision: str,
+                                       urgency: int = 0) -> dict:
+        """NF3: the bounded RELATIONSHIP consequence of a negotiation outcome — a deterministic EXECUTION effect
+        gated by the Player2 decision (attitude shift, anti-cheat OK: intent→attitude). Refusal breeds resentment;
+        acceptance builds trust + debt. Also emits a transition world-event so the outcome surfaces as news."""
+        if not requester or not recipient or requester == recipient:
+            return {"ok": False, "reason": "no parties"}
+        scale = 1.0 + min(2.0, float(urgency or 0) / 3.0)  # urgent refusals sting more
+        d = decision
+        applied = "none"
+        if d in ("refused", "refuse"):
+            self.adjust_relationship(save_id, requester, recipient, dtrust=int(-3 * scale),
+                                     dresentment=int(5 * scale), summary=f"{recipient} refused {requester}'s request")
+            applied = "refused"
+        elif d == "refuse_harshly":
+            self.adjust_relationship(save_id, requester, recipient, dtrust=int(-6 * scale),
+                                     dresentment=int(10 * scale), summary=f"{recipient} rebuffed {requester} harshly")
+            applied = "refused"
+        elif d in ("accepted", "accept"):
+            self.adjust_relationship(save_id, requester, recipient, dtrust=int(4 * scale), ddebt=int(4 * scale),
+                                     summary=f"{recipient} accepted {requester}'s request")
+            applied = "accepted"
+        elif d in ("countered", "counter"):
+            self.adjust_relationship(save_id, requester, recipient, dtrust=int(1 * scale),
+                                     summary=f"{recipient} countered {requester}'s offer")
+            applied = "countered"
+        else:
+            return {"ok": True, "applied": "none"}
+        try:
+            self.add_world_event(save_id, event_type=f"agreement_{applied}",
+                                 summary=f"{recipient} {applied} {requester}'s proposal.",
+                                 primary_faction=recipient, secondary_faction=requester,
+                                 importance=(3 if applied != "accepted" else 2))
+        except Exception:
+            pass
+        return {"ok": True, "applied": applied}
+
+    # --- Decision records: audit log for the Player2 Decision Adapter (spec §12) ---------------------
+    def record_decision(self, save_id: str, decision_type: str, subject_faction: str, source: str,
+                        parsed_choice: Optional[str] = None, brief: str = "", options: Any = None,
+                        advisory: Any = None, raw_response: str = "", request_id: str = "",
+                        linked_operation_id: Optional[str] = None, linked_offer_id: Optional[int] = None,
+                        final_status: str = "") -> int:
+        """One durable row per decide() call — replayable/auditable (why did teladi refuse? what did the model see?)."""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO decision_records (save_id, decision_type, subject_faction, linked_operation_id, "
+                "linked_offer_id, brief, options_json, advisory_json, request_id, raw_response, parsed_choice, "
+                "final_status, source, created_at, decided_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (save_id, decision_type, subject_faction, linked_operation_id, linked_offer_id,
+                 (brief or "")[:4000], json.dumps(options or []),
+                 json.dumps(advisory) if advisory is not None else None, request_id,
+                 (raw_response or "")[:2000], parsed_choice, final_status or None, source, now, now))
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def finalize_decision(self, decision_id: int, validator_result: Any = None, final_status: Optional[str] = None,
+                          linked_operation_id: Optional[str] = None, linked_offer_id: Optional[int] = None) -> dict:
+        """Update a decision record after the caller validated + executed (final_status applied/rejected/converted)."""
+        sets: list[str] = []
+        vals: list = []
+        if validator_result is not None:
+            sets.append("validator_result=?")
+            vals.append(validator_result if isinstance(validator_result, str) else json.dumps(validator_result))
+        if final_status is not None:
+            sets.append("final_status=?"); vals.append(final_status)
+        if linked_operation_id is not None:
+            sets.append("linked_operation_id=?"); vals.append(linked_operation_id)
+        if linked_offer_id is not None:
+            sets.append("linked_offer_id=?"); vals.append(linked_offer_id)
+        if not sets:
+            return {"ok": True, "noop": True}
+        sets.append("decided_at=?"); vals.append(time.time()); vals.append(int(decision_id))
+        with self._lock, self._connect() as conn:
+            conn.execute(f"UPDATE decision_records SET {','.join(sets)} WHERE id=?", vals)
+            conn.commit()
+        return {"ok": True, "id": decision_id}
+
+    def list_decision_records(self, save_id: str, limit: int = 50) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM decision_records WHERE save_id=? ORDER BY id DESC LIMIT ?",
+                                (save_id, int(limit))).fetchall()
+        return [dict(r) for r in rows]
 
     @staticmethod
     def _decode_agreement(row: dict) -> dict:
@@ -3819,6 +4292,24 @@ class MemoryStore:
     # --- OPORD Execution Authority: ship leases (real-asset orders) + force-quota requests --------------
     _LEASE_TERMINAL = ("completed", "failed", "released", "lost")
 
+    def debug_force_pending_order(self, save_id: str, faction: str = "argon") -> dict:
+        """DEBUG/TEST ONLY: synthesize one ACTIVE op with a single pending-ingame fleet task so the in-game MD
+        issuer (On_Assign) can be exercised ON DEMAND (the live recognizer's anti-spam dedup otherwise blocks
+        manufacturing a fresh combat op). Writes real rows in the normal tables; clean up by concluding the op."""
+        save_id = save_id or "unindexed"
+        faction = faction or "argon"
+        threat_key = f"{save_id}:{faction}:sector_pressure:debug:{uuid.uuid4().hex[:6]}"
+        res = self.create_or_get_operation(save_id, faction, "sector_pressure", threat_key,
+                                           status="active", target_faction="xenon",
+                                           target_sector="Argon Prime", urgency=5, importance=5,
+                                           threat_id=threat_key)
+        op_id = res["id"]
+        task_id = self.attach_task(op_id, "patrol_sector", status="issued", assigned_actor_type="fleet",
+                                   owning_faction=faction, target_faction="xenon",
+                                   target_sector="Argon Prime", order_id="pending_ingame")
+        return {"ok": True, "operation_id": op_id, "task_id": task_id, "faction": faction,
+                "note": "GET /v1/opord/orders/pending should now list it; the in-game poller will fire On_Assign"}
+
     def pending_orders(self, save_id: str) -> dict:
         """Tasks awaiting a REAL in-game ship order — internal-fleet tasks routed but still `pending_ingame`.
         The MD issuer polls this, finds a ship, leases it, issues a create_order, then reports back."""
@@ -4170,13 +4661,32 @@ class MemoryStore:
             persisted.append(rec)
             if best is None or score > best["score"] or (score == best["score"] and c["coa_type"] < best["type"]):
                 best = rec
+        # D1: the engine does the STAFF WORK (generate/screen/wargame/score) and records the ADVISORY best, but does
+        # NOT select. The op waits at coa_generated until Player2 chooses via router.select_pending_coas_llm. The
+        # deterministic score is advice, not the decision (spec §1/§11).
         if best:
-            with self._lock, self._connect() as conn:
-                conn.execute("UPDATE operation_coas SET viability_status='selected', selected=1 WHERE id=?",
-                             (best["coa_id"],))
-                conn.commit()
-            self.update_operation(op_id, status="coa_generated", selected_coa_id=best["coa_id"])
-        return {"ok": True, "op_id": op_id, "coas": persisted, "selected": best}
+            self.update_operation(op_id, status="coa_generated")
+        return {"ok": True, "op_id": op_id, "coas": persisted, "advisory_best": best, "selected": None}
+
+    def set_selected_coa(self, op_id: str, coa_id: str) -> dict:
+        """Commit a COA selection (the result of the Player2 D1 decision, or a test/operator action). Validates the
+        COA belongs to the op and is viable; marks it selected and advances the op so OPORD generation can proceed."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT operation_id, viability_status FROM operation_coas WHERE id=?",
+                               (coa_id,)).fetchone()
+            if not row or row["operation_id"] != op_id:
+                return {"ok": False, "reason": "coa not for this op"}
+            if row["viability_status"] not in ("viable", "selected"):
+                return {"ok": False, "reason": f"coa not viable ({row['viability_status']})"}
+            conn.execute("UPDATE operation_coas SET viability_status='selected', selected=1 WHERE id=?", (coa_id,))
+            conn.commit()
+        self.update_operation(op_id, status="coa_generated", selected_coa_id=coa_id)
+        return {"ok": True, "op_id": op_id, "selected_coa_id": coa_id}
+
+    def list_viable_coas(self, op_id: str) -> list[dict]:
+        """Viable COA candidates for an op (the legal menu the Player2 D1 decision chooses from)."""
+        det = self.operation_detail(op_id) or {}
+        return [c for c in (det.get("coas") or []) if c.get("viability_status") in ("viable", "selected")]
 
     def plan_pending_coas(self, save_id: str) -> dict:
         """Run the COA engine on every operation at `analysing` (the analyse→coa_generated transition)."""
@@ -4238,18 +4748,26 @@ class MemoryStore:
         ships = int(((op.get("mission_analysis_json") or {}).get("available_assets") or {}).get("combat_ships") or 0)
         ev = {"operation_id": op_id, "sector": sector}
         if ttype in {"patrol_sector", "engage_hostiles", "raid_enemy_logistics"} and ships > 0:
-            self.update_task(task_id, status="issued", assigned_actor_type="fleet", owning_faction=faction,
-                             order_id="pending_ingame", issued_at=time.time())
-            return {"task_id": task_id, "route": "internal_fleet"}
+            # D3/D4 ROUTING DECISION: with own ships available, fulfilment is a CHOICE — commit our own fleet, hire
+            # contractors, or ask an ally. Player2 decides via router.route_pending_tasks_llm; leave the task PLANNED
+            # (unrouted) for the driver. Single-viable cases (no ships → hire below) still route deterministically.
+            return {"task_id": task_id, "route": "awaiting_decision",
+                    "options": ["commit_own_fleet", "hire_contractors", "ask_ally"]}
         if ttype in {"request_allied_support"}:
-            ag = self.add_agreement(save_id, faction, "", type="alliance", status="pending",
-                                    terms={"operation_id": op_id, "operation_task_id": task_id,
-                                           "kind": "allied_support", "sector": sector})
+            # OPORD SUBMITS AN INTENT — Negotiations owns counterparty + dedupe + (later) acceptance.
+            ag = self.submit_negotiation_intent(
+                save_id, "opord", "allied_support", faction, operation_id=op_id, operation_task_id=task_id,
+                urgency=int(op.get("urgency") or 0), enemy=target, sector=sector, require_counterparty=True,
+                terms={"operation_id": op_id, "operation_task_id": task_id, "kind": "allied_support",
+                       "sector": sector, "enemy": target})
             self.update_task(task_id, status="issued", agreement_id=str(ag.get("id")), issued_at=time.time())
-            return {"task_id": task_id, "route": "agreement:allied"}
+            return {"task_id": task_id, "route": "agreement:allied",
+                    "party_b": ag.get("party_b"), "agreement_id": ag.get("id")}
         if ttype in {"seek_ceasefire"}:
-            ag = self.add_agreement(save_id, faction, target, type="ceasefire", status="pending",
-                                    terms={"operation_id": op_id, "operation_task_id": task_id, "kind": "ceasefire"})
+            ag = self.submit_negotiation_intent(
+                save_id, "opord", "ceasefire", faction, recipient=target, operation_id=op_id,
+                operation_task_id=task_id, enemy=target, sector=sector,
+                terms={"operation_id": op_id, "operation_task_id": task_id, "kind": "ceasefire"})
             self.update_task(task_id, status="issued", agreement_id=str(ag.get("id")), issued_at=time.time())
             return {"task_id": task_id, "route": "agreement:ceasefire"}
         jt = ("supply" if ttype in {"request_supplies", "post_supply_contract", "supply_delivery"}
@@ -4262,6 +4780,62 @@ class MemoryStore:
                                         operation_id=op_id, operation_task_id=task_id, evidence=ev)
         self.update_task(task_id, status="issued", job_id=str(job.get("id")), issued_at=time.time())
         return {"task_id": task_id, "route": "job:" + jt, "job_created": job.get("created")}
+
+    def route_task(self, op: dict, task: dict, choice: str) -> dict:
+        """Commit a D3/D4 routing CHOICE for a task (the Player2 decision, or a single-viable deterministic route).
+        choice: commit_own_fleet | hire_contractors | ask:<faction>. Links the task + marks it issued."""
+        save_id, faction, op_id, task_id = op["save_id"], op["faction_id"], op["id"], task["id"]
+        sector = task.get("target_sector") or op.get("target_sector") or ""
+        target = task.get("target_faction") or op.get("target_faction") or ""
+        ttype = task.get("task_type") or ""
+        if choice == "commit_own_fleet":
+            self.update_task(task_id, status="issued", assigned_actor_type="fleet", owning_faction=faction,
+                             order_id="pending_ingame", issued_at=time.time())
+            return {"ok": True, "task_id": task_id, "route": "internal_fleet"}
+        if choice == "hire_contractors":
+            jt = "privateer" if ttype == "raid_enemy_logistics" else "patrol"
+            job = self.create_or_update_job(save_id, faction, jt, target_sector=sector, target_faction=target,
+                                            reward=self.OPORD_JOB_REWARDS.get(jt, 50000),
+                                            urgency=int(op.get("urgency") or 0), operation_id=op_id,
+                                            operation_task_id=task_id, evidence={"operation_id": op_id, "sector": sector})
+            self.update_task(task_id, status="issued", job_id=str(job.get("id")), issued_at=time.time())
+            return {"ok": True, "task_id": task_id, "route": "job:" + jt}
+        if isinstance(choice, str) and choice.startswith("ask:"):
+            ally = choice.split(":", 1)[1]
+            if not ally or ally == faction:
+                return {"ok": False, "reason": "invalid ally"}
+            ag = self.submit_negotiation_intent(
+                save_id, "opord", "allied_support", faction, recipient=ally, operation_id=op_id,
+                operation_task_id=task_id, urgency=int(op.get("urgency") or 0), enemy=target, sector=sector,
+                terms={"operation_id": op_id, "operation_task_id": task_id, "kind": "allied_support",
+                       "sector": sector, "enemy": target})
+            self.update_task(task_id, status="issued", agreement_id=str(ag.get("id")), issued_at=time.time())
+            return {"ok": True, "task_id": task_id, "route": "agreement:allied", "party_b": ally,
+                    "agreement_id": ag.get("id")}
+        return {"ok": False, "reason": f"unknown route choice {choice}"}
+
+    def select_support_candidates(self, save_id: str, requester: str, enemy: str = "", sector: str = "",
+                                  top: int = 3) -> list[str]:
+        """Ranked ally candidates (advisory) — the legal menu the Player2 D4 counterparty decision picks from. Same
+        scoring as select_support_counterparty (trust*0.25 + shared_enemy − resentment*0.2), best-first."""
+        scored = []
+        for f in self.list_factions(save_id):
+            fid = f.get("faction_id") or ""
+            if not fid or fid == requester or fid == enemy or fid in self.CRIMINAL_FACTIONS:
+                continue
+            rel = self.get_relationship(save_id, fid, requester) or {}
+            trust = float(rel.get("trust") or 0)
+            if trust < 0:
+                continue
+            resentment = float(rel.get("resentment") or 0)
+            shared = 0.0
+            if enemy:
+                er = self.get_relationship(save_id, fid, enemy) or {}
+                if float(er.get("trust") or 0) < 0 or float(er.get("resentment") or 0) > 0:
+                    shared = 20.0
+            scored.append((trust * 0.25 + shared - resentment * 0.2, fid))
+        scored.sort(reverse=True)
+        return [fid for _, fid in scored[:int(top)]]
 
     def route_operation(self, op_id: str) -> dict:
         """Route all PLANNED tasks of an issued operation, then advance opord_issued→active (activated_at)."""
@@ -4325,50 +4899,116 @@ class MemoryStore:
             if tids:
                 self.attach_report(op_id, "bda", f"BDA: enemy losses observed ({round(our_kills, 1)}); offensive tasks complete.",
                                    severity=2, evidence={"enemy_loss": round(our_kills, 1), "tasks_completed": len(tids)})
-        # FRAGO: enemy reinforcement → request allied support (a real proposal) + report.
-        if recent_mag >= self.OPORD_REINFORCE_MAG:
-            ag = self.add_agreement(save_id, op["faction_id"], "", type="alliance", status="pending",
-                                    terms={"operation_id": op_id, "kind": "allied_support", "reason": "reinforcement"})
-            self.attach_report(op_id, "frago", f"FRAGO: {target} reinforcing {sector}; requesting allied support.",
-                               severity=3, evidence={"trigger": "enemy_reinforcement", "agreement_id": ag.get("id")})
-            fragos.append("enemy_reinforcement")
-        # FRAGO: unclaimed linked job too long → increase reward, BUT gated by the op's reserved budget
-        # (no escalation beyond what the operation actually reserved — spec budget rule; #2 audit fix).
-        reserved = int(op.get("budget_reserved") or 0)
-        for j in self.list_jobs(save_id, "open"):
-            if j.get("operation_id") == op_id and (now - float(j.get("created_at") or now)) >= self.OPORD_JOB_UNCLAIMED_S:
-                cur = int(j.get("reward") or 0)
-                new_reward = min(int(cur * 1.5) or 1, reserved)
-                if new_reward > cur:
-                    with self._lock, self._connect() as conn:
-                        conn.execute("UPDATE market_jobs SET reward=?, updated_at=? WHERE id=?", (new_reward, now, j["id"]))
-                        conn.commit()
-                    self.attach_report(op_id, "frago", f"FRAGO: job unclaimed; reward raised to {new_reward}.",
-                                       severity=2, evidence={"trigger": "job_unclaimed", "job_id": j["id"], "reward": new_reward})
-                    fragos.append("job_unclaimed")
-                else:
-                    self.attach_report(op_id, "budget_report",
-                                       f"Job unclaimed but reserved budget ({reserved}) cannot raise reward above {cur}.",
-                                       severity=2, evidence={"trigger": "budget_exhausted", "job_id": j["id"]})
-                    fragos.append("budget_exhausted")
-        if fragos:  # one gated milestone event for the FRAGO (cooldown stops per-tick spam)
-            self.emit_operation_event(op, "frago_issued", 3,
-                                      f"FRAGO on {op['faction_id']} operation in {sector or 'AO'}: {', '.join(fragos)}.")
-        # Conclude from evidence.
+        # JUDGMENT (escalate / conserve / raise reward / conclude-on-abated) is the Player2 D5 decision over this
+        # SITREP — router.assess_operations_llm → apply_assessment_decision. assess does FACTS + a SAFETY BACKSTOP
+        # only: a hung op past MAX age FAILS (time_expired is a hard fact, not a judgment; prevents infinite ops).
         outcome = None
-        if recent_mag <= 0 and age >= self.OPORD_MIN_ACTIVE_S:
-            self.conclude_operation(op_id, "completed", "Hostile pressure abated; sector stable.")
-            self.attach_report(op_id, "completion_report", "Operation complete: pressure abated.", severity=2)
-            self.emit_operation_event(op, "operation_completed", 4,
-                                      f"{op['faction_id']} operation in {sector or 'the sector'} succeeded; pressure abated.")
-            outcome = "completed"
-        elif age >= self.OPORD_MAX_ACTIVE_S:
+        if age >= self.OPORD_MAX_ACTIVE_S:
             self.conclude_operation(op_id, "failed", "Operation timed out without resolving the threat.")
             self.attach_report(op_id, "failure_report", "Operation failed: timed out, threat unresolved.", severity=3)
             self.emit_operation_event(op, "operation_failed", 3,
                                       f"{op['faction_id']} operation in {sector or 'the sector'} failed; threat unresolved.")
             outcome = "failed"
-        return {"ok": True, "op_id": op_id, "recent_magnitude": round(recent_mag, 1), "fragos": fragos, "outcome": outcome}
+        return {"ok": True, "op_id": op_id, "recent_magnitude": round(recent_mag, 1),
+                "our_kills": round(our_kills, 1), "age_s": int(age), "outcome": outcome,
+                "needs_decision": outcome is None}
+
+    def can_conclude(self, op_id: str) -> dict:
+        """Validator for the Player2 `request_conclude` intent (spec D5): an op may conclude ONLY on objective proof —
+        threat_abated (no new enemy pressure + min active age), time_expired (past max age), or budget_exhausted.
+        No proof → not concludable (caller converts to hold/reassess). Player2 never marks complete on a feeling."""
+        op = self.get_operation(op_id)
+        if not op:
+            return {"ok": False, "reasons": [], "reason": "no op"}
+        save_id = op["save_id"]
+        now = time.time()
+        activated = float(op.get("activated_at") or op.get("issued_at") or op.get("created_at") or now)
+        age = now - activated
+        sector = op.get("target_sector") or ""
+        target = op.get("target_faction") or ""
+        recent_mag = 0.0
+        for e in self.list_hostile_events(save_id, window_s=max(age, 1.0) + 5.0, limit=2000):
+            if e.get("sector") == sector and e.get("attacker_faction") == target and float(e.get("ts") or 0) >= activated:
+                recent_mag += float(e.get("magnitude") or 0)
+        reasons = []
+        if recent_mag <= 0 and age >= self.OPORD_MIN_ACTIVE_S:
+            reasons.append("threat_abated")
+        if age >= self.OPORD_MAX_ACTIVE_S:
+            reasons.append("time_expired")
+        reserved = int(op.get("budget_reserved") or 0)
+        if reserved > 0 and int(op.get("budget_spent") or 0) >= reserved:
+            reasons.append("budget_exhausted")
+        suggested = "failed" if ("time_expired" in reasons and "threat_abated" not in reasons) else "completed"
+        return {"ok": bool(reasons), "reasons": reasons, "recent_magnitude": round(recent_mag, 1),
+                "age_s": int(age), "suggested_status": suggested}
+
+    def apply_assessment_decision(self, op_id: str, decision: str, reason: str = "") -> dict:
+        """Execute the Player2 D5 assessment decision with validators (intent → validated execution). Options:
+        escalate_reinforce (→ allied-support negotiation intent), raise_reward (budget-gated job reward bump),
+        hold (no-op), request_conclude (→ can_conclude validator; concludes only on proof, else converts to hold)."""
+        op = self.get_operation(op_id)
+        if not op or op.get("status") not in ("active", "frago_required"):
+            return {"ok": False, "reason": "not an active operation"}
+        save_id = op["save_id"]
+        sector = op.get("target_sector") or ""
+        target = op.get("target_faction") or ""
+        now = time.time()
+        if decision in ("request_conclude", "conclude"):
+            cc = self.can_conclude(op_id)
+            if not cc["ok"]:
+                self.attach_report(op_id, "assessment",
+                                   f"Commander sought to conclude but evidence is insufficient; holding. {reason}",
+                                   severity=2, evidence={"converted": "hold", "can_conclude": cc})
+                return {"ok": True, "applied": "converted_to_hold", "can_conclude": cc}
+            status = cc.get("suggested_status", "completed")
+            self.conclude_operation(op_id, status, reason or ("Hostile pressure abated; sector stable."
+                                                              if status == "completed" else "Operation concluded."))
+            self.attach_report(op_id, ("completion_report" if status == "completed" else "failure_report"),
+                               f"Operation {status}: {reason or ', '.join(cc['reasons'])}.",
+                               severity=(2 if status == "completed" else 3))
+            self.emit_operation_event(op, ("operation_completed" if status == "completed" else "operation_failed"),
+                                      4, f"{op['faction_id']} operation in {sector or 'the sector'} {status}.")
+            return {"ok": True, "applied": status, "can_conclude": cc}
+        if decision in ("escalate_reinforce", "escalate") or decision.startswith("escalate:"):
+            # D4b: the WHICH-ally counterparty is the Player2 pick (escalate:<ally>); only fall back to the advisory
+            # auto-pick when no ally was chosen (back-compat / deterministic test path).
+            ally = decision.split(":", 1)[1] if decision.startswith("escalate:") else ""
+            ag = self.submit_negotiation_intent(
+                save_id, "opord", "allied_support", op["faction_id"], operation_id=op_id,
+                recipient=ally, enemy=target, sector=sector, require_counterparty=(not ally),
+                terms={"operation_id": op_id, "kind": "allied_support", "reason": "reinforcement",
+                       "sector": sector, "enemy": target})
+            if ag.get("created"):
+                self.attach_report(op_id, "frago",
+                                   f"FRAGO: requesting allied support from {ag.get('party_b') or 'available allies'}.",
+                                   severity=3, evidence={"trigger": "commander_escalate", "agreement_id": ag.get("id")})
+                self.emit_operation_event(op, "frago_issued", 3,
+                                          f"FRAGO on {op['faction_id']} operation in {sector or 'AO'}: reinforcement.")
+            return {"ok": True, "applied": "escalate_reinforce", "agreement_id": ag.get("id"),
+                    "ally": ag.get("party_b")}
+        if decision == "raise_reward":
+            reserved = int(op.get("budget_reserved") or 0)
+            bumped = []
+            for j in self.list_jobs(save_id, "open"):
+                if j.get("operation_id") == op_id:
+                    cur = int(j.get("reward") or 0)
+                    new_reward = min(int(cur * 1.5) or 1, reserved)
+                    if new_reward > cur:
+                        with self._lock, self._connect() as conn:
+                            conn.execute("UPDATE market_jobs SET reward=?, updated_at=? WHERE id=?",
+                                         (new_reward, now, j["id"]))
+                            conn.commit()
+                        bumped.append({"job_id": j["id"], "reward": new_reward})
+            if bumped:
+                self.attach_report(op_id, "frago", f"FRAGO: reward raised on {len(bumped)} job(s).",
+                                   severity=2, evidence={"trigger": "commander_raise_reward", "jobs": bumped})
+                self.emit_operation_event(op, "frago_issued", 2,
+                                          f"FRAGO: reward raised on {op['faction_id']} operation.")
+                return {"ok": True, "applied": "raise_reward", "jobs": bumped}
+            return {"ok": True, "applied": "raise_reward_noop", "reason": "no budget headroom or no open jobs"}
+        # hold / conserve
+        self.attach_report(op_id, "assessment", f"Commander holds the line; continue as planned. {reason}", severity=1)
+        return {"ok": True, "applied": "hold"}
 
     def assess_active_operations(self, save_id: str) -> dict:
         """Battle-rhythm pass: assess every active/frago_required operation (FRAGOs + conclude-or-fail)."""
@@ -4380,16 +5020,61 @@ class MemoryStore:
                 concluded += 1
         return {"ok": True, "assessed": n, "concluded": concluded}
 
+    def resume_operations_from_negotiations(self, save_id: str) -> dict:
+        """#48 (OC1) — CONSUME resolved negotiations back into the OPORD (OPORD is a Negotiations CLIENT: it SUBMITS an
+        intent via the single door, then RESUMES off the outcome). For each op task that submitted an intent (status
+        'issued' + agreement_id), once its agreement reaches a terminal verdict: accepted/kept/fulfilled → the task is
+        COMPLETED (support/ceasefire secured); refused/broken/expired/rejected → the task FAILS (the op must adapt —
+        a FRAGO trigger). Emits a world_event so the outcome surfaces. Idempotent (only acts on still-'issued' tasks)."""
+        now = time.time()
+        ags = {str(a.get("id")): a for a in self.list_agreements(save_id)}
+        fulfilled, failed = 0, 0
+        for op in self.list_operations(save_id):
+            if str(op.get("status") or "") in ("concluded", "cancelled", "failed", "aborted"):
+                continue
+            det = self.operation_detail(op.get("id")) or {}
+            fac = op.get("faction_id")
+            for t in (det.get("tasks") or []):
+                aid = t.get("agreement_id")
+                if not aid or str(t.get("status") or "") != "issued":
+                    continue
+                ag = ags.get(str(aid))
+                if not ag:
+                    continue
+                st = str(ag.get("status") or "")
+                if st in ("accepted", "kept", "fulfilled"):
+                    self.update_task(t.get("id"), status="completed", completed_at=now)
+                    self.add_world_event(save_id, event_type="after_action_report",
+                                         summary=f"{ag.get('party_b') or 'an ally'} agreed — support secured for the "
+                                                 f"{fac} operation in {op.get('target_sector') or 'the sector'}.",
+                                         primary_faction=fac, secondary_faction=ag.get("party_b"),
+                                         importance=2, source="opord")
+                    fulfilled += 1
+                elif st in ("refused", "broken", "expired", "rejected"):
+                    self.update_task(t.get("id"), status="failed", failed_at=now)
+                    self.add_world_event(save_id, event_type="frago_issued",
+                                         summary=f"{ag.get('party_b') or 'the counterparty'} declined — {fac} must "
+                                                 f"adapt its operation in {op.get('target_sector') or 'the sector'}.",
+                                         primary_faction=fac, secondary_faction=ag.get("party_b"),
+                                         importance=3, source="opord")
+                    failed += 1
+        return {"ok": True, "fulfilled": fulfilled, "failed": failed}
+
     def advance_operations(self, save_id: str) -> dict:
         """OPORD pipeline driver — runs each BUILT stage in spec order for one save. Extended as phases land
-        (P2 recognize → P3 analyse → P4 COA → P5 OPORD → P6 route → P7 assess/FRAGO → … ). One Lua entrypoint."""
+        (P2 recognize → P3 analyse → P4 COA → P5 OPORD → P6 route → P7 assess/FRAGO → OC1 consume-negotiations )."""
         rec = self.recognize_threats(save_id)
         ana = self.analyze_pending_missions(save_id)
         coa = self.plan_pending_coas(save_id)
         opd = self.issue_pending_opords(save_id)
         rte = self.route_pending_operations(save_id)
         ass = self.assess_active_operations(save_id)
-        return {"ok": True, "recognize": rec, "analyze": ana, "coa": coa, "opord": opd, "route": rte, "assess": ass}
+        resumed = self.resume_operations_from_negotiations(save_id)  # OC1: consume resolved deals
+        # NOTE: negotiation RESOLUTION is NOT decided here. Per the AI-Influence architecture, the decision layer is
+        # the Player2 LLM (router.resolve_offers_llm), run on a SLOW cadence — the deterministic engine sets the
+        # scene + executes; the thinking entity decides. (evaluate_open_offers remains only as advisory/fallback.)
+        return {"ok": True, "recognize": rec, "analyze": ana, "coa": coa, "opord": opd, "route": rte,
+                "assess": ass, "resumed": resumed}
 
     # --- Economy MEANING + player market --------------------------------------
 
@@ -4850,16 +5535,17 @@ class MemoryStore:
         return {"npc_key": npc_key, "promoted": len(promoted), "facts": promoted}
 
     # --- G5 (Gameplay Changes doc): generate AGREEMENT gameplay objects — the missing middle between talk & war --
-    def generate_agreements(self, save_id: str, max_new: int = 8) -> dict:
-        """Propose REAL agreements grounded in faction state: CEASEFIRES for active wars, TRADE pacts for an
-        exporter that can relieve an importer's shortage. Excludes engine-permanent hostiles (khaak/xenon — they
-        don't negotiate). De-duplicated against existing agreements. status='proposed' (a feeler, not auto-applied)."""
+    def agreement_candidates(self, save_id: str, max_new: int = 8) -> list[dict]:
+        """D6: PLAUSIBLE deal candidates grounded in faction state (ceasefire for active wars, trade for an exporter
+        relieving an importer's shortage, patrol-cooperation for shared enemies, non-aggression for neutral pairs),
+        deduped against existing agreements, excluding engine-permanent hostiles. Returns {proposer, target, kind,
+        terms} — does NOT create. The proposer's Player2 (router.propose_deals_llm) decides which to initiate."""
         EXCLUDED = {"civilian", "criminal", "khaak", "player", "smuggler", "visitor", "xenon"}
         existing: set = set()
         for a in self.list_agreements(save_id):
             pa, pb, ty = a.get("party_a"), a.get("party_b"), a.get("type")
             existing.add((pa, pb, ty)); existing.add((pb, pa, ty))
-        made: list[dict] = []
+        cands: list[dict] = []
 
         def _pair_ok(a, b):
             return a and b and a != b and a not in EXCLUDED and b not in EXCLUDED
@@ -4868,14 +5554,14 @@ class MemoryStore:
         at_war = {frozenset((c.get("faction_a"), c.get("faction_b"))) for c in conflicts}
         # 1) ceasefire feelers for active wars between negotiable factions
         for c in conflicts:
-            if len(made) >= max_new:
+            if len(cands) >= max_new:
                 break
             a, b = c.get("faction_a"), c.get("faction_b")
             if not _pair_ok(a, b) or (a, b, "ceasefire") in existing:
                 continue
-            made.append(self.add_agreement(save_id, a, b, type="ceasefire", status="proposed",
-                        terms={"reason": "active war — both sides taking losses",
-                               "intensity": round(float(c.get("intensity", 0) or 0), 2)}))
+            cands.append({"proposer": a, "target": b, "kind": "ceasefire",
+                          "terms": {"reason": "active war — both sides taking losses",
+                                    "intensity": round(float(c.get("intensity", 0) or 0), 2)}})
             existing.add((a, b, "ceasefire"))
         # 2) trade pacts: an exporter that can relieve an importer's real shortage (and not at war)
         econ = {e.get("faction_id"): e for e in self.list_economy(save_id) if e.get("faction_id")}
@@ -4883,14 +5569,15 @@ class MemoryStore:
         importers = [(f, e) for f, e in econ.items() if e.get("market_status") == "importer" and (e.get("shortages") or {})]
         for a in exporters:
             for b, eb in importers:
-                if len(made) >= max_new:
+                if len(cands) >= max_new:
                     break
                 if not _pair_ok(a, b) or frozenset((a, b)) in at_war or (a, b, "trade") in existing:
                     continue
-                made.append(self.add_agreement(save_id, a, b, type="trade", status="proposed",
-                            terms={"reason": f"{a} exports what {b} imports", "ware": next(iter(eb.get("shortages") or {}), None)}))
+                cands.append({"proposer": a, "target": b, "kind": "trade",
+                              "terms": {"reason": f"{a} exports what {b} imports",
+                                        "ware": next(iter(eb.get("shortages") or {}), None)}})
                 existing.add((a, b, "trade"))
-            if len(made) >= max_new:
+            if len(cands) >= max_new:
                 break
         # 3) patrol cooperation: two non-excluded factions sharing a COMMON enemy in active conflicts.
         enemy_of: dict = {}
@@ -4903,7 +5590,7 @@ class MemoryStore:
         normal = sorted(set(normal) | {f for f in enemy_of if f and f not in EXCLUDED})
         for i in range(len(normal)):
             for j in range(i + 1, len(normal)):
-                if len(made) >= max_new:
+                if len(cands) >= max_new:
                     break
                 a, b = normal[i], normal[j]
                 if not _pair_ok(a, b) or frozenset((a, b)) in at_war:
@@ -4912,15 +5599,15 @@ class MemoryStore:
                 common = {f for f in common if f not in (a, b)}
                 if common and (a, b, "patrol_cooperation") not in existing:
                     foe = sorted(common)[0]
-                    made.append(self.add_agreement(save_id, a, b, type="patrol_cooperation", status="proposed",
-                                terms={"reason": f"both fighting {foe}", "common_enemy": foe}))
+                    cands.append({"proposer": a, "target": b, "kind": "patrol_cooperation",
+                                  "terms": {"reason": f"both fighting {foe}", "common_enemy": foe}})
                     existing.add((a, b, "patrol_cooperation"))
-            if len(made) >= max_new:
+            if len(cands) >= max_new:
                 break
         # 4) non-aggression pacts: neutral non-excluded pairs (not at war, not already bound by another pact).
         for i in range(len(normal)):
             for j in range(i + 1, len(normal)):
-                if len(made) >= max_new:
+                if len(cands) >= max_new:
                     break
                 a, b = normal[i], normal[j]
                 if not _pair_ok(a, b) or frozenset((a, b)) in at_war:
@@ -4930,11 +5617,18 @@ class MemoryStore:
                 rel = self.get_relationship(save_id, a, b)
                 standing = str(rel.get("standing")) if rel else "neutral"
                 if standing in ("neutral", "wary"):
-                    made.append(self.add_agreement(save_id, a, b, type="non_aggression", status="proposed",
-                                terms={"reason": "neither at war nor allied — formalize the peace"}))
+                    cands.append({"proposer": a, "target": b, "kind": "non_aggression",
+                                  "terms": {"reason": "neither at war nor allied — formalize the peace"}})
                     existing.add((a, b, "non_aggression"))
-            if len(made) >= max_new:
+            if len(cands) >= max_new:
                 break
+        return cands[:max_new]
+
+    def generate_agreements(self, save_id: str, max_new: int = 8) -> dict:
+        """Deterministic auto-propose — kept for SEEDING + test fixtures only. LIVE proposal initiation (D6) routes
+        through the proposer's Player2 (router.propose_deals_llm); this is no longer on the heartbeat."""
+        made = [self.add_agreement(save_id, c["proposer"], c["target"], type=c["kind"], status="proposed",
+                                   terms=c["terms"]) for c in self.agreement_candidates(save_id, max_new)]
         return {"ok": True, "save_id": save_id, "generated": len(made), "agreements": made}
 
     # --- Rumor propagation (design-doc §4): spread hearsay along the #39 social graph, weighted by tie strength --
@@ -6607,9 +7301,59 @@ OPORD_PHASES = {
 }
 
 
+# OPORD Execution = 4 doctrinal components (Ken 2026-06-30; grounded in US Army FM 6-0 / ADP 5-0 para-3 doctrine +
+# the British Concept-of-Operations model): Commander's INTENT (purpose + key tasks + end state), SCHEME OF
+# MANOEUVRE (concept of operations — how the force fights from start to finish), MAIN EFFORT (the designated decisive
+# task that receives priority of support), and END STATE ("success is…"). The engine composes the deterministic
+# doctrinal skeleton; Player2 may later author/override the judgment parts via the decision layer.
+# Decisive → shaping → sustaining: task-type priority used to DESIGNATE the main effort.
+_MAIN_EFFORT_PRIORITY = (
+    ("strike", "attack", "raid", "assault", "destroy", "intercept", "secure"),   # decisive
+    ("patrol", "screen", "escort", "defend", "hold", "blockade"),                # shaping
+    ("recon", "scout", "post", "brief", "request", "coordinate", "verify", "supply"),  # sustaining
+)
+
+
+def opord_designate_main_effort(coa_tasks: list, faction: str, sector: str) -> dict:
+    """Designate the MAIN EFFORT — the single decisive task that receives priority of support — and label the rest as
+    supporting efforts. Doctrine: the main effort is the task most critical to mission success at the decisive point."""
+    if not coa_tasks:
+        return {"unit": "", "task": "", "rationale": "no tasks derived", "supporting_efforts": []}
+
+    def rank(t: dict) -> int:
+        tt = str(t.get("task_type") or "").lower()
+        for tier, kws in enumerate(_MAIN_EFFORT_PRIORITY):
+            if any(k in tt for k in kws):
+                return tier
+        return len(_MAIN_EFFORT_PRIORITY)  # unranked → lowest priority
+
+    main = min(coa_tasks, key=rank)
+    main_tt = str(main.get("task_type") or "operation")
+    me_sector = main.get("sector") or sector
+    supporting = [str(t.get("task_type") or "task") for t in coa_tasks if t is not main]
+    return {
+        "unit": f"{faction}_{main_tt}",
+        "task": main_tt,
+        "sector": me_sector,
+        "rationale": f"{main_tt} in {me_sector} is decisive to the end state; it receives priority of support.",
+        "supporting_efforts": supporting,
+    }
+
+
+def opord_scheme_of_manoeuvre(coa: dict, faction: str, sector: str, phases: list, main_effort: dict) -> str:
+    """SCHEME OF MANOEUVRE (concept of operations): a narrative of how the force fights the operation from start to
+    finish, naming the phase sequence and the main effort. Deterministic; Player2 may enrich it later."""
+    coa_human = str(coa.get("coa_type") or "operation").replace("_", " ")
+    seq = " → ".join(phases) if phases else "Execute → Assess → Consolidate"
+    me = main_effort.get("task") or "the decisive task"
+    return (f"{faction} executes a {coa_human} in {sector}. Phasing: {seq}. "
+            f"The main effort is {me}; the remaining tasks shape and sustain it until the end state is met.")
+
+
 def opord_build_smesc(op: dict, coa: dict) -> dict:
     """Build the machine-readable SMESC OPORD from the operation + its selected COA. Player-readable strings come
-    from the deterministic mission/intent/end-state; an optional LLM prose wrapper is a later/optional step."""
+    from the deterministic mission/intent/end-state; an optional LLM prose wrapper is a later/optional step.
+    Execution carries the 4 doctrinal components: intent, scheme_of_manoeuvre, main_effort, end_state."""
     faction = op.get("faction_id") or ""
     sector = op.get("target_sector") or "the contested zone"
     target = op.get("target_faction") or "hostile forces"
@@ -6622,6 +7366,9 @@ def opord_build_smesc(op: dict, coa: dict) -> dict:
     for t in coa_tasks:
         exec_tasks.append({"unit": f"{faction}_{coa.get('coa_type', 'force')}", "task": t.get("task_type"),
                            "sector": t.get("sector") or sector, "target_faction": t.get("target_faction")})
+    phases = OPORD_PHASES.get(coa.get("coa_type"), ["Execute", "Assess", "Consolidate"])
+    main_effort = opord_designate_main_effort(coa_tasks, faction, sector)
+    scheme = opord_scheme_of_manoeuvre(coa, faction, sector, phases, main_effort)
     return {
         "situation": {
             "enemy": opord_enemy_reaction(target),
@@ -6631,8 +7378,13 @@ def opord_build_smesc(op: dict, coa: dict) -> dict:
         },
         "mission": op.get("mission_statement") or "",
         "execution": {
+            # The 4 doctrinal components of the Execution paragraph (Ken 2026-06-30):
             "intent": op.get("commander_intent") or "",
-            "phases": OPORD_PHASES.get(coa.get("coa_type"), ["Execute", "Assess", "Consolidate"]),
+            "scheme_of_manoeuvre": scheme,
+            "main_effort": main_effort,
+            "end_state": op.get("desired_end_state") or "",
+            # supporting detail
+            "phases": phases,
             "tasks": exec_tasks,
             "coordinating_instructions": list(constraints) + ["report hostile contact",
                                                               "withdraw if outmatched by capital-class enemy"],
@@ -6794,7 +7546,7 @@ def run_opord_e2e_selftest() -> dict:
                 ev["ts"] = ts
             store.add_hostile_event(sid, ev)
 
-        # 1) Teladi pressure → full pipeline → ONE operation.
+        # 1) Teladi pressure → pipeline → ONE operation (reaches coa_generated; COA selection is the Player2 D1 step).
         for _ in range(3):
             hit()
         store.advance_operations(sid)
@@ -6804,6 +7556,13 @@ def run_opord_e2e_selftest() -> dict:
         op_id = op["id"]
         check("argon_vs_teladi_swi", op["faction_id"] == "argon" and op["target_faction"] == "teladi"
               and op["target_sector"] == "Silent Witness I", str({k: op.get(k) for k in ("faction_id", "target_faction", "target_sector")}))
+        # D1: simulate the Player2 COA selection (deterministic in the test) so the pipeline can proceed past it.
+        viable = store.list_viable_coas(op_id)
+        check("coas_generated", len(viable) >= 1, str(len(viable)))
+        if viable:
+            store.set_selected_coa(op_id, viable[0]["id"])
+        store.advance_operations(sid)
+        op = store.get_operation(op_id)
         check("reached_active", op["status"] in ("active", "opord_issued"), op["status"])
         check("has_selected_coa", bool(op.get("selected_coa_id")))
 
@@ -6825,7 +7584,7 @@ def run_opord_e2e_selftest() -> dict:
             with store._connect() as conn:
                 conn.execute("UPDATE market_jobs SET created_at=? WHERE id=?", (time.time() - 700, job["id"]))
                 conn.commit()
-            store.assess_operation(op_id)
+            store.apply_assessment_decision(op_id, "raise_reward")  # D5: commander decision (was auto-FRAGO)
             j2 = [j for j in store.list_jobs(sid, "open") if j["id"] == job["id"]]
             check("reward_escalated", bool(j2) and int(j2[0]["reward"]) > int(job["reward"]),
                   f"{job['reward']}->{j2 and j2[0].get('reward')}")
@@ -6836,7 +7595,7 @@ def run_opord_e2e_selftest() -> dict:
             conn.execute("UPDATE hostile_events SET ts=? WHERE save_id=?", (now - 5000, sid))
             conn.commit()
         store.update_operation(op_id, activated_at=now - 400)
-        store.assess_operation(op_id)
+        store.apply_assessment_decision(op_id, "request_conclude")  # D5: commander requests; can_conclude validates
         check("concluded_completed", store.get_operation(op_id)["status"] == "completed", store.get_operation(op_id)["status"])
 
         # 6) Conclusion cleaned up linked jobs (no open jobs for this op).
@@ -6957,6 +7716,350 @@ def run_opord_lease_selftest() -> dict:
         check("force_req_cancelled_on_conclude", store.conclude_operation(op, "completed", "done").get("force_requests_cancelled") >= 1)
     finally:
         shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_negotiation_dedup_selftest() -> dict:
+    """Oracle for Negotiations N1: agreements carry a durable agreement_key (one OPEN per key) so repeat requests
+    UPDATE one row (bump request_count) instead of inserting duplicates; allied-support picks a REAL counterparty
+    (never an empty party_b); a different operation/task is a distinct key; and the partial-unique index physically
+    blocks a second open row for the same key."""
+    import shutil
+    import sqlite3
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    d = tempfile.mkdtemp(prefix="nl_negodedup_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "nego.sqlite3")
+        sid = "s"
+        for f in ("argon", "antigone", "teladi", "boron"):
+            store.upsert_faction(sid, f, name=f.title())
+        store.adjust_relationship(sid, "antigone", "argon", dtrust=60)      # antigone trusts argon
+        store.adjust_relationship(sid, "antigone", "teladi", dresentment=40)  # ...and resents the enemy → shared
+        store.adjust_relationship(sid, "boron", "argon", dtrust=10)
+        # 1) deterministic counterparty: antigone wins (high trust + shared-enemy bonus)
+        ally = store.select_support_counterparty(sid, "argon", "teladi", "Hatikvah's Choice III")
+        check("counterparty_real", ally == "antigone", f"ally={ally}")
+        # 2) upsert dedup: 4 identical requests → ONE row, request_count == 4
+        r = None
+        for _ in range(4):
+            r = store.create_or_update_agreement(sid, "argon", ally, type="alliance", kind="allied_support",
+                                                 operation_id="op1", operation_task_id="t1", status="pending")
+        check("repeat_updates_not_inserts", r["created"] is False and r["request_count"] == 4, str(r))
+        openrows = [a for a in store.list_agreements(sid)
+                    if a.get("agreement_key") == r["agreement_key"]
+                    and a.get("status") in ("pending", "proposed", "pending_response", "countered")]
+        check("one_open_row_per_key", len(openrows) == 1, f"open={len(openrows)}")
+        check("party_b_never_empty", bool(openrows) and openrows[0].get("party_b") == "antigone", str(openrows[:1]))
+        # 3) different op/task → distinct key → a genuinely new row
+        r2 = store.create_or_update_agreement(sid, "argon", ally, type="alliance", kind="allied_support",
+                                              operation_id="op2", operation_task_id="t2", status="pending")
+        check("distinct_key_new_row", r2["created"] is True and r2["agreement_key"] != r["agreement_key"], str(r2))
+        # 4) partial-unique index physically blocks a duplicate OPEN insert for the same key
+        blocked = False
+        try:
+            with store._connect() as c:
+                c.execute("INSERT INTO agreements (save_id, party_a, party_b, type, agreement_key, status, created_at) "
+                          "VALUES (?,?,?,?,?,?,?)",
+                          (sid, "argon", "antigone", "alliance", r["agreement_key"], "pending", time.time()))
+                c.commit()
+        except sqlite3.IntegrityError:
+            blocked = True
+        check("unique_index_blocks_dup", blocked is True)
+        # 5) counterparty never the requester or the enemy
+        ally2 = store.select_support_counterparty(sid, "teladi", "argon", "X")
+        check("never_self_or_enemy", ally2 not in ("teladi", "argon"), f"ally2={ally2}")
+        # 6) OPORD allied-support routing reuses the open agreement instead of spawning a duplicate
+        op = store.create_or_get_operation(sid, "argon", "sector_pressure", "s:argon:sp:teladi:n1",
+                                           status="active", target_faction="teladi", target_sector="Z")["id"]
+        tk = store.attach_task(op, "request_allied_support", status="planned", target_faction="teladi")
+        store.route_operation_task(store.get_operation(op), {"id": tk, "task_type": "request_allied_support",
+                                                             "target_faction": "teladi", "target_sector": "Z"})
+        store.route_operation_task(store.get_operation(op), {"id": tk, "task_type": "request_allied_support",
+                                                             "target_faction": "teladi", "target_sector": "Z"})
+        alliedrows = [a for a in store.list_agreements(sid)
+                      if a.get("kind") == "allied_support" and a.get("operation_id") == op
+                      and a.get("status") in ("pending", "proposed", "pending_response", "countered")]
+        check("route_reuses_open_agreement", len(alliedrows) == 1 and alliedrows[0].get("party_b"),
+              f"rows={len(alliedrows)}")
+        # 7) INVARIANT: add_agreement with an OPEN status auto-routes through dedupe (generate_agreements-style spam)
+        for _ in range(3):
+            store.add_agreement(sid, "argon", "boron", type="patrol_cooperation", status="proposed",
+                                terms={"common_enemy": "xenon"})
+        pc = [a for a in store.list_agreements(sid)
+              if a.get("type") == "patrol_cooperation" and a.get("party_a") == "argon"
+              and a.get("party_b") == "boron" and a.get("status") == "proposed"]
+        check("add_agreement_open_deduped", len(pc) == 1, f"patrol_coop_rows={len(pc)}")
+        # 8) terminal/historical records still insert directly (records, not open deals)
+        store.add_agreement(sid, "argon", "teladi", type="ceasefire", status="kept")
+        store.add_agreement(sid, "argon", "teladi", type="ceasefire", status="kept")
+        check("terminal_inserts_direct", len([a for a in store.list_agreements(sid) if a.get("status") == "kept"]) == 2)
+        # 9) submit_negotiation_intent (the single public door) creates one proposed offer + dedupes on repeat
+        i1 = store.submit_negotiation_intent(sid, "opord", "ceasefire", "argon", recipient="teladi",
+                                             operation_id="opz", operation_task_id="tz")
+        i2 = store.submit_negotiation_intent(sid, "opord", "ceasefire", "argon", recipient="teladi",
+                                             operation_id="opz", operation_task_id="tz")
+        check("intent_door_dedupes",
+              i1["created"] is True and i2["created"] is False and i2["id"] == i1["id"]
+              and i2["request_count"] == 2, f"{i1} {i2}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_negotiation_scoring_selftest() -> dict:
+    """Oracle for NF2: deterministic acceptance scoring + resolution. High trust + shared enemy + good offer →
+    accept; low trust + heavy own war-load + no offer → refuse; mid → counter. Reads strategic_state + relationships
+    (shared models). The resolver transitions open offers and records score/factors in context_json."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(cond), "detail": detail})
+
+    def agg(store, sid, aid):
+        return [x for x in store.list_agreements(sid) if x["id"] == aid][0]
+
+    d = tempfile.mkdtemp(prefix="nl_negoscore_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "s.sqlite3")
+        sid = "s"
+        for f in ("argon", "antigone", "teladi", "split", "boron"):
+            store.upsert_faction(sid, f, name=f.title())
+        # ACCEPT: antigone trusts argon, resents the enemy teladi (shared), low own war-load, good offer
+        store.adjust_relationship(sid, "antigone", "argon", dtrust=85)
+        store.adjust_relationship(sid, "antigone", "teladi", dresentment=50)
+        store.upsert_strategic_state(sid, "antigone", military_pressure=0.1, recent_losses=0.0)
+        a_acc = store.submit_negotiation_intent(sid, "opord", "allied_support", "argon", recipient="antigone",
+                                                operation_id="o1", operation_task_id="t1", enemy="teladi",
+                                                offered_value=150000)
+        sc_acc = store.score_agreement_acceptance(sid, agg(store, sid, a_acc["id"]))
+        check("accept_scores_high", sc_acc["decision"] == "accept", str(sc_acc))
+        # REFUSE: split low trust to argon, heavy own war-load + losses, no offer, no shared enemy
+        store.upsert_strategic_state(sid, "split", military_pressure=1.0, recent_losses=1.0)
+        a_ref = store.submit_negotiation_intent(sid, "opord", "allied_support", "argon", recipient="split",
+                                                operation_id="o2", operation_task_id="t2", enemy="teladi",
+                                                offered_value=0)
+        sc_ref = store.score_agreement_acceptance(sid, agg(store, sid, a_ref["id"]))
+        check("refuse_scores_low", sc_ref["decision"] in ("refuse", "refuse_harshly"), str(sc_ref))
+        # COUNTER: boron mid trust, small offer, modest war-load → middle band
+        store.adjust_relationship(sid, "boron", "argon", dtrust=40)
+        store.upsert_strategic_state(sid, "boron", military_pressure=0.2, recent_losses=0.0)
+        a_cnt = store.submit_negotiation_intent(sid, "opord", "trade", "argon", recipient="boron",
+                                                operation_id="o3", operation_task_id="t3", offered_value=60000)
+        sc_cnt = store.score_agreement_acceptance(sid, agg(store, sid, a_cnt["id"]))
+        check("counter_scores_mid", sc_cnt["decision"] == "counter", str(sc_cnt))
+        # resolver transitions them
+        r = store.evaluate_open_offers(sid)
+        check("resolver_ran", r["evaluated"] >= 3, str(r))
+        check("accepted_status", agg(store, sid, a_acc["id"])["status"] == "accepted")
+        check("refused_status", agg(store, sid, a_ref["id"])["status"] == "refused")
+        check("countered_status", agg(store, sid, a_cnt["id"])["status"] == "countered")
+        check("score_recorded", "acceptance" in (json.loads(agg(store, sid, a_acc["id"]).get("context_json") or "{}")))
+        # idempotent-ish: accepted/refused left the evaluatable set; only the countered remains (excluded) → 0 new
+        r2 = store.evaluate_open_offers(sid)
+        check("resolved_not_reevaluated", r2["evaluated"] == 0, str(r2))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_decision_record_selftest() -> dict:
+    """Oracle for the decision audit log (spec §12): record_decision persists a full row; finalize_decision updates
+    validator_result/final_status; list returns newest-first; deferred records are logged too."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def chk(n: str, c: bool, d: str = "") -> None:
+        checks.append({"name": n, "ok": bool(c), "detail": d})
+
+    d = tempfile.mkdtemp(prefix="nl_decrec_selftest_")
+    try:
+        store = MemoryStore(Path(d) / "d.sqlite3")
+        sid = "s"
+        did = store.record_decision(sid, "negotiation", "argon", "player2", parsed_choice="accept",
+                                    brief="b", options=[{"key": "accept", "label": "A"}], advisory={"score": 80},
+                                    raw_response="1. yes, they share our enemy", request_id="r1",
+                                    linked_offer_id=407, final_status="decided")
+        chk("recorded", isinstance(did, int) and did > 0, str(did))
+        store.finalize_decision(did, validator_result={"ok": True}, final_status="applied")
+        rows = store.list_decision_records(sid)
+        chk("listed_one", len(rows) == 1, str(len(rows)))
+        r = rows[0]
+        chk("fields_persisted", r["source"] == "player2" and r["parsed_choice"] == "accept"
+            and r["final_status"] == "applied" and r["linked_offer_id"] == 407, str(r))
+        store.record_decision(sid, "negotiation", "teladi", "deferred", brief="b",
+                              options=[{"key": "a", "label": "A"}], final_status="deferred")
+        rows2 = store.list_decision_records(sid)
+        chk("two_rows_newest_first", len(rows2) == 2 and rows2[0]["subject_faction"] == "teladi", str(len(rows2)))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_negotiation_consequence_selftest() -> dict:
+    """Oracle for NF3: a negotiation outcome has bounded RELATIONSHIP consequences (refusal → resentment up + trust
+    down; acceptance → trust up + debt up; urgency scales it) + a transition world-event. Deterministic execution
+    gated by the Player2 decision."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def chk(n: str, c: bool, d: str = "") -> None:
+        checks.append({"name": n, "ok": bool(c), "detail": d})
+
+    dd = tempfile.mkdtemp(prefix="nl_negocons_")
+    try:
+        store = MemoryStore(Path(dd) / "c.sqlite3")
+        sid = "s"
+        for f in ("argon", "teladi", "boron", "split"):
+            store.upsert_faction(sid, f, name=f.title())
+        store.apply_relationship_consequence(sid, "argon", "teladi", "refused", urgency=4)
+        rel = store.get_relationship(sid, "argon", "teladi") or {}
+        chk("refusal_resentment_up", float(rel.get("resentment") or 0) > 0, str(rel))
+        chk("refusal_trust_down", float(rel.get("trust") or 0) < 0, str(rel))
+        store.apply_relationship_consequence(sid, "boron", "split", "accepted", urgency=0)
+        rel2 = store.get_relationship(sid, "boron", "split") or {}
+        chk("accept_trust_up", float(rel2.get("trust") or 0) > 0, str(rel2))
+        chk("accept_debt_up", float(rel2.get("debt") or 0) > 0, str(rel2))
+        store.apply_relationship_consequence(sid, "split", "boron", "refused", urgency=0)
+        relc = store.get_relationship(sid, "split", "boron") or {}
+        chk("urgency_scales", float(rel.get("resentment") or 0) > float(relc.get("resentment") or 0),
+            f"{rel.get('resentment')} vs {relc.get('resentment')}")
+        evs = store.list_world_events(sid, limit=50)
+        chk("transition_event", any(str(e.get("event_type", "")).startswith("agreement_") for e in evs), str(len(evs)))
+    finally:
+        shutil.rmtree(dd, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_relation_move_validator_selftest() -> dict:
+    """Oracle for #64: the DeadAir-grounded relation-move eligibility gate — distinct real diplomatic factions,
+    excluded factions rejected, step bounded ±5, result clamped to the ±25 band, band-limit no-op rejected."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def chk(n: str, c: bool, d: str = "") -> None:
+        checks.append({"name": n, "ok": bool(c), "detail": d})
+
+    dd = tempfile.mkdtemp(prefix="nl_relmove_")
+    try:
+        store = MemoryStore(Path(dd) / "c.sqlite3")
+        sid = "s"
+        for f in ("argon", "teladi", "xenon"):
+            store.upsert_faction(sid, f, name=f.title())
+        r1 = store.validate_relation_move(sid, "argon", "teladi", 5.0)
+        chk("valid_move_ok", r1["ok"] and r1["clamped_step"] == 5.0, str(r1))
+        chk("excluded_target_rejected", store.validate_relation_move(sid, "argon", "xenon", 5.0)["ok"] is False, "")
+        chk("self_rejected", store.validate_relation_move(sid, "argon", "argon", 5.0)["ok"] is False, "")
+        chk("unknown_rejected", store.validate_relation_move(sid, "argon", "boron", 5.0)["ok"] is False, "")
+        r5 = store.validate_relation_move(sid, "argon", "teladi", 50.0)
+        chk("step_bounded_to_5", r5["ok"] and r5["clamped_step"] == 5.0, str(r5))
+        # push to the band limit, then a further move is a rejected no-op
+        store.adjust_relationship(sid, "argon", "teladi", dtrust=25)
+        rlim = store.validate_relation_move(sid, "argon", "teladi", 5.0)
+        chk("band_limit_noop_rejected", rlim["ok"] is False and "band" in rlim["reason"], str(rlim))
+    finally:
+        shutil.rmtree(dd, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_oc1_resume_selftest() -> dict:
+    """Oracle for #48 (OC1): OPORD consumes resolved negotiations — a submitted intent that gets ACCEPTED completes
+    its task; REFUSED fails it (FRAGO trigger); pending does nothing; and the consume is idempotent."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def chk(n: str, c: bool, d: str = "") -> None:
+        checks.append({"name": n, "ok": bool(c), "detail": d})
+
+    dd = tempfile.mkdtemp(prefix="nl_oc1_")
+    try:
+        store = MemoryStore(Path(dd) / "c.sqlite3")
+        sid = "s"
+        for f in ("argon", "antigone", "split", "teladi"):
+            store.upsert_faction(sid, f, name=f.title())
+        # accepted path
+        op1 = store.create_or_get_operation(sid, "argon", "sector_pressure", "s:argon:sp:teladi:a", status="active",
+                                            target_faction="teladi", target_sector="X")["id"]
+        ag1 = store.submit_negotiation_intent(sid, "opord", "allied_support", "argon", recipient="antigone",
+                                              operation_id=op1, enemy="teladi", sector="X",
+                                              terms={"kind": "allied_support"})
+        t1 = store.attach_task(op1, "request_allied_support", status="issued",
+                               agreement_id=str(ag1.get("id")), target_faction="antigone")
+        r0 = store.resume_operations_from_negotiations(sid)
+        chk("pending_no_resume", r0["fulfilled"] == 0 and r0["failed"] == 0, str(r0))
+        store.apply_offer_decision(sid, ag1.get("id"), "accept", "aye", "player2")
+        r1 = store.resume_operations_from_negotiations(sid)
+        chk("accept_fulfills", r1["fulfilled"] == 1, str(r1))
+        task1 = next((t for t in (store.operation_detail(op1).get("tasks") or []) if t.get("id") == t1), {})
+        chk("task_completed", task1.get("status") == "completed", str(task1.get("status")))
+        # refused path
+        op2 = store.create_or_get_operation(sid, "argon", "sector_pressure", "s:argon:sp:teladi:b", status="active",
+                                            target_faction="teladi", target_sector="Y")["id"]
+        ag2 = store.submit_negotiation_intent(sid, "opord", "allied_support", "argon", recipient="split",
+                                              operation_id=op2, enemy="teladi", sector="Y",
+                                              terms={"kind": "allied_support"})
+        t2 = store.attach_task(op2, "request_allied_support", status="issued",
+                               agreement_id=str(ag2.get("id")), target_faction="split")
+        store.apply_offer_decision(sid, ag2.get("id"), "refuse", "nay", "player2")
+        r2 = store.resume_operations_from_negotiations(sid)
+        chk("refuse_fails", r2["failed"] == 1, str(r2))
+        task2 = next((t for t in (store.operation_detail(op2).get("tasks") or []) if t.get("id") == t2), {})
+        chk("task_failed", task2.get("status") == "failed", str(task2.get("status")))
+        r3 = store.resume_operations_from_negotiations(sid)
+        chk("idempotent", r3["fulfilled"] == 0 and r3["failed"] == 0, str(r3))
+    finally:
+        shutil.rmtree(dd, ignore_errors=True)
+    return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+            "total": len(checks), "checks": checks}
+
+
+def run_faction_doctrine_brief_selftest() -> dict:
+    """Oracle for #53: the faction Worldview line reflects the canon FACTION_PERSONA (traits + goal) and is injected
+    deterministically. Aggressive/profit/diplomatic factions read distinctly; an unknown faction falls back safely."""
+    import shutil
+    import tempfile
+    checks: list[dict] = []
+
+    def chk(n: str, c: bool, d: str = "") -> None:
+        checks.append({"name": n, "ok": bool(c), "detail": d})
+
+    dd = tempfile.mkdtemp(prefix="nl_doctrine_")
+    try:
+        store = MemoryStore(Path(dd) / "c.sqlite3")
+        sid = "s"
+        for f in ("split", "teladi", "boron", "argon"):
+            store.upsert_faction(sid, f, name=f.title())
+        b_split = store.faction_doctrine_brief(sid, "split")
+        chk("split_aggressive", "aggressive" in b_split.lower(), b_split)
+        chk("split_goal_conquest", "conquest" in b_split.lower(), b_split)
+        b_teladi = store.faction_doctrine_brief(sid, "teladi")
+        chk("teladi_profit", "profit" in b_teladi.lower(), b_teladi)
+        b_boron = store.faction_doctrine_brief(sid, "boron")
+        chk("boron_diplomatic", "diplomatic" in b_boron.lower(), b_boron)
+        chk("boron_goal_peace", "peace" in b_boron.lower(), b_boron)
+        chk("factions_read_distinctly", b_split != b_teladi != b_boron, "")
+        b_unknown = store.faction_doctrine_brief(sid, "madeup")
+        chk("unknown_default_goal", "interests" in b_unknown.lower() and len(b_unknown) > 0, b_unknown)
+        chk("empty_fid_empty", store.faction_doctrine_brief(sid, "") == "", "")
+        chk("has_leadership_prefix", b_split.lower().startswith("you are the leadership"), b_split)
+    finally:
+        shutil.rmtree(dd, ignore_errors=True)
     return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
             "total": len(checks), "checks": checks}
 
@@ -7121,7 +8224,7 @@ def run_opord_cleanup_selftest() -> dict:
         with store._connect() as conn:
             conn.execute("UPDATE market_jobs SET created_at=? WHERE id=?", (now - 700, jb["id"]))
             conn.commit()
-        store.assess_operation(opB)
+        store.apply_assessment_decision(opB, "raise_reward")  # D5: commander decision (was auto-FRAGO in assess)
         jrow = [j for j in store.list_jobs(sid, "open") if j["id"] == jb["id"]]
         # reserved 90000 < 1.5×80000(=120000) → capped at 90000 (raised but bounded by reserved)
         check("reward_capped_by_reserved", bool(jrow) and int(jrow[0]["reward"]) == 90000, str(jrow and jrow[0].get("reward")))
@@ -7148,41 +8251,57 @@ def run_assessment_frago_selftest() -> dict:
         sid = "s"
         now = time.time()
 
+        for f in ("argon", "antigone", "teladi"):
+            store.upsert_faction(sid, f, name=f.title())
+        store.adjust_relationship(sid, "antigone", "argon", dtrust=60)
+
         def active_op(tkey, offset, sector):
             return store.create_or_get_operation(sid, "argon", "sector_pressure", tkey, status="active",
                                                  target_faction="teladi", target_sector=sector,
                                                  budget_reserved=200000, activated_at=now - offset)["id"]
 
-        # A+B: recent reinforcement + an old unclaimed linked job (age 100s < MIN, stays active).
-        opAB = active_op("s:argon:sp:teladi:ab", 100, "AB Sector")
-        store.add_hostile_event(sid, {"attacker_faction": "teladi", "victim_faction": "argon",
-                                      "sector": "AB Sector", "magnitude": 3, "ts": now})
-        job = store.create_or_update_job(sid, "argon", "patrol", target_sector="AB Sector", target_faction="teladi",
-                                         reward=80000, operation_id=opAB, operation_task_id="t1")
-        with store._connect() as conn:
-            conn.execute("UPDATE market_jobs SET created_at=? WHERE id=?", (now - 700, job["id"]))
-            conn.commit()
-        rAB = store.assess_operation(opAB)
-        check("reinforcement_frago", "enemy_reinforcement" in rAB["fragos"], str(rAB))
-        check("job_unclaimed_frago", "job_unclaimed" in rAB["fragos"])
+        # A: assess = FACTS only — SITREP + BDA (our real kill completes an offensive task) + no judgment.
+        opA = active_op("s:argon:sp:teladi:a", 100, "A Sector")
+        tk = store.attach_task(opA, "engage_hostiles", status="issued", target_faction="teladi")
+        store.add_hostile_event(sid, {"attacker_faction": "argon", "victim_faction": "teladi",
+                                      "sector": "A Sector", "magnitude": 5, "ts": now})
+        rA = store.assess_operation(opA)
+        detA = store.operation_detail(opA)
+        check("sitrep_emitted", any(r["report_type"] == "sitrep" for r in detA["reports"]))
+        check("bda_task_complete", any(t["id"] == tk and t["status"] == "completed" for t in detA["tasks"]))
+        check("assess_no_judgment", rA.get("outcome") is None and rA.get("needs_decision") is True)
+
+        # escalate_reinforce decision → allied-support negotiation intent created.
+        e = store.apply_assessment_decision(opA, "escalate_reinforce")
+        check("escalate_makes_agreement", e["applied"] == "escalate_reinforce" and any(
+            a.get("kind") == "allied_support" and a.get("operation_id") == opA for a in store.list_agreements(sid)))
+
+        # raise_reward decision (budget-gated): 80k → 120k.
+        job = store.create_or_update_job(sid, "argon", "patrol", target_sector="A Sector", target_faction="teladi",
+                                         reward=80000, operation_id=opA, operation_task_id="t1")
+        rr = store.apply_assessment_decision(opA, "raise_reward")
         jrow = [j for j in store.list_jobs(sid, "open") if j["id"] == job["id"]][0]
-        check("reward_escalated", int(jrow["reward"]) == 120000, str(jrow.get("reward")))
-        check("ab_still_active", store.get_operation(opAB)["status"] == "active")
-        det = store.operation_detail(opAB)
-        check("sitrep_emitted", any(r["report_type"] == "sitrep" for r in det["reports"]))
-        check("frago_reports", sum(1 for r in det["reports"] if r["report_type"] == "frago") >= 2)
+        check("reward_raised", rr["applied"] == "raise_reward" and int(jrow["reward"]) == 120000, str(jrow.get("reward")))
 
-        # C: pressure abated (no events in its sector) + age >= MIN → completed.
+        # request_conclude with NO proof (age < MIN) → can_conclude False → converts to hold (stays active).
+        cc1 = store.can_conclude(opA)
+        hold = store.apply_assessment_decision(opA, "request_conclude")
+        check("conclude_blocked_converts_hold", (not cc1["ok"]) and hold["applied"] == "converted_to_hold"
+              and store.get_operation(opA)["status"] == "active")
+
+        # abated + age >= MIN → can_conclude True → request_conclude completes.
         opC = active_op("s:argon:sp:teladi:c", 400, "C Sector")
-        rC = store.assess_operation(opC)
-        check("abated_completed", rC["outcome"] == "completed" and store.get_operation(opC)["status"] == "completed")
+        ccC = store.can_conclude(opC)
+        cdone = store.apply_assessment_decision(opC, "request_conclude")
+        check("abated_conclude_completed", ccC["ok"] and cdone["applied"] == "completed"
+              and store.get_operation(opC)["status"] == "completed")
 
-        # D: still contested + age >= MAX → failed (no hanging forever).
+        # SAFETY BACKSTOP: assess on an op past MAX age → failed (deterministic, not a judgment).
         opD = active_op("s:argon:sp:teladi:d", 4000, "D Sector")
         store.add_hostile_event(sid, {"attacker_faction": "teladi", "victim_faction": "argon",
                                       "sector": "D Sector", "magnitude": 2, "ts": now})
         rD = store.assess_operation(opD)
-        check("timeout_failed", rD["outcome"] == "failed" and store.get_operation(opD)["status"] == "failed")
+        check("timeout_backstop_failed", rD["outcome"] == "failed" and store.get_operation(opD)["status"] == "failed")
     finally:
         shutil.rmtree(d, ignore_errors=True)
     return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
@@ -7204,6 +8323,10 @@ def run_execution_routing_selftest() -> dict:
     try:
         store = MemoryStore(Path(d) / "route.sqlite3")
         sid = "s"
+        # seed an ally so allied_support resolves a real counterparty (Negotiations door requires one)
+        for _f in ("argon", "antigone"):
+            store.upsert_faction(sid, _f, name=_f.title())
+        store.adjust_relationship(sid, "antigone", "argon", dtrust=50)
 
         def issued_op(tkey, ships):
             op_id = store.create_or_get_operation(sid, "argon", "sector_pressure", tkey, status="opord_issued",
@@ -7220,11 +8343,16 @@ def run_execution_routing_selftest() -> dict:
         store.attach_task(op1, "seek_ceasefire", status="planned", target_faction="teladi")
         r1 = store.route_operation(op1)
         routes = {x["route"] for x in r1["routes"]}
-        check("patrol_internal", "internal_fleet" in routes, str(routes))
+        # D3: patrol with own ships available is a Player2 routing DECISION (not auto internal-fleet) → awaiting.
+        check("patrol_awaiting_decision", "awaiting_decision" in routes, str(routes))
         check("supply_job", "job:supply" in routes)
         check("allied_agreement", "agreement:allied" in routes)
         check("ceasefire_agreement", "agreement:ceasefire" in routes)
         check("op_active", store.get_operation(op1)["status"] == "active")
+        # D3 commit (simulated Player2): the deferred patrol task → commit own fleet → internal_fleet, issued + linked.
+        ptask = next(t for t in store.operation_detail(op1)["tasks"] if t["task_type"] == "patrol_sector")
+        rt = store.route_task(store.get_operation(op1), ptask, "commit_own_fleet")
+        check("route_task_internal", rt.get("route") == "internal_fleet", str(rt))
         det1 = store.operation_detail(op1)
         check("tasks_issued", all(t["status"] == "issued" for t in det1["tasks"]))
         check("tasks_linked", all((t.get("job_id") or t.get("agreement_id") or t.get("order_id")) for t in det1["tasks"]))
@@ -7269,7 +8397,8 @@ def run_opord_generator_selftest() -> dict:
                                            target_faction="teladi", target_sector="Silent Witness I",
                                            evidence_json={"magnitude": 4})["id"]
         store.analyze_mission(op)
-        store.plan_operation_coas(op)
+        pr = store.plan_operation_coas(op)
+        store.set_selected_coa(op, pr["advisory_best"]["coa_id"])  # simulate the Player2 D1 selection
         r = store.generate_opord(op)
         check("ok", r.get("ok") is True, str(r))
         check("tasks_derived", len(r.get("tasks", [])) >= 1)
@@ -7280,6 +8409,15 @@ def run_opord_generator_selftest() -> dict:
             check("smesc_" + sec, sec in smesc)
         check("execution_tasks", len((smesc.get("execution") or {}).get("tasks") or []) >= 1)
         check("mission_readable", bool(smesc.get("mission")))
+        # Execution = the 4 doctrinal components (Ken 2026-06-30): intent, scheme_of_manoeuvre, main_effort, end_state.
+        ex = smesc.get("execution") or {}
+        check("exec_intent", bool(ex.get("intent")))
+        check("exec_scheme_of_manoeuvre", bool(ex.get("scheme_of_manoeuvre"))
+              and "main effort" in str(ex.get("scheme_of_manoeuvre")).lower())
+        me = ex.get("main_effort") or {}
+        check("exec_main_effort_designated", bool(me.get("task")) and "priority of support" in (me.get("rationale") or ""))
+        check("exec_main_effort_supporting", isinstance(me.get("supporting_efforts"), list))
+        check("exec_end_state", bool(ex.get("end_state")) and ex.get("end_state") == opd.get("desired_end_state"))
         ann = opd.get("annexes_json") or {}
         for a in ("A_conduct", "B_task_org", "D_intel", "E_rules", "RS_sustainment", "Q_command"):
             check("annex_" + a, a in ann)
@@ -7316,36 +8454,40 @@ def run_coa_engine_selftest() -> dict:
                 target_sector="Silent Witness I", evidence_json={"magnitude": 4},
                 mission_analysis_json={"available_assets": {"combat_ships": ships, "budget_available": budget}})["id"]
 
-        # 1. impossible (0 assets): ship/budget COAs rejected; only no-asset COAs viable.
+        # 1. impossible (0 assets): ship/budget COAs rejected; engine records ADVISORY best but does NOT select.
         op0 = make("argon", 0, 0, "s:argon:sector_pressure:teladi:a0")
         r0 = store.plan_operation_coas(op0)
         rej = {c["type"] for c in r0["coas"] if not c["viable"]}
         check("impossible_rejected", {"organic_patrol", "hire_contractors", "raid_enemy_logistics"} <= rej, str(rej))
-        check("selected_present", r0["selected"] is not None)
+        check("advisory_present", r0["advisory_best"] is not None)
         op0d = store.get_operation(op0)
-        check("status_coa_generated", op0d["status"] == "coa_generated" and op0d["selected_coa_id"] == r0["selected"]["coa_id"])
+        check("coa_generated_not_selected", op0d["status"] == "coa_generated" and not op0d.get("selected_coa_id"))
 
         # 2. ample assets, argon.
         opA = make("argon", 6, 200000, "s:argon:sector_pressure:teladi:aA")
         rA = store.plan_operation_coas(opA)
-        check("argon_selected_viable", rA["selected"]["viable"] is True)
+        check("argon_advisory_viable", rA["advisory_best"]["viable"] is True)
 
-        # 3. determinism: identical inputs (fresh op) → identical selected COA type.
+        # 3. determinism of the ADVISORY: identical inputs (fresh op) → identical advisory COA type.
         opA2 = make("argon", 6, 200000, "s:argon:sector_pressure:teladi:aA2")
         rA2 = store.plan_operation_coas(opA2)
-        check("deterministic_selection", rA2["selected"]["type"] == rA["selected"]["type"],
-              rA["selected"]["type"] + " vs " + rA2["selected"]["type"])
+        check("deterministic_advisory", rA2["advisory_best"]["type"] == rA["advisory_best"]["type"],
+              rA["advisory_best"]["type"] + " vs " + rA2["advisory_best"]["type"])
 
-        # 4. doctrine changes selection: split (aggression/speed-weighted) vs argon on identical assets.
+        # 4. doctrine changes the ADVISORY ranking: split vs argon on identical assets.
         opS = make("split", 6, 200000, "s:split:sector_pressure:teladi:aS")
         rS = store.plan_operation_coas(opS)
-        check("doctrine_changes_selection", rS["selected"]["type"] != rA["selected"]["type"],
-              "argon=" + rA["selected"]["type"] + " split=" + rS["selected"]["type"])
+        check("doctrine_changes_advisory", rS["advisory_best"]["type"] != rA["advisory_best"]["type"],
+              "argon=" + rA["advisory_best"]["type"] + " split=" + rS["advisory_best"]["type"])
 
-        # 5. rejected COAs carry a reason; selected COA is marked in the table.
+        # 5. NOT auto-selected; set_selected_coa commits a (simulated Player2) choice + validates + marks the table.
+        detA = store.operation_detail(opA)
+        check("none_selected_before_decision", not any(c.get("selected") for c in detA["coas"]))
+        sr = store.set_selected_coa(opA, rA["advisory_best"]["coa_id"])
+        check("set_selected_ok", sr["ok"] is True and sr.get("selected_coa_id") == rA["advisory_best"]["coa_id"])
         det = store.operation_detail(opA)
         sel = [c for c in det["coas"] if c.get("selected")]
-        check("one_selected_in_table", len(sel) == 1 and sel[0]["viability_status"] == "selected")
+        check("one_selected_after_decision", len(sel) == 1 and sel[0]["viability_status"] == "selected")
         check("viable_has_wargame", all(c.get("wargame_json") for c in det["coas"] if c["viability_status"] == "viable"))
     finally:
         shutil.rmtree(d, ignore_errors=True)

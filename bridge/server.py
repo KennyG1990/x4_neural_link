@@ -141,6 +141,10 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/ops/advance":
             self._send_json(200, self.router.ops_advance(query.get("save_id", [""])[0]))
             return
+        if parsed.path == "/api/ops/debug_force_order":
+            self._send_json(200, self.router.ops_debug_force_order(
+                query.get("save_id", [""])[0], query.get("faction", ["argon"])[0]))
+            return
         if parsed.path == "/api/ops/analyze_selftest":
             self._send_json(200, self.router.mission_analysis_selftest())
             return
@@ -176,6 +180,108 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/ops/execution_selftest":
             self._send_json(200, self.router.execution_lifecycle_selftest())
+            return
+        if parsed.path == "/api/ops/negotiation_selftest":
+            self._send_json(200, self.router.negotiation_dedup_selftest())
+            return
+        if parsed.path == "/api/ops/negotiation_scoring_selftest":
+            self._send_json(200, self.router.negotiation_scoring_selftest())
+            return
+        if parsed.path == "/api/ops/negotiation_consequence_selftest":
+            self._send_json(200, self.router.negotiation_consequence_selftest())
+            return
+        if parsed.path == "/api/ops/actions_selftest":
+            self._send_json(200, self.router.actions_selftest())
+            return
+        if parsed.path == "/api/ops/actions_whitelist":
+            self._send_json(200, self.router.actions_whitelist())
+            return
+        if parsed.path == "/api/ops/actions_proposal_selftest":
+            self._send_json(200, self.router.actions_proposal_selftest())
+            return
+        if parsed.path == "/api/ops/faction_doctrine_brief_selftest":
+            self._send_json(200, self.router.faction_doctrine_brief_selftest())
+            return
+        if parsed.path == "/api/ops/relation_move_validator_selftest":
+            self._send_json(200, self.router.relation_move_validator_selftest())
+            return
+        if parsed.path == "/api/ops/oc1_resume_selftest":
+            self._send_json(200, self.router.oc1_resume_selftest())
+            return
+        if parsed.path == "/api/ops/offers_evaluate":
+            self._send_json(200, self.router.offers_evaluate(query.get("save_id", [""])[0]))
+            return
+        if parsed.path == "/api/ops/offers_resolve_llm":
+            self._send_json(200, self.router.resolve_offers_llm(
+                query.get("save_id", [""])[0], int((query.get("max_n", ["25"])[0]) or 25)))
+            return
+        if parsed.path == "/api/ops/decision_adapter_selftest":
+            self._send_json(200, self.router.decision_adapter_selftest())
+            return
+        if parsed.path == "/api/ops/decide_probe":
+            self._send_json(200, self.router.decide_probe(
+                query.get("save_id", [""])[0], query.get("faction", ["argon"])[0]))
+            return
+        if parsed.path == "/api/ops/decision_record_selftest":
+            self._send_json(200, self.router.decision_record_selftest())
+            return
+        if parsed.path == "/api/ops/select_coas_llm":
+            self._send_json(200, self.router.select_pending_coas_llm(
+                query.get("save_id", [""])[0], int((query.get("max_n", ["10"])[0]) or 10)))
+            return
+        if parsed.path == "/api/ops/opord_player2_demo":
+            self._send_json(200, self.router.opord_player2_demo(query.get("faction", ["split"])[0]))
+            return
+        if parsed.path == "/api/ops/faction_scene_selftest":
+            self._send_json(200, self.router.faction_scene_selftest())
+            return
+        if parsed.path == "/api/ops/faction_scene":
+            self._send_json(200, self.router.run_faction_scene(
+                query.get("save_id", [""])[0], query.get("a", [""])[0], query.get("b", [""])[0]))
+            return
+        if parsed.path == "/api/ops/faction_scene_scheduler_selftest":
+            self._send_json(200, self.router.faction_scene_scheduler_selftest())
+            return
+        if parsed.path == "/api/ops/scheduled_scene":
+            self._send_json(200, self.router.run_scheduled_scene(
+                query.get("save_id", [""])[0], query.get("a", [None])[0], query.get("b", [None])[0]))
+            return
+        if parsed.path == "/api/ops/coa_selection_selftest":
+            self._send_json(200, self.router.coa_selection_selftest())
+            return
+        if parsed.path == "/api/ops/assess_decisions_llm":
+            self._send_json(200, self.router.assess_operations_llm(
+                query.get("save_id", [""])[0], int((query.get("max_n", ["15"])[0]) or 15)))
+            return
+        if parsed.path == "/api/ops/assessment_decision_selftest":
+            self._send_json(200, self.router.assessment_decision_selftest())
+            return
+        if parsed.path == "/api/ops/route_tasks_llm":
+            self._send_json(200, self.router.route_pending_tasks_llm(
+                query.get("save_id", [""])[0], int((query.get("max_n", ["20"])[0]) or 20)))
+            return
+        if parsed.path == "/api/ops/route_decision_selftest":
+            self._send_json(200, self.router.route_decision_selftest())
+            return
+        if parsed.path == "/api/ops/propose_deals_llm":
+            self._send_json(200, self.router.propose_deals_llm(
+                query.get("save_id", [""])[0], int((query.get("max_n", ["8"])[0]) or 8)))
+            return
+        if parsed.path == "/api/ops/propose_deals_selftest":
+            self._send_json(200, self.router.propose_deals_selftest())
+            return
+        if parsed.path == "/api/ops/faction_action_selftest":
+            self._send_json(200, self.router.faction_action_selftest())
+            return
+        if parsed.path == "/api/ops/decision_tick":
+            self._send_json(200, self.router.decision_tick(query.get("save_id", [""])[0]))
+            return
+        if parsed.path == "/api/ops/decision_tick_selftest":
+            self._send_json(200, self.router.decision_tick_selftest())
+            return
+        if parsed.path == "/api/ops/decisions":
+            self._send_json(200, self.router.decisions_list(
+                query.get("save_id", [""])[0], int((query.get("limit", ["50"])[0]) or 50)))
             return
         if parsed.path == "/api/ops/lease_selftest":
             self._send_json(200, self.router.opord_lease_selftest())

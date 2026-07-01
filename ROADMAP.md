@@ -1,5 +1,188 @@
 # X4 Neural Link + AI Influence Roadmap
 
+### #49 OC2 — Job Market + chat deals via Negotiations; resume OPORD via outcomes — ✅ SUPERSEDED/verified 2026-06-30
+- RECONCILE verdict: OC2's scope is already covered by shipped infra — building it would be a redundant defect. Cited
+  coverage (all green): (1) **job outcomes resume OPORD** — `complete_job` completes the linked operation_task when
+  job.operation_task_id is set (#40); proven by execution_selftest **9/9**. (2) **all deals go through the single
+  Negotiations door** — the NF1 invariant redirects every non-terminal agreement through create_or_update_agreement
+  (dedupe by key); proven by negotiation_selftest **11/11**. Chat/proposal deals already submit via
+  submit_negotiation_intent (D6, router propose_deals_llm; source "proposal"). (3) **agreement outcomes resume
+  OPORD** — #48 oc1_resume_selftest **6/6**. Jobs are a distinct market primitive (hire contracts), not bilateral
+  agreements, so they correctly use the job market + complete_job resume, not the agreements door.
+- CLOSE: no new code — scope met by NF1 + #40 + #48. Marked superseded with the three cited selftests, per the
+  reconcile "extend/verify, don't rebuild" rule.
+
+### #48 OC1 — OPORD as a Negotiations CLIENT (submit intent → consume outcome) — ✅ bridge-verified 2026-06-30
+- RECONCILE: NF1 already made OPORD SUBMIT intents through the single door (route_pending_operations →
+  submit_negotiation_intent for allied_support/ceasefire, task → status 'issued' + agreement_id). The missing half
+  was CONSUMING the outcome. So this was the consume step, not a rebuild.
+- BUILT `memory.resume_operations_from_negotiations(save_id)`: for each op task still 'issued' with an agreement_id,
+  once the agreement is terminal — accepted/kept/fulfilled → task COMPLETED (support/ceasefire secured); refused/
+  broken/expired/rejected → task FAILED (a FRAGO trigger, op adapts). Emits an after_action_report / frago_issued
+  world_event so the outcome surfaces. Idempotent (only acts on still-'issued' tasks). Wired into advance_operations
+  (runs each pipeline pass) so the loop closes: submit → Player2 resolves (resolve_offers_llm) → OPORD resumes.
+- VALIDATED: oc1_resume_selftest 6/6 (pending=no-op, accept→completed, refuse→failed, idempotent). Regression green:
+  opord 24/24, e2e 11/11, decision_tick 4/4. ◐ in-game: the AAR/FRAGO world_events surface via the existing
+  news→logbook path (proven); visual confirmation rides the daemon.
+
+### #64 Player2 relation actions → validated → in-game actuation format — ✅ LIVE-verified (on-screen ◐) 2026-06-30
+- COMPLETE loop built + live-verified: a Player2 scene proposal (relation:<faction>,change:…) → whitelist (now
+  ENABLED) → `validate_relation_move` (DeadAir-grounded eligibility+bounds) → shadow-apply + emit
+  {type:'adjust_relation', faction, target, relation:<delta/100>} into the drain actions[] → the EXISTING Lua
+  On_action → MD set_faction_relation path (verified present, no MD change needed). Enabled relation_delta_limited in
+  action_whitelist.json + ACTION_GRAMMAR (advertised to the model). `_relation_drain_actions` does the validate+emit;
+  wired into run_scheduled_scene + _drain_from_tick. run_scheduled_scene got an optional a/b pair override.
+- MD/FORGE: per Ken, MD is authored in the Forge — but reconcile confirmed On_action ALREADY handles adjust_relation
+  ($fidA/$fidB → set_faction_relation, oldRel+$relation), so this needed NO new MD, only verification (read in the
+  Forge tree). Directive satisfied by verification, not authoring.
+- VALIDATED: relation_move_validator 6/6, scheduler 5/5 (incl. relation_action_emitted), actions 18/18 (updated for
+  the now-enabled verb), proposal 8/8, tick 4/4. LIVE on the ACTIVE save game_333930704 (Ken had reloaded → new
+  save id; the old game_707480512 is orphaned): argon "let us discuss trade & security" / paranid "your hollow
+  offers mean nothing" → **Player2 emitted a validated relation move paranid→argon −0.05** (bounded, attitude-only,
+  eligibility-checked; correctly REJECTED for xenon pairs = excluded faction).
+- ◐ REMAINING: on-screen in-game proof — drive X4 (foreground), let the daemon's strategic tick fire a scene with a
+  relation action, and SEE the relation shift + fleets react in the game. The bridge emits the correct actuation
+  format; the Lua+MD path is proven; only the visual confirmation is pending (needs the game focused).
+
+### #64 relation-move eligibility validator (DeadAir-grounded) — ◐ bridge done, MD dispatch via Forge pending 2026-06-30
+- GROUNDED (x4-reference-mods skill + Ken's DeadAir resources): ported dynamicwardiplomacy.xml's relation model —
+  legal move requires FactionOne≠FactionTwo, target isactive, target NOT in ExcludedFactions (civilian/criminal/
+  khaak/smuggler/visitor/xenon/ownerless/yaki), bounded ±5 step, result clamped to the ±25 diplomatic band. This is
+  the "eligibility model the bridge lacked" (per the skill).
+- BUILT `memory.validate_relation_move(save_id, actor, target, step)` → {ok, clamped_step, result, reason}. Attitude-
+  only (anti-cheat OK). Selftest run_relation_move_validator_selftest → **6/6** (valid move, excluded target rejected,
+  self rejected, unknown rejected, step bounded ±5, band-limit no-op rejected). Route
+  /api/ops/relation_move_validator_selftest. Regression green (scheduler 4/4, tick 4/4, consequence 6/6).
+- ◐ REMAINING (per Ken 2026-06-30: MD is built in the FORGE at localhost:3000): (a) bridge emits a validated
+  relation action into the drain actions[] channel + enable relation_delta_limited (bounded) in the whitelist; (b)
+  the MD dispatcher — the relation actuation On_action→set_faction_relation ALREADY exists in ai_influence_contract.xml
+  (SPEC 1d-W2); any new/changed MD (e.g. status_update handler) is authored in the FORGE, not by hand; (c) in-game
+  proof (drive X4, see the relation shift + fleets react). This unit = the DeadAir-grounded VALIDATOR (the gate);
+  emit+enable+MD+in-game is the tail.
+
+### #63 NPC>NPC scheduler + memory writeback + player surface — ✅ LIVE-verified 2026-06-30
+- BUILT `router.run_scheduled_scene(save_id)`: picks a TOPICAL pair (two factions sharing a recent high-importance
+  world_event; fallback first two factions), runs run_faction_scene, PERSISTS a `diplomatic` world_event (source
+  "scene") so both factions remember it (feeds each faction's situation briefing), and SURFACES "Overheard — X: …"
+  news lines. WIRED into decision_tick strategic tier (one scene per tick, rate-limited by the tier gate) and into
+  _drain_from_tick so the overheard lines reach the game logbook via the existing news→log path. Routes
+  /api/ops/scheduled_scene + faction_scene_scheduler_selftest.
+- VALIDATED: faction_scene_scheduler_selftest 4/4 (topical pair, both spoke, 2 overheard lines, scene world_event
+  persisted). Regression green: faction_scene 7/7, decision_tick 4/4, actions 18/18. LIVE on game_707480512 (6.3s):
+  scheduler picked scaleplate↔ministry from a real shared event → Scale Plate "surrender tribute now or face the
+  full fury…", Ministry "your empty threats amuse us… pay tribute on our terms" — both in character, ministry
+  replying to the demand, persisted + surfaced as overheard news.
+- RESULT: NPC>NPC scenes now happen AUTONOMOUSLY in the live loop, both sides remember, and the player sees them in
+  the logbook. Ken's goal (NPC>NPC works like player>NPC, world supplies the message) is live end-to-end on the
+  bridge+feed. ◐ remaining: the in-game logbook render is the existing news path (proven for other feeds); a visual
+  in-game confirmation of an overheard line is the last ◐. Scene actions[] execution rides #64.
+
+### #62 NPC>NPC scenes — two-sided contract — ✅ LIVE-verified 2026-06-30
+- BUILT `router.run_faction_scene(save_id, a, b)` + `_scene_situation` (engine grounds the opening situation from
+  relationship trust/resentment + most-recent shared world event). Player2 speaks for A via decide_actions →
+  {A_says, actions_a[]}; then for B GIVEN A's line as the incoming message → {B_says, actions_b[]}. Both whitelisted +
+  audited; defers cleanly (no half-scene) if Player2 is down. Routes /api/ops/faction_scene(_selftest).
+- TRANSPORT FIX (the key live enabler — the thing Ken kept pointing at re: the Bannerlord method): decide_actions
+  now calls `player2.complete` (stateless POST /v1/chat/completions, system+user) instead of `npc_complete` (npc
+  spawn+chat). npc_chat returns in-character PROSE, so the {response, actions[]} JSON contract came back EMPTY live;
+  /v1/chat/completions returns raw text we parse as JSON. This fixes ALL of proposal mode live, not just scenes.
+- VALIDATED: faction_scene_selftest 7/7, actions_proposal_selftest 8/8 (stub updated to .complete). LIVE on
+  game_707480512 (real LLM, 5.6s): Split→Teladi "submit to our rule or be crushed!" (dialogue_only, status_update);
+  Teladi→Split "We will not bow to tyrants… you would do well to reconsider before you lose profit" (dialogue_only,
+  logbook_entry, status_update). Both doctrine-consistent, B replies to A's actual line, whitelisted actions both
+  sides. This is NPC>NPC working like player>NPC with the world supplying the message (Ken's goal).
+- ◐ NEXT (#63): scheduler (which pairs get scenes + cadence), memory writeback (both remember), player surface
+  (overheard/news/transmission). This unit = the scene GENERATOR + contract; #63 = schedule + persist + surface.
+  Also unblocks #64 now that there's a real producer of mvp actions[].
+
+### #62 NPC>NPC scenes — two-sided {A_says,B_says,actions[]} contract — PLANNED 2026-06-30
+- RECONCILE: no scene/two-sided/npc_npc infra exists (grep clean) → greenfield, but built ON `decide_actions` (#57,
+  the proposal contract) which exists. This is also the FIRST real producer of mvp actions[] — which is why #64
+  (the actuator) was correctly deferred until now (no producer before this).
+- PLAN: `router.run_faction_scene(save_id, a, b, situation?)` — the engine supplies the SITUATION (the "message the
+  world hands them": relationship trust/resentment + doctrine), Player2 speaks for A via decide_actions →
+  {A_says, actions_a[]}, then for B GIVEN A's line as the incoming message → {B_says, actions_b[]}. Both sides
+  whitelisted + audited (decide_actions already records to decision_records); nothing executes. Defers cleanly if
+  Player2 is down (no half-scene). Scheduler/cadence + memory writeback + player surface = #63. Selftest = stub
+  Player2, assert the two-sided contract + both recorded.
+
+### #67 HAND THE LIVE LOOP TO PLAYER2 — daemon drives decision_tick — ✅ LIVE-verified 2026-06-30
+- ROOT CAUSE (corrected a wrong earlier claim): the faction strategic pick was ALREADY Player2 (review_faction
+  ignores its vestigial use_llm flag and always routes through decide()). The real defect was that the live
+  `_influence_daemon` called `influence_step` DIRECTLY every 22s (faction news only, NO resolver), so proposals
+  piled (45 `proposed`) and the feed spammed, while `decision_tick` (#50, the tiered driver that runs the resolver +
+  Player2 COA/route/assess/propose) was wired to a route but NOTHING invoked it on the live loop.
+- FIX: `_influence_daemon` now calls `self.decision_tick(save)` (self-gated tiers: operational ~300s = COA/route/
+  assess, strategic ~900s = offers/propose/throttled influence) instead of the every-22s influence_step. Added
+  `_drain_from_tick()` to surface the tick's Player2 DECISIONS (negotiation verdicts + COA commitments) + the
+  throttled faction news into the game drain feed, so the logbook SHOWS the LLM's intent. Every driver defers on
+  Player2 failure (no math substitute).
+- VALIDATED LIVE on save game_707480512 (real LLM): one decision_tick → operational fired, **Player2 made 2 live COA
+  decisions**. Drove the resolver (offers_resolve_llm max_n=6) → **6 proposals resolved by Player2** (4 refuse, 2
+  counter, 0 deferred) with in-character, doctrine-driven reasons — Teladi: "No free patrols… without a trade
+  payoff"; Split: "the Split will crush Antigone, not bow to their feeble offers" / "any peace without guarantees is
+  weakness we can't afford." Gamestate delta: `proposed` 45→38, `refused` 0→5, `countered` 1→3; decision types now
+  include negotiation ×8 + coa_selection ×2 (were faction_action-only). Regression green: decision_tick 4/4,
+  decision_adapter 4/4, negotiation_scoring 9/9, actions 18/18.
+- ◐ TAIL: the drivers DECIDE + resolve (attitude/records); turning a resolved COA/deal into in-game SHIP ORDERS is
+  the ExecAuth issuer + #64 dispatcher (gated on the game). Cadence (300s/900s) is tunable if Ken wants faster/
+  slower visible activity. The remaining 38-proposal backlog drains on the throttled tier over time.
+
+## ★★★ GOVERNING ARCHITECTURE — PLAYER2 INTENT, X4 VALIDATED EXECUTION (spec'd 2026-06-30, Bannerlord capture)
+
+**Source evidence:** `F:\DEV_ENV\AiInfluenceBannerlord\player2_proxy\runtime\player2_proxy.sqlite3` captured live
+Bannerlord AI Influence traffic through the Player2 proxy. Two player-facing outcomes proved the contract:
+`actions:["relation:main_hero,change:negative"]` caused a relationship decrease, and
+`actions:["attack:main_hero"]` caused the NPC to prepare an attack. Therefore the working reference pattern is:
+
+```
+game context -> Player2 prompt -> JSON response with response/actions[] -> bridge parses/audits
+-> deterministic validator/whitelist -> X4 executes only validated effects
+```
+
+**Non-negotiable scope rule from here forward:** Player2 owns character voice, intent, preference, doctrine-flavored
+judgment, and proposed actions. Neural Link/X4 own facts, legality, bounds, cooldowns, affordability, object lookup,
+execution, and proof. A failed/unparsed Player2 decision **defers**; it must not silently fall back to a deterministic
+math decision. Deterministic scoring may remain only as advisory context in the prompt and audit row.
+
+**Refactor target for all remaining work:**
+- Chat, diplomacy, offers, OPORD choices, autonomous influence, mission offers, economy requests, and faction posture
+  must route through one auditable decision/action contract.
+- The preferred bridge response shape is `{response|reply, actions:[{type, params, description?, needs_confirm?}]}`;
+  string actions from reference data may be stored as evidence, but X4 executes only normalized object actions.
+- Every action category requires: prompt contract, parser, audit row, whitelist/validator, X4 dispatcher handler,
+  dashboard visibility, selftest, and in-game proof before it is marked ✅.
+- Existing deterministic authority in older influence paths is technical debt to retire. In particular, the autonomous
+  influence loop must stop choosing with `use_llm=False`, and `_llm_decide` must use the universal `decide(...)`
+  defer-on-failure policy instead of index-0 fallback.
+
+**Action rollout order under this architecture:**
+1. ✅/◐ Preserve current safe surfaces: `dialogue_only`, `memory_write`, `logbook_entry`, `status_update`.
+2. Next MVP: `relation_delta_limited` and `threaten/attack_intent` as proposed actions, with confirmation/gates and
+   strict bounds.
+3. Then: `mission_offer`, `trade_request`, `temporary_diplomatic_flag`, `faction_to_faction_proposal`.
+4. Later: OPORD fleet-task decisions and economy/war phase effects, only after validators and in-game proof.
+
+Validation for this scope update:
+- Bannerlord proxy DB contains live Player2 action examples for relation decrease and attack intent.
+- Live X4 bridge health on `http://127.0.0.1:8713/health` returned `ok:true`; Player2 reachable.
+- Live X4 DB has existing substrate to adapt rather than rebuild: factions, relationships, world_events, agreements,
+  and decision_records.
+
+**FULL SPEC (authoritative):** `F:\StarForge\wiki\x4-neural-link\player2-decision-layer-spec.md` — §2 decision-point
+inventory (D1–D9), §11 fact-vs-judgment bright line, §10 fallback (defer/mock/operator-flag), §12 decision_records,
+§14 TOTAL CONVERSION MAP (the complete finite audit + what STAYS deterministic), §15 split-brain resolution.
+
+**CONVERSION STATUS (every judgment → Player2 via `decide()`; facts/validation/execution stay deterministic):**
+- ✅ adapter `decide()` (#52) · ✅ audit log `decision_records` (#54) · ✅ D1 COA · ✅ D2 negotiation accept ·
+  ✅ D3/D4 routing+counterparty · ✅ D5 assessment (+`can_conclude`). All deterministic-selftest green; in-game ◐.
+- ☐ D6 proposal initiation → ☐ D8 influence engine (retire `_llm_decide` index-0 fallback + `use_llm=False`; the
+  galaxy-wide loop; THE correctness fix) → ☐ D9/#57 chat + `{response, actions[]}` contract + whitelist enablement →
+  ☐ #50 tiered cadence → ☐ #59 mod-wide invariant sweep.
+**Per-task workflow is mandatory** (PLAN→RECONCILE→DOCUMENT→IMPLEMENT→VALIDATE(cite selftests + in-game when up)→
+SECOND-LAYER→DOCUMENT→AAR). The recipe per decision point: stop-engine-at-advisory → commit-validator → router `_llm`
+driver (defer-on-fail) → reframe old selftest as advisory → stub-Player2 driver selftest.
+
 ## ★★★ EPIC OPORD-EXEC — EXECUTION AUTHORITY (spec'd 2026-06-29, Ken/Codex — `OPORD Execution Authority Update`)
 The release gate: OPORD task → REAL X4 ship order → OBSERVED execution. Without it OPORD is a planner/market
 coordinator; with it, a command layer over the X4 sim. Split: deterministic bridge SPINE (testable) + in-game ARMS.
@@ -4840,173 +5023,376 @@ This closes the loop: events → update relationships/economy/strategic_state �
 - **Ingest:** events `{target, type, summary, importance, sector, faction, ts}` are buffered in memory + persisted to a `pending_events` table. Cheap; no LLM.
 - **Green light (flush triggers, any of):** time **interval** (default ~15s); **batch size** (target piled up ≥K); **priority preempt** (importance-5 = ambulance, flushes immediately / jumps the queue).
 - **Flush = one LLM call per cycle:** the worker pops up to `batch_size` pending events, coalesces dupes ("3 freighters lost" not 3 lines), builds ONE consolidated prompt, and sends it to a dedicated **"Strategic AI" NPC** via the working NPC API (clean replies, sidesteps the raw-chat reasoning bug). The single resolution is logged + condensed into memory facts. So N events → 1 LLM call.
-- **Single drain lane = backpressure:** one flush at a time behind the chat gate. A flood of 1,000 events drains in controlled groups at the cadence instead of thrashing. Directly fixes the stress-test concurrency failure.
-- **Memory tie-in:** coalesce + batch-condense ⇒ fewer, merged facts ⇒ also slows the unbounded-CORE growth found above.
+- **Single drain lane = backpressure:** one flush at a time behind the chat gate. A flood of 1,000 events drains in controlled groups at the cadence instead of thrashing. Directly fixes the stress-te
+## 2026-06-29 — FIX: OPORD issuer leased a NULL ship ("not of type component") ◐→in-game-pending
+- SYMPTOM (live): Forge debug-watcher showed `md.aic_opord_execution.On_Assign … Evaluated value 'null' is not of
+  type component`; bridge lease lease_9eeae8d309 had ship_runtime_id/name/sector = literal "null".
+- ROOT CAUSE (grounded vs vanilla + DeadAir dynamicwar.xml l.215 `$X? and $X != null`): in X4 MD `?` tests
+  ACCESSIBILITY, not non-null. `<set_value name="$ship" exact="null"/>` DEFINED $ship, so `not $ship?` was false
+  forever → the find-first loop never assigned a real ship → create_order got null → raise emitted "null" for every
+  ship field.
+- FIX (md/aic_opord_execution.xml): removed the null-init; loop guard `(not $ship? or $ship == null)`; final guard
+  `$ship? and $ship != null`; switched filter to `primarypurpose="purpose.fight"` (lease a COMBAT ship, not any
+  ship); added a `debug_text` self-doc line.
+- VALIDATION: Forge project/validate → 0 structural errors in the cue (only `missing_content_xml`, the single-file
+  isolation artifact). Phantom lease released (idempotent). IN-GAME: ◐ pending — needs a SAVE RELOAD to register the
+  new MD, then re-trigger; PASS = watcher On_Assign clears + bridge lease shows a real ship idcode.
 
-**Endpoints (planned):** `POST /api/events/enqueue`, `GET /api/events/simulate?npcs=500&events=N` (flood), `GET /api/events/flush` (manual green light), `GET /api/events/state` (pending + config + flush history + last resolution), `GET /api/events/clear`. Dashboard gets an **Event Queue** panel: pending gauge, interval, last flush, and a flush-history table showing each cycle's batch size, latency, and the LLM's resolution text.
+## 2026-06-29 — NEGOTIATIONS (Codex spec): allied-support agreement spam is a real append-only/under-keyed defect
+RECONCILE confirmed Codex (~95%): `add_agreement` is bare-INSERT (no key), agreements table had only a non-unique
+index, and BOTH allied-support creators passed `party_b=""` — route_operation_task (#request_allied_support) and the
+per-tick FRAGO reinforcement path → 27x/26x duplicate anonymous pending alliances on op_argon_*. Relationship infra
+(relationships table + adjust_relationship trust/fear/resentment/debt + get_relationship) ALREADY exists → reuse for
+§4/§6, don't rebuild.
 
-**Live demo (in our setup, not in-game):** simulate **500 NPCs** generating conversation/events into the queue; the worker resolves a batch through the **real Player2 LLM every interval**; watch on the dashboard the pending count climb during the flood then drain group-by-group as the green light cycles, with each cycle's real LLM resolution shown.
+PLAN — 4 phases mapping the 10 spec sections:
+- N2 = lifecycle statuses + deterministic acceptance scoring (§3,§6)
+- N3 = rich context_json + refusal/accept/broken→adjust_relationship + OPORD task-state-follows-agreement (§4,§5,§7)
+- N4 = world events on state TRANSITIONS only + dashboard agreements panel + health warnings (§9,§10)
 
-**Phasing:** Phase 1 = ingest → buffer → interval flush → real-LLM resolution → memory (this milestone). Phase 2 = priority preempt + coalescing tuning + per-profile knobs.
+### N1 — durable identity + dedup + real counterparty (§1,§2,§7,§8) — ◐ built, bridge-restart-pending validation
+- SCHEMA (idempotent migration in init): ALTER agreements ADD agreement_key/kind/operation_id/operation_task_id/
+  request_count/last_requested_at/urgency/offered_value/context_json; backfill key for legacy rows; COLLAPSE existing
+  OPEN duplicates (keep MIN(id) per key → 'superseded'); CREATE UNIQUE INDEX uq_agreements_open(agreement_key) WHERE
+  status IN (open set incl. no_counterparty). agreement_key = save:type:party_a:party_b:op:task:kind.
+- create_or_update_agreement(): upsert on key — repeat request UPDATEs one open row (bumps request_count) not INSERT.
+- select_support_counterparty(): real party_b from relations (non-criminal, not self/enemy, trust>=0, ranked
+  trust*.25 + shared_enemy(20) - resentment*.2); '' → status='no_counterparty' (still deduped, not anonymous spam).
+- Refactored BOTH creators to use it; FRAGO emits its report/escalation ONLY on first creation (created) — kills the
+  per-tick report/event spam (§8/§9).
+- run_negotiation_dedup_selftest (route /api/ops/negotiation_selftest) — 8 checks: counterparty real, repeat→1 row
+  request_count==4, one_open_per_key, party_b never empty, distinct key→new row, unique-index blocks dup, never
+  self/enemy, route reuses open agreement.
+- VALIDATION PENDING: needs ONE bridge restart (schema ALTER + new module fn + new routes don't hot-reload). After
+  restart: GET negotiation_selftest all-pass; live 98-agreement dupes auto-collapse (verify open count drops on the
+  dashboard). Then ◐→✅.
 
-**Dev tooling — watch mode (`Watch-Neural-Link.bat`):** run once and leave open; a PowerShell file-watcher polls `bridge/` + `config/` and on any edit auto-compiles, redeploys F:→G:, and restarts the bridge **in place** (same window, bridge runs hidden). Compile errors keep the previous bridge alive. Replaces the manual `Deploy-And-Restart.bat` per-edit loop. (Dashboard files are served live from G: and need no restart, so they're not watched.)
+## 2026-06-29 — ARCHITECTURE INVERSION (Ken): Negotiations is the FOUNDATION; OPORD is a client
+Decision: do NOT build a war-specific diplomacy model under a global negotiations layer. Invert: Negotiations =
+universal transaction layer (dedupe/counterparty/valuation/lifecycle/budget/consequences/world-events). OPORD/Job
+Market/Chat are CLIENTS that SUBMIT intents and CONSUME results. HARD INVARIANT: no subsystem may create an OPEN
+deal except through the single Negotiations door.
+Reconcile bonus (already built, reuse — don't rebuild): market_jobs+dedupe+escalation, budget_capacity/spent gate
+("words≠resources"), op↔agreement linkage, ship-order plumbing. Genuinely-new: valuation/scoring, lifecycle
+resolution, NPC-side acceptance, audience/public-board layer.
+Re-ordered plan: NF1 door+invariant → NF2 valuation/scoring/resolver → NF3 consequences+transition-events+dashboard
+→ OC1 OPORD-as-client (intent + 'negotiating' state + consume result) → OC2 job-market/chat + resume OPORD exec.
 
-**Verification (live demo):** deployed via the new watch-mode `Deploy-And-Restart.bat`; `/api/events/state` → `worker_running:true`, interval 12s, batch 25. `simulate?npcs=500` → **497 pending** (a death-priority flush already cleared 3). Worker drained it group-by-group: each flush = **exactly one real Player2 LLM call** (the Galaxy Strategic AI NPC), batch 25, ~4–6s, producing coherent situation reports ("Naval attrition remains critical with heavy losses concentrated in Sectors 1 and 3…", "Total fleet collapse is imminent…"). **Priority preempt confirmed** — importance-5 `death` events fired `reason:priority` flushes ahead of the interval. Net: **500 events resolved through ~20 LLM calls instead of 500** (25× reduction), at a controlled cadence, no thrash, all logged + visible on the dashboard.
+### NF1 — single negotiation door + invariant (route ALL creators) — ◐ built, restart-pending validation
+- INVARIANT enforced at API level: `add_agreement` now REDIRECTS any non-terminal status through
+  create_or_update_agreement (dedupe by agreement_key); only terminal/historical records (kept/broken/expired/…)
+  insert directly. So EVERY caller deduplicates — fixes the 45x patrol_cooperation (generate_agreements) spam too,
+  not just allied-support, with zero per-site edits.
+- `submit_negotiation_intent(source, kind, proposer, recipient, op/task, terms, context, require_counterparty)` =
+  THE public door (kind→type map; resolves counterparty when required). OPORD allied_support/FRAGO/seek_ceasefire
+  now SUBMIT intents (source="opord") instead of owning agreement creation.
+- NF1 keeps created status 'pending' (conclude/health/cleanup key on it); canonical lifecycle = NF2.
+- selftest run_negotiation_dedup_selftest extended to 12 checks (incl. add_agreement-open-deduped, terminal-insert-
+  direct, intent-door-dedupes). Fixed 2 would-be regressions in run_execution_routing_selftest (seed ally so
+  allied_support resolves a counterparty; status stays 'pending').
+- VALIDATION PENDING: bridge restart → GET /api/ops/negotiation_selftest all-pass + full /api/agent selftest green
+  + live agreement dupes auto-collapse. Then ◐→✅.
 
-**Tuning notes / honest warts:** (1) each flush currently writes the strategic resolution as a `diplomacy` (significant) fact to *every* distinct target in the batch — that inflated significant-fact counts; the resolution should instead go to a single global/faction memory, not per-officer. (2) death-priority events spawn a flush thread each; the no-blocking flush lock dedupes them to one runner, but a debounce would be cleaner. Both are Phase-2 polish, not blockers.
+## 2026-06-29 — ✅ VALIDATED LIVE (post bridge-restart)
+- **Issuer null-ship fix ✅ IN-GAME PROVEN.** Live leases now hold REAL ships (DDM-561 "ARG Recon Fighter
+  Discoverer", OQE-651 "ARG Prospector Discoverer") with real idcode/name/sector + order_kind=protectposition,
+  status=issued — NOT "null". Forge debug-watcher activeErrors:0, no "not of type component". The release gate is
+  CLOSED: OPORD task → in-game create_order → real ship leased+ordered. (debug-trigger /api/ops/debug_force_order
+  armed the queue; the in-game poller fired On_Assign with the fixed MD.)
+- **N1 + NF1 ✅ VALIDATED.** negotiation_selftest 11/11; ZERO regressions (route 10/10, frago 8/8, cleanup 9/9,
+  e2e 10/10). Live agreement dupes collapsed: 34 superseded + 28 expired; partial-unique index created at startup
+  (proves no same-key open dupes remain). The 45 'proposed' are DISTINCT patrol_cooperation pairs (deduped per-pair,
+  resolution = NF2).
+- **REFINEMENT (logged, not blocking):** the issuer leased a SCOUT + a MINER despite primarypurpose="purpose.fight"
+  — the find filter isn't restricting to combat ships. A protectposition order on a Prospector is suboptimal. Fix in
+  OC1/execution: verify purpose.fight semantics or add a class/role gate so only fightships are leased. Chain works;
+  ship-selection quality is the refinement.
 
----
+## 2026-06-29 — FIX: issuer leased non-combat ships → combat-only gate ◐ in-game-pending
+- CAUSE (grounded vs vanilla fight.attack.object.capital.xml + interrupt.attacked.xml l.73): `recursive="true"` on
+  find_ship_by_true_owner pulled in a warship's SUBORDINATE scout/miner unfiltered by the parent's purpose filter.
+- FIX (md/aic_opord_execution.xml): dropped recursive; added per-element guard `$s.primarypurpose == purpose.fight`
+  (re-filters every candidate by the real property — vanilla-confirmed syntax). Forge project/validate: 0 structural
+  errors (only single-file missing_content_xml artifact).
+- VALIDATION: ◐ needs /refreshmd → re-fire debug trigger → confirm leased ship_name is a warship (not
+  Discoverer/Prospector). Lease ship_name is the readable ground truth.
 
-## 2026-06-19 — 100-NPC memory stress test ✅ DONE (passed)
+### NF2 — valuation + acceptance scoring + resolution driver — ◐ built, restart-pending validation
+- `score_agreement_acceptance(save, agreement)`: deterministic WH3-style score from the RECIPIENT's POV, reading the
+  SHARED models (relationships trust/resentment/debt toward requester + strategic_state war_load/losses), NOT a
+  bespoke calc. factors = base50 + trust*.25 + shared_enemy(20) + offer(min20 @200k) + debt*.1 − war_load*30 −
+  losses*20 − resentment*.2 − risk*30. Bands (Codex): ≥70 accept · 45–69 counter · 25–44 refuse · <25 refuse_harshly.
+  LLM never decides — this does.
+- `evaluate_open_offers(save)`: scores every open offer WITH a real counterparty → accepted/countered/refused,
+  records score+factors+decision in context_json. Counteroffers left for the requester (OC); no-counterparty skipped;
+  resolved offers leave the evaluatable set (not re-scored). WIRED into advance_operations (heartbeat) → the 45 stuck
+  'proposed' offers will auto-resolve live.
+- selftest run_negotiation_scoring_selftest (8 checks: accept/refuse/counter bands, resolver transitions, score
+  recorded, resolved-not-reevaluated) → route /api/ops/negotiation_scoring_selftest; + /api/ops/offers_evaluate.
+- VALIDATION PENDING: bridge restart → scoring_selftest all-pass + watch the live 'proposed' backlog drain to
+  accepted/countered/refused on the dashboard. Then ◐→✅. (Consequences/budget/world-events = NF3; OPORD consuming
+  the result = OC1.)
 
-**Goal:** prove the memory system holds at the scale a 100-hour save implies — many NPCs, long conversations — and put hard numbers on Risks #2 (unbounded growth) and #3 (condensation) from the robustness assessment.
+## 2026-06-29 — ARCHITECTURE PIVOT (Ken + Codex, grounded in Bannerlord "AI Influence" mod): decision authority → Player2
+Reference: the Bannerlord AI Influence (AI Diplomacy) mod (the namesake) keeps deterministic game systems but inserts
+the LLM as the THINKING layer — builds world/diplomacy/event context FIRST, then the LLM decides/dialogues in
+character, on a turn cadence (not per-frame). Our system was a math war-sim with LLM narration; the fix is to make
+Player2 the strategic actor, deterministic = guardrails.
+CANON loop (Codex): game/DB evidence → deterministic summarizer builds grounded brief → Player2 faction actor (brief +
+doctrine/personality/memory) → proposes intent/terms/COA as JSON → deterministic VALIDATORS (legality/resources/dedupe/
+safety) → accepted intent becomes Negotiation/OPORD/Job/Order → execute → results feed memory.
+HARD BOUNDARY: Player2 decides INTENT only; it must NOT directly change relation / create credits / assign ship /
+transfer sector / mark task complete. Validators decide executability; bridge/X4 executes only validated actions.
 
-**Method (two layers):**
-- *Synthetic scale (fast, the bulk):* a `GET /api/memory/stresstest?npcs=100&turns=40` endpoint drives ~100 NPCs (varied race/role/ship/skills) through ~40-turn conversations each (~4000 turns), with CORE events (death/war/oath/love) embedded in routine chatter. Runs in-process against the *live* memory store (no Player2, no joules) so it populates the real dashboard. Reports timing, per-NPC raw-turn bounding, total facts, CORE-survival, DB size. `GET /api/memory/stress_clear` removes the `save_id=stress` rows afterward.
-- *Live integration sample:* a handful of real `target.mode:"npc"` conversations through Player2 to confirm the full pipeline + concurrency gate still behave while the store is populated.
+### NF2 reworked → Player2 decision layer — ◐ built, restart-pending validation
+- Math decider UN-WIRED from the heartbeat (advance_operations no longer auto-resolves; evaluate_open_offers kept only
+  as advisory/fallback).
+- memory.build_negotiation_situation = the grounded brief (parties/terms/relationship/war-pressures/faction
+  doctrine+mood + advisory math score). memory.apply_offer_decision = RECORD-ONLY (status + in-character reason +
+  source + counter); NO relation/credit/ship mutation (validator-gated execution = NF3/OC).
+- router._decide_offer_llm = Player2 decides structured intent (accept/counter/refuse/defer + message) via
+  npc_complete, JSON-parsed, advisory-score fallback. router.resolve_offers_llm = bounded driver. Route
+  /api/ops/offers_resolve_llm.
+- VALIDATION: restart → GET /api/ops/offers_resolve_llm?save_id=…&max_n=5 → watch offers transition to
+  accepted/countered/refused with in-character reasons sourced "player2". Then ◐→✅.
+- QUEUED: NF2b slow ~10min cadence into heartbeat; OC-COA move COA selection to Player2 (same brief→decide→validate
+  shape); NF3 = validator-gated execution + relationship consequences of decisions.
 
-**Why synthetic for the 100×40 bulk:** Player2 chat is ~2–3s serialized by the bridge's single-model gate, so 4000 real calls ≈ hours + joules. The bridge memory engine (binding, turns, condensation, decay, retrieval, SQLite) is the system under test here; it's exercised at full scale directly. Player2 throughput is already characterized separately.
+### #47 NF3 — relationship consequences of a negotiation outcome — ✅ bridge-verified (in-game ◐, dashboard ◐)
+- `memory.apply_relationship_consequence(save_id, requester, recipient, decision, urgency)` = the deterministic
+  EXECUTION effect GATED by the Player2 decision (spec boundary: intent→attitude is anti-cheat-OK; no
+  resources/credits mutated). refused → dtrust −3·scale / dresentment +5·scale; refuse_harshly → −6 / +10;
+  accepted → dtrust +4·scale / ddebt +4·scale; countered → dtrust +1·scale. `scale = 1 + min(2, urgency/3)` so
+  urgent refusals sting more. Emits a transition world-event `agreement_{accepted|refused|countered}`
+  (importance 3 for refuse/counter, 2 for accept) so the outcome surfaces as news.
+- WIRED into `router.resolve_offers_llm` right after `apply_offer_decision` (record-only) — so the Player2 offer
+  decision now both records AND applies its bounded attitude consequence + news event.
+- VALIDATED (bridge, deterministic stub — no Player2 dependence): `GET /api/ops/negotiation_consequence_selftest`
+  → **6/6** (refusal_resentment_up, refusal_trust_down, accept_trust_up, accept_debt_up, urgency_scales 11>5,
+  transition_event). Regression green: negotiation_scoring 9/9, decision_record 4/4, decision_adapter 4/4,
+  decision_tick 4/4. New route/method threaded server→router→memory; bridge imported all three modules clean.
+- ◐ REMAINING: (a) dashboard health-warning surface for resentment/debt buildup — deferred (separate panel work);
+  (b) IN-GAME proof — needs a live offer to resolve through resolve_offers_llm and the world-event seen in the
+  logbook/news. Per the in-game gate, the player-facing half stays ◐ "bridge-verified, in-game pending".
 
-**Results (live):**
+### #66 LIVE Player2-driven OPORD end-to-end demo — ✅ LIVE-verified (real LLM) 2026-06-30
+- BUILT `router.opord_player2_demo(faction)` + GET /api/ops/opord_player2_demo?faction= : seeds a realistic op in an
+  ISOLATED temp store, keeps the REAL Player2 client (only self.memory is swapped), runs the full chain — analyze →
+  plan COAs → **Player2 selects the COA via decide() (live LLM, #53 doctrine in the prompt, defer-on-fail)** →
+  generate_opord with the #65 4-component Execution — and returns the full trace. Temp store discarded (no live-DB
+  pollution); Player2 unreachable ⇒ honest defer, no math substitute.
+- VALIDATED LIVE (real gpt-oss-120b @4315, not a stub): TWO runs, SAME scenario (contain Teladi in Heretic's End),
+  doctrine changed the decision —
+  · **Split** (aggressive/conquest): picked `organic_patrol` — "Deploying patrols shows strength, keeps Teladi
+    off-balance… without inviting a full-scale clash." (11.5s, source=player2)
+  · **Teladi** (measured/profit-minded): picked `defensive_posture` — "Holding a defensive line secures our traffic
+    while keeping the conflict contained." (9.8s, source=player2)
+  Both generated the 4-component OPORD (intent / scheme_of_manoeuvre naming the main effort / main_effort with
+  priority-of-support + supporting_efforts / end_state). This is the end-to-end proof that Player2 DRIVES the OPORD,
+  and that #53 doctrine measurably shifts the choice — not a fixed staff pick.
+- ◐ in-game tail unchanged: the selected COA's tasks still need the in-game issuer/dispatcher to actuate (existing
+  ExecAuth path + #64). This demo proves the DECISION+ORDER chain live; in-game actuation is the separate gate.
 
-*Synthetic scale — the memory engine under 100-NPC load:*
-- 100 NPCs created (varied race/role/ship/skills), **~8,000 turns fed → 806 retained** (max 8 raw turns/NPC = the keep-window; condensation pruned the rest). Risk #2 (unbounded growth) **closed at scale**.
-- **300 CORE facts survived** (100 NPCs × 3 embedded death/war/oath/love events); `facts_by_tier = {core:300, significant:0, routine:0}` — routine chatter forgotten. Risk #3 (condensation) **proven**.
-- Throughput **~100 turns/s**; whole DB **0.33 MB** for 100 NPCs with deep histories — i.e. a 100-hour save's chatter condenses to a negligible, bounded footprint. (Per-op SQLite connections are the throughput ceiling; fine for real-paced single conversations, optimizable later if bulk ingest is ever needed.)
-- Invariant checks `raw_turns_bounded`, `core_survived`, `routine_not_persisted` all pass. (Stacking a second run trips only the cosmetic `npcs_created` count, not a real failure.)
+### #65 OPORD Execution = 4 doctrinal components (Ken request) — ✅ bridge-verified 2026-06-30
+- RESEARCH (not blind): verified the doctrine against US Army FM 6-0 / ADP 5-0 OPORD para-3 + the British
+  Concept-of-Operations model. Execution paragraph = Commander's INTENT (purpose + key tasks + end state),
+  SCHEME OF MANOEUVRE (concept of operations — how the force fights start→finish), MAIN EFFORT (the designated
+  decisive task that receives priority of support; supporting efforts identified), END STATE ("success is…").
+  Sources cited in chat (armyopordshell.com, irp.fas.org OPORD, Wikipedia Operations order).
+- RECONCILE: opord_build_smesc already produced an `execution` block with `intent` (=commander_intent) + phases +
+  tasks + coordinating_instructions, and `desired_end_state` existed on the op but was NOT in the Execution
+  paragraph. GAP: scheme_of_manoeuvre + main_effort absent; end_state not surfaced. WIRE/EXTEND, not greenfield.
+- BUILT: `opord_designate_main_effort(coa_tasks, faction, sector)` — ranks tasks decisive→shaping→sustaining
+  (_MAIN_EFFORT_PRIORITY) and designates the decisive task with "priority of support" + lists supporting_efforts;
+  `opord_scheme_of_manoeuvre(...)` — concept-of-ops narrative (faction + COA + phase sequence + the named main
+  effort). execution{} now carries all 4: intent, scheme_of_manoeuvre, main_effort, end_state (= desired_end_state).
+- VALIDATED: GET /api/ops/opord_selftest → **24/24** (added exec_intent, exec_scheme_of_manoeuvre [contains "main
+  effort"], exec_main_effort_designated [task + "priority of support"], exec_main_effort_supporting list,
+  exec_end_state == desired_end_state). Regression green: coa_selftest 10/10, e2e_selftest 11/11.
+- ◐ candidate follow-on (Player2-decides mandate): main-effort designation is a JUDGMENT Player2 could own via the
+  decision layer (engine derives candidate tasks → Player2 designates). Deterministic skeleton is the guardrail/
+  default now; Player2 authoring is a natural extension, logged not built.
 
-*Live integration — 5 concurrent real Player2 conversations:*
-- All 5 returned `ok`, in-character, distinct per race (Teladi "Profitssss", Split "crush weak enemies", Paranid "Holy Three", Boron scientific, Argon military). Memory attached to each.
-- Latencies 5.5 / 12 / 15 / 23 / 32 s show the **single-model concurrency gate serialized them cleanly** — 5 simultaneous requests queued and each completed, instead of all thrashing into empty/timeout (the pre-gate failure mode). 32 s total for 5 ≈ ~6 s each effective. No timeouts, no empty content.
+### #53 faction doctrine enrichment (Worldview into the decision prompt) — ✅ bridge-verified 2026-06-30
+- BUILT `memory.faction_doctrine_brief(save_id, fid)` — composes the canon FACTION_PERSONA tuple (aggr/econ/risk/
+  dipl) into trait adjectives (same thresholds as persona.py for consistency) + the standing goal + the live mood
+  (stored heartbeat value, else derived, else baseline). e.g. split → "aggressive and quick to anger,
+  uncompromising, bold. Your standing goal: Prove Split strength through conquest." Reuses existing canon, no new
+  source invented (settles the spec's 'personality source' open question: FACTION_PERSONA is the de-facto canon).
+- WIRED into BOTH decide() and decide_actions: the doctrine line is APPENDED to whatever system prompt the caller
+  passes (try/except, never breaks the decision), so EVERY faction decision — COA select, negotiation, strategic
+  action, proposal actions[] — is now doctrine-flavored, not generic "decide in character" (the "every single
+  thing" mandate).
+- VALIDATED: GET /api/ops/faction_doctrine_brief_selftest → **9/9** (split→aggressive+conquest, teladi→profit,
+  boron→diplomatic+peace, factions read distinctly, unknown→default goal, empty fid→empty, leadership prefix).
+  Regression green: decision_adapter 4/4, coa_selection 3/3, actions_proposal 8/8 (doctrine append didn't disturb
+  the decision path — the try/except keeps it additive).
+- Backend infra (feeds the LLM prompt; no direct player surface) → ✅ at bridge level per the in-game-gate
+  exemption. In-game effect (richer in-character behaviour) rides on the existing decision drivers.
 
-**Endpoints:** `GET /api/memory/stresstest?npcs=&turns=`, `GET /api/memory/stress_clear` (removes `save_id=stress`).
+#### #53 plan/reconcile (retained for history)
+- RECONCILE (does it exist?): the doctrine SOURCE already exists — `memory.FACTION_PERSONA` (aggr/econ/risk/dipl +
+  goal Worldview tuples for 21 factions), the trait→adjective logic (`persona.py PersonaCardBuilder._persona_traits`),
+  and live mood (`_derive_mood`/`derive_all_pressures`). NPC CHAT already consumes them. GAP: the universal faction
+  DECISION path (decide / decide_actions) injects NONE of it. So this is WIRE/EXTEND, not greenfield.
+- PLAN: add `memory.faction_doctrine_brief(save_id, fid)` (canon traits + goal + live mood → one compact Worldview
+  line) and inject it into BOTH decide() and decide_actions system prompts (append to whatever sp the caller passes,
+  so EVERY faction decision is doctrine-flavored). Selftest: split→"aggressive", teladi→"profit", boron→
+  "diplomatic"+goal, unknown→default. Backend infra (feeds the prompt) → closeable at bridge level.
 
-**Honest caveat:** synthetic turns use the heuristic summarizer, not the LLM — it validates the *mechanics* (bounding, survival, decay, DB growth) at scale, not LLM summary *quality*. The 100 stress NPCs remain in the live DB (visible on the dashboard) until `stress_clear` is hit.
+### #64 actions[] in-game dispatcher + dashboard panel — PLANNED (◐ tail of #57) 2026-06-30
+- MD dispatcher that drains decision_records' `proposed` actions and actuates ONLY the 4 mvp types
+  (dialogue_only → NPC line/comm; memory_write → blackboard/bridge memory; logbook_entry → player logbook;
+  status_update → faction status). Dashboard action-verdict panel (allowed/gated/unknown counts + recent). IN-GAME
+  proof. Gated on in-game; the bridge half (#57) is the prerequisite and is done.
 
----
+### #57 actions[] proposal contract + whitelist gate — ✅ bridge-verified (in-game ◐) 2026-06-30
+- BUILT `bridge/actions.py` (pure, no state mutation): `parse_actions`/`_extract_action_list` (dict | JSON string |
+  bare list), `normalize_action` (object OR Bannerlord terse string "relation:main_hero,change:negative" →
+  {type, params, description, source_verb, source}; VERB_ALIAS maps reference verbs onto canonical types),
+  `classify_action` (allowed=mvp_enabled / gated=disabled_until_tested / unknown=default-deny), `validate_actions`
+  (the public entry → {reply, actions[], allowed/gated/unknown, counts}). `load_whitelist(root)` reads the real
+  config/action_whitelist.json from candidate paths (env override → sibling/parent layouts) with the embedded
+  DEFAULT as safe fallback. NEVER executes — only `allowed` may reach the (◐) MD dispatcher.
+- VALIDATED: hermetic `python3 actions.py` → 14/14 (object+string parse, verb-alias parity, gated relation,
+  default-deny attack, mixed-bucket counts, JSON-string wire shape, empty-safe). Live bridge GET
+  /api/ops/actions_selftest → **14/14**; GET /api/ops/actions_whitelist → exactly {mvp 4, gated 6} = PROOF the
+  on-disk config resolves against the bridge root (not the embedded default). Bridge imported actions.py clean
+  (new routes served = import-regression pass).
+- WIRED: router.actions_selftest / actions_whitelist / actions_validate(payload) + server GET routes.
+- PROPOSAL MODE (the other half of the task title) — BUILT + validated: `router.decide_actions(save_id,
+  decision_type, actor, name, brief, …)` = the free-form Bannerlord path: Player2 returns {response, actions[]};
+  bridge parses via validate_actions (loose-JSON tolerant — strips ```fences / extracts outermost {…}), whitelists,
+  and AUDITS the verdict to decision_records (final_status 'proposed' on success, 'deferred' on LLM fail) —
+  EXECUTES NOTHING; only `allowed` may reach the MD dispatcher. Defer-on-failure (no actions) honours Ken's
+  no-math-fallback policy. Stub-Player2 oracle GET /api/ops/actions_proposal_selftest → **8/8** (source player2,
+  reply parsed, counts split 1/1/1, allowed=dialogue only, gated=relation, audited proposed, record status
+  proposed, deferred-on-error). actions_selftest now **15/15** (added fenced-JSON). Regression green
+  (decision_adapter 4/4, negotiation_consequence 6/6).
+- ◐ TAIL (logged, separate task): MD dispatcher handlers for the 4 mvp types; dashboard action-verdict panel;
+  IN-GAME proof (NPC line + a dialogue_only/memory_write action actuated). Player-facing → ◐ per the in-game gate.
+- AMEND 2026-06-30 (align to the SPOOFED Bannerlord CALLING METHOD): the proxy capture
+  (player2_proxy.sqlite3, exchange 7/11/13) shows the proven method ENUMERATES the legal action verbs WITH grammar
+  in the system prompt's `### Actions ###` block ("Any world change must go through actions[]. Use ONLY the verbs
+  listed…") — a GENERATION-TIME constraint, not just post-hoc validation. Our decide_actions previously gave one
+  example verb and relied solely on validate_actions. FIX: added `actions.ACTION_GRAMMAR` (grammar per ENABLED verb
+  only — gated verbs are NOT advertised) + `actions.prompt_action_spec()` (renders the ### Actions ### block from the
+  live whitelist) and injected it into decide_actions' system prompt. Validator kept as defense-in-depth (both
+  layers, like Bannerlord). actions_selftest 18/18 (3 new: lists enabled grammar, has the contract rule, hides
+  gated verbs); actions_proposal 8/8; decision_adapter 4/4. NOTE on transport: Bannerlord uses stateless
+  /v1/chat/completions; our bridge uses /v1/npc spawn+chat (persistent per-NPC memory) — kept deliberately (better
+  for X4); the PROMPT contract is what we aligned, not the endpoint.
 
-## 2026-06-19 — X4 NPC stats attached to NPC data ✅ DONE (live-verified)
+#### #57 plan/reconcile (retained for history)
+- PLAN: the governing architecture (top of file) requires EVERY action category to have a prompt contract,
+  parser, audit row, whitelist/validator, X4 dispatcher handler, dashboard visibility, selftest, in-game proof.
+  This unit builds the reusable BRIDGE half: a pure `bridge/actions.py` — parse Player2's `{response, actions[]}`
+  (object OR Bannerlord-style string e.g. "relation:main_hero,change:negative"), normalize to {type, params},
+  classify each against `config/action_whitelist.json` into allowed (mvp_enabled) / gated (disabled_until_tested) /
+  unknown (default-deny). NEVER executes — returns an audited verdict; only `allowed` reach the MD dispatcher.
+- RECONCILE: gates.py is the EVENT-ROUTING tier layer (cooldown/dedup/authority for engine-generated events), NOT
+  the proposal whitelist — different concern, compose later (whitelist says type is permitted; gate says this
+  instance fires now). decide() currently forces a single numbered choice ("Do not invent actions") — actions[]
+  proposal mode is genuinely new. config/action_whitelist.json already exists (mvp 4 / gated 6) — reuse verbatim.
+- ◐ TAIL (not this unit): decide() proposal-mode integration; MD dispatcher handlers; dashboard action panel;
+  in-game proof. This unit = parser + normalizer + whitelist classifier + audit shape + selftest + route.
 
-**Research (verified):** X4 tracks **5 crew skills**, stored as `boarding, management, engineering, piloting, morale`, each 0..15 internally = 0..5 stars (3 levels/star). Roles: **Pilot, Manager, Service Crew, Marine**; morale is a universal modifier (effective skill ≈ avg of chosen skill + morale). Piloting → ship handling/travel/boost; Management → station/trade; Engineering → repair; Boarding → marines. Plus identity: name, **race** (argon/teladi/paranid/split/boron/terran/…), gender, faction, and ship assignment (ship_class S/M/L/XL, ship_name, sector). Sources: Egosoft wiki "Crew", X4 Personnel wiki, and the old mod's own `context_selector`/`faction_personalities` (which already read `skill_piloting/management/engineering/boarding/morale`, race overlays, ship_class).
+### SPEC: Player2 Decision Layer (decision authority → Player2 across the WHOLE mod)
+Full spec: F:\StarForge\wiki\x4-neural-link\player2-decision-layer-spec.md. Audited 9 decision points (D1 COA select,
+D2 negotiation accept, D3 task routing, D4 counterparty, D5 escalate/conserve/conclude, D6 proposal initiation, D7
+mount-or-ignore, D8 faction strategic action [already has use_llm, default OFF = the reference impl], D9 player
+messaging). Principle: Perception=deterministic, DECISION=Player2, Validation+Execution=deterministic; generation of
+OPTIONS stays deterministic (bounded legal menu) so Player2 chooses but can't invent illegal moves. Universal Decision
+Adapter (build once, use everywhere) + "no hardcoded decision" invariant + hard boundary (Player2 decides intent, never
+mutates relation/credit/ship/sector/task). Slow ~10min decision cadence. Migration: adapter → D2 → D1 → D5 → D3/D4 →
+D6/D7 → D8 default-on → NF3 validator-gated execution. Awaiting Ken on 4 open decisions (cadence, fallback policy, D7
+scope, personality source).
 
-**Built into the bridge memory model:**
-- `MemoryStore.npcs` migrated (idempotent `ALTER TABLE ADD COLUMN`) with `race, role, ship_class, gender, ship_name, sector, skills(JSON), stats(JSON)`.
-- `bind_npc(..., stats=...)` merges a stats blob (fields not sent this turn keep their prior value). `skill_stars(0..15) → ★/☆`. `_identity_line()` builds a "You are a pilot, argon, L-class … Skills: piloting ★★★★☆, morale ★★★☆☆" line.
-- `build_memory_context` now **prepends the identity/skills line** so the NPC speaks in-character to its role/skill (an expert pilot talks like one).
-- `npc_complete` reads `target.stats` (or individual `target.{race,role,gender,ship_class,ship_name,sector,skills}`) and attaches them on bind.
-- Dashboard NPC detail renders stat chips + a skills box with stars; `list_npcs`/`npc_detail` expose the fields.
-- Self-test extended to 13 checks (adds `stats_attached`, `skills_stored`, `skill_stars`, `context_has_identity`).
+### #52 Decision Adapter — ◐ built, restart-pending validation
+- router.decide(save_id, decision_type, actor_faction, actor_name, brief, options, system_prompt?, request_id?) =
+  the UNIVERSAL decision path (spec §3). Bounded legal-option menu → Player2 picks one in character →
+  {choice, reason, source}. On LLM down/timeout/unparsed/junk → DEFER (choice=None, source='deferred') — NO math
+  fallback (Ken's policy). Empty options → 'skipped'.
+- _decide_offer_llm (D2) REFACTORED to route through decide(). resolve_offers_llm now LEAVES deferred offers pending
+  (retry next tick), records only genuine player2 decisions; returns {decided, deferred}.
+- decision_adapter_selftest (route /api/ops/decision_adapter_selftest): deterministic, stub-Player2 (no live LLM) —
+  4 checks: picks player2 choice, defers on error, defers on unparsed, skips empty options.
+- VALIDATION: restart → GET /api/ops/decision_adapter_selftest 4/4 (confirms the foundation WITHOUT a live LLM); then
+  /api/ops/offers_resolve_llm exercises the live Player2 path. Then ◐→✅.
+- NEXT (migration): D1 COA selection through the adapter (plan_operation_coas: keep generate/screen/wargame/score as
+  advisory, the SELECT becomes a decide() call), then D5/D3/D4/D6, tiered cadence (#50), doctrine enrichment (#53).
 
-**Verification (live):** deployed via `Deploy-And-Restart.bat` (compile-gate OK, killed PID 26080, restarted). `GET /api/memory/selftest` → **ok, 13/13** (Windows temp-cleanup fix confirmed; 4 stat checks pass). Sent a `target.stats` request for Captain Reyes (role pilot, argon, ship_l, ANV Vigilant, skills piloting 13/management 4/engineering 6/boarding 2/morale 11) → stored correctly, the pre-existing 4 turns survived the in-place migration (now 6 turns), and the NPC replied in-character referencing its ship ("The Vigilant will hold"). Dashboard NPC detail renders 6 stat chips + 5 star-rated skill rows (screenshot confirmed).
+### #52 Decision Adapter — ✅ VALIDATED (deterministic + LIVE)
+- decision_adapter_selftest 4/4 (stub-Player2: picks/defers-on-error/defers-on-junk/skips-empty).
+- decide_probe (live): Player2 returned an in-character decision ("No, hold for now — the front lines are still
+  shifting…"), source=player2. The synthetic faction-actor path works.
+- LIVE end-to-end: offers_resolve_llm decided agreement 407 → Player2 "defer" in character, source=player2, applied.
+- BUGFIX: apply_offer_decision + evaluate_open_offers wrote a non-existent `updated_at` column on agreements (same
+  root cause as the earlier offers_evaluate 500). Removed it. Also hardened resolve_offers_llm with per-offer
+  try/except + errors[] (one bad offer can't 500 the batch) — which is how the bug surfaced.
+- ONLINE-ONLY (Ken): the mod requires Player2; NO offline/deterministic decision fallback. decide() DEFERS (waits +
+  retries) on LLM unavailability — never math-decides. Advisory score is LLM brief-context only. The math DECIDER
+  (evaluate_open_offers) is dead/un-wired — to be retired.
 
----
+### SPEC refined per Codex review (mandatory pre-build edits applied)
+player2-decision-layer-spec.md updated: (1) FALLBACK CONTRADICTION resolved — §5/§7/§8 + the §1 table + the §3
+signature all scrubbed of "deterministic fallback"; one production path = Player2, failure = DEFER; new §10 codifies
+3 modes (production=defer · selftest=mock harness · emergency operator=config, default OFF). (2) §11 fact-vs-judgment
+bright line (fact/proof/legality/affordability/execution=deterministic; preference/intent/doctrine/diplomacy/priority=
+Player2). (3) D5 conclude = Player2 emits request_conclude → can_conclude? validator (evidence/abated/fulfilled/time/
+budget/fleet-lost) → else hold/reassess/FRAGO; never marks complete on feel. (4) D6 proposal initiation RATE-LIMITED
+via the negotiation door (dedupe_key + cooldown + max-active/faction + max-open/pair + expiry) so it's not LLM-spam.
+(5) §12 decision_records audit log (new task #54) — adapter writes full record per call. Online-only confirmed.
+NEXT BUILD: #54 decision-record log → #51 D1 COA selection → D5 (with can_conclude) → D3/D4 → D6 (rate-limited) �
+### #60 D6 — proposal initiation → Player2 — ✅ VALIDATED (deterministic; in-game ◐)
+- memory.agreement_candidates(save_id): plausible deals (ceasefire/trade/patrol_coop/non_aggression), deduped, no
+  create. generate_agreements kept as deterministic SEED/test fixture only (off the heartbeat).
+- router.propose_deals_llm (T3): proposer's Player2 picks which deal to initiate or HOLD → submit via the Negotiations
+  door (deduped/rate-limited); defer-on-fail; audit-logged. Routes /api/ops/propose_deals_llm + propose_deals_selftest.
+- HEARTBEAT REPOINTED: gameplay_generation_tick now uses propose_deals_llm live (dry_run just COUNTS candidates — no
+  LLM/create, keeps gameplay_tick_selftest deterministic).
+- VALIDATION: propose_deals 4/4; gameplay_tick 3/3; full regression green (negotiation/route/e2e/cleanup/frago/coa/
+  assessment/route_decision/adapter all pass). Live endpoint on game_707480512 returns clean with 0 candidates (galaxy
+  already covered — dedup working; in-game Player2-proposing ◐ until fresh candidates arise).
+- Decision migrations now: ✅ D1 D2 D3/D4 D5 D6. Remaining: D8 (influence engine), D9/#57, #50 cadence, #59 sweep.
 
-## 2026-06-19 — Player2 vendor finding (reasoning bug) + memory architecture scoped
+### #58 D8 — influence engine → Player2-by-default — ✅ VALIDATED (deterministic; in-game ◐). SPLIT-BRAIN FIXED.
+- review_faction PICK now routes through the unified router.decide() (Player2) — NOT deterministic top, NOT
+  _llm_decide's index-0 fallback. On failure it DEFERS (faction HOLDS the cycle; no incident). rank_faction stays as
+  the advisory legal menu; validate_incident + apply_incident_effects (validation/execution) unchanged. effects
+  source='player2'; decision audit-logged + finalized on apply.
+- _llm_decide is now UNUSED (retired in practice — its only caller was review_faction). use_llm param vestigial;
+  Player2 is the decider by default for review_faction/review_all/influence_step (autonomous galaxy loop, budget 2-6
+  factions/tick = bounded LLM calls; #50 sets the slow cadence).
+- VALIDATION: faction_action_selftest 3/3 (options_generated, player2_decided, defers_on_error); full regression green
+  (adapter/negotiation/coa/assessment/route/propose/coa_selection/opord/e2e/cleanup/frago/record all pass).
+- ALL decision migrations now complete: ✅ D1 D2 D3/D4 D5 D6 D8 (D7 deterministic-always-mount by design).
+  Remaining: D9/#57 (chat {response,actions[]} + whitelist), #50 cadence, #59 sweep, #53 doctrine.
 
-### Player2 reasoning bug — confirmed vendor-side, under investigation ◐ MITIGATED
+### #59 Invariant sweep — ✅ DONE (decision conversion proven complete; 1 minor residual logged)
+Grepped the bridge for residual hardcoded judgments. Result:
+- _llm_decide: 0 callers (retired; index-0 fallback dead). ✓
+- review_faction ignores use_llm (Player2 always; defer-on-fail); use_llm=False call sites vestigial. ✓
+- evaluate_open_offers: not in any live judgment path (advisory /offers_evaluate endpoint + selftests only). ✓
+- All primary decision points D1-D6,D8 route through decide(). ✓
+- RESIDUAL (◐ → #61 D4b): select_support_counterparty single-best auto-pick inside
+  submit_negotiation_intent(require_counterparty=True) — the D5 escalate + request_allied_support task auto-pick WHICH
+  ally. The escalate/route decision is Player2; only the counterparty sub-pick is still deterministic (advisory
+  default). Minor; logged as D4b.
+CONCLUSION: "refactor everything" for the DECISION layer is COMPLETE — every judgment is Player2 via one contract,
+defer-on-fail, audit-logged. Remaining work is NOT decision-conversion: D9/#57 (chat {response,actions[]} + whitelist),
+#50 cadence (run drivers hands-free), #53 doctrine, #61 D4b (the residual).
 
-Reported the empty-content/latency issue to the Player2 Discord (#dev). Outcome:
+### NPC>NPC INTERACTION SCENES (Ken 2026-06-30) — spec §17; the top-level synthesis
+NPC>NPC = player>NPC with the player's message replaced by a WORLD trigger (event/need/rumor/offer/threat). A scene is
+one decide() call in {response, actions[]} mode between two faction-rep actors, fed social_edge_brief + relationship +
+doctrine, validated by the §16 grounded whitelist, executed, written back to social edges + faction relations, and
+surfaced as a world_event/comm. REUSES: decide() adapter, §16 whitelist, decision_records, propose_deals_llm (D6 is a
+one-actor primitive), and the rich social substrate (apply_social_event, social_edge_brief, propagate_rumor,
+relationships, world_events). FOUNDATION = #57 (actions[] contract + parser + whitelist executors). Tasks: #62 scene
+scheduler + two-sided contract (faction-rep first), #63 memory writeback + player surface. Phased: rep↔rep → rep↔player
+→ manager/commander↔rep → individual-NPC memory last. Anti-cheat unchanged.
 
-- A Player2 dev confirmed it's **on their side and actively being investigated** ("might be related to another thing we're looking at, I'll forward this"). Their guidance: *"for now use another model or wait for the fix."*
-- They claim **Gemini models work fine** and that in their tests there is "a clear time difference between thinking on vs off." **Our observation contradicts this:** the user switched Player2 to Gemini and saw the *same* empty/slow behavior, with the app's Thinking toggle confirmed OFF.
-- Confirmed our own finding: the app's Thinking toggle and the API's `thinking:{type:"disabled"}` both fail to suppress reasoning on the developer `/v1/chat/completions` path.
-
-**Mitigation in place (not a fix):** the bridge uses the **NPC API**, which returns clean text regardless of the reasoning bug (see NPC block above). So Neural Link is unblocked even while the vendor bug is open.
-
-**OPEN — Gemini + thinking-toggle A/B test `[host-gated]`:** the Player2 dev specifically asked us to (a) confirm Thinking is OFF, (b) confirm the perf issue on Gemini, and (c) test toggling Thinking on vs off and report the time delta. This requires switching the chat model + flipping the toggle in the Player2 desktop app (UI action), then re-running the bridge probe. Blocked only by reliable desktop input. **Verify:** for each {model × thinking} cell, `POST /api/player2/npc_chat` and a raw `/v1/chat/completions` probe → record latency + whether `message.content` is non-empty. Expected per vendor: Gemini + thinking-off → fast, non-empty.
-
-### Character memory architecture — scoped, NOT yet built OPEN `[blocked by: inspect old chronicle_service]`
-
-Grounded in `Desktop/X4_AI_Influence_Blueprint2.md` §13 + the user's decaying-memory model. Design is a **four-stage consolidation pipeline** (detail dies, meaning survives — human-like):
-
-- **A. Raw episodic** — `conversation_log`, full-fidelity, short-lived; pruned after digestion.
-- **B. Condensed facts** — after a conversation, LLM crushes the raw turns into a few `memory_facts` (each `importance` 1–5, tagged). The "1000 lines → key details, cut useless context" step.
-- **C. Semantic gist** — `relationships` rollup (`trust/fear/resentment/debt` + `last_summary`); individual events fade into scores + one paragraph.
-- **D. Decay/forgetting** — periodic pass using `importance` + `last_used_at`: old low-importance facts condensed/dropped; importance-5 (betrayal, rescue, leader death) effectively permanent; mid-tier blurs into the Stage-C summary. This is the "degrading accuracy like real life" layer the blueprint implies but doesn't spec.
-
-**Retrieval (§13.2):** each turn injects only profile + game-state summary + last 3–5 turns + top-K facts (importance × recency × relevance) + relationship summary + recent world events. Never raw logs ⇒ **prompt size stays flat at hour 2 or hour 200.**
-
-### 100-hour-save robustness assessment (honest)
-
-Foundation is sound (X4 authoritative, safe fallback, NPC path proven). As of today the bridge is an MVP and is **NOT** 100-hour-ready. Three concrete risks, ranked:
-
-1. **Save/reload memory desync (highest).** Bridge memory lives outside the X4 save; reloads/save-scum desync it. Blueprint partially handles this via per-save DB (`ai_influence_<save_id>.sqlite`, §8) + `save_id` in the request (§9.1) — but reload-to-earlier-point *within* a save_id still desyncs. **Open.**
-2. **Unbounded growth (~90%, straight leak).** `router.responses` dict, per-request `responses/*.json`, and the telemetry SQLite all grow forever — confirmed in code. Needs eviction/TTL/rotation. **Open.**
-3. **No durable summarized memory yet.** The Stage A–D pipeline above doesn't exist in `x4_neural_link`; raw-history injection would overflow context. **Open.**
-
-Risks #2 and #3 are solved *by* the memory architecture above. #1 needs explicit save-coupling.
-
-**Old `x4_ai_influence/bridge` inspected ✅ (2026-06-19).** Read `chronicle_service.py`, `persistence.py`, `context_selector.py`, `state/memory_store.py`, `state/conversation_memory.py` from the live `G:\` folder. **Verdict: a strong Stage-A + retrieval foundation exists, but the durable political memory and the consolidation/decay layers do NOT.** Specifically:
-
-- *Misnamed:* `chronicle_service.py` is **not** memory — it's a Star Wars opening-crawl flavor-text generator that patches a `t/`-file. Ignore for memory.
-- *Reuse (good, port these):* `state/memory_store.py` `SQLiteMemoryStore` — thread-safe, indexed SQLite with `npc_profiles`, `npc_turns` (**rolling window, auto-trimmed to `max_turns=12`**), `world_events` (has a `severity` field ≈ importance), and `war_losses` + `get_loss_summary` (windowed war-fatigue aggregation). `context_selector.py` `build_context_block` is a real, token-policy-aware retrieval/assembly layer (identity + personality + priority-ordered/deduped world events + conflict sentiment + minimal game-state). `persistence.py` adds the X4-entity→`player2_npc_id` binding. These are worth lifting wholesale.
-- *Missing (build new):* **no `relationships` table** (trust/fear/resentment/debt/promises) — Stage C absent; **no `memory_facts` + importance + post-conversation summarization** — Stage B absent (turns are *trimmed*, not condensed, so anything past the last 12 turns is simply lost, not remembered); **no decay/forgetting pass** — Stage D absent; **no `save_id` scoping** — DBs are global, so the save/reload desync risk (Risk #1) is fully live.
-
-**Decision:** hybrid, not rebuild and not pure port. Lift `SQLiteMemoryStore` + `context_selector` into `x4_neural_link` as the Stage-A/retrieval base, then add the missing Stage-B summarization (turns → `memory_facts`), Stage-C `relationships` rollup, Stage-D decay pass, and `save_id` scoping. This is what task #9 builds.
-
-### Memory engine built + self-tested ◐ CORE DONE (live in-game test pending)
-
-`bridge/memory.py` — `MemoryStore`, stdlib/SQLite, generic (bridge owns mechanics; the mod owns gameplay meaning). Implements all four stages: `turns` (raw rolling window) → `condense_if_needed` crushes overflow into categorized `facts` and drops the raw turns → rolling `summary` gist per NPC → `decay` pass. Durable, save-scoped NPC binding (`make_key(save_id, game_id, persona)` → `bind_npc`/`get_npc_id`). Injectable summarizer (default = deterministic keyword heuristic, joule-free; LLM summarizer is a later swap).
-
-**Category taxonomy — what survives degradation (the explicit design ask):**
-- **CORE** (`death, war, betrayal, love, oath, birth, catastrophe`) → importance 5, `verbatim=1`: kept **unaltered forever**; only the surrounding chatter is dropped.
-- **SIGNIFICANT** (`deal, battle, threat, alliance, gift, insult, rescue, economy, diplomacy`) → importance 3: kept as a condensed fact, detail blurs, capped per NPC (LRU drop of the lowest).
-- **ROUTINE** (`smalltalk, status, greeting, flavor, query`) → importance 1: never persisted as durable facts; forgotten.
-
-**Wired into the bridge:** `npc_complete` now resolves the durable `npc_id`, injects `build_memory_context` into the turn, records the exchange, and condenses. Respawn-on-404 also clears the durable binding. New endpoints: `GET /api/memory/selftest`, `GET /api/memory/metrics`.
-
-**Verification (sandbox, deterministic):** `python -m py_compile` staged + live → both OK. `run_memory_selftest()` → **ok=True, 9/9**: NPC-id bind+retrieve+rebind; 80 turns fed → bounded to 16 raw turns + **3** durable facts (massive condensation); all 3 CORE events (death/oath/love) survived **verbatim**; 0 routine facts persisted; retrieval context contained the CORE memories and stayed at 512 chars. Files deployed to live `G:\`; **bridge restart pending** to exercise it against real Player2 NPCs.
-
-**Honest limitation:** default summarizer is a keyword heuristic, not the LLM — good enough for structure + tests, but real-quality condensation (paraphrase, multi-turn synthesis) needs the LLM summarizer swap. No `save_id`-timestamp reload-desync handling yet (separate from this).
-
-### Memory live-verified + dashboard visualization ✅ DONE (2026-06-19)
-
-Deployed to the live bridge (host-side `Deploy-And-Restart.bat` — compile-gate OK, copy, restart; metrics reset to 0). Verified against **real Player2 NPCs through the bridge**:
-
-- **NPC creation + ID retrieval:** a `target.mode:"npc"` request spawned "Captain Reyes" (argon), bound `npc_id 99a74e66-…`, durably stored under save-scoped key `save_demo_01|x4_demo|Captain Reyes`.
-- **Memory continuity (the real test):** Turn 1 — *"Admiral Vance was killed when the ANV Resolute was destroyed at Argon Prime."* Turn 2 (separate request, only the new question sent) → *"Admiral Vance. He was lost aboard the ANV Resolute."* The NPC recalled the death because the durable binding reused the same Player2 npc_id. 4 turns recorded, attached to the NPC.
-- **Dashboard:** new **NPC Memory** panel ships in `dashboard/` — top-band NPC/Memory counts, tier chips (core/significant/routine), an NPCs table (name, faction, save/game, turns, facts, core, bound npc_id), and a click-through Memories pane (gist + tier-colored facts with verbatim/category/importance badges + color-coded conversation). Endpoints `GET /api/memory/{npcs,npc,metrics,selftest}`. Confirmed rendering live (screenshot): Reyes row + all 4 turns + "condensation triggers once the raw window overflows" (facts=0 at 4 turns, by design).
-
-**Two honest caveats:**
-- `GET /api/memory/selftest` **crashed on Windows** — the self-test's temp-SQLite cleanup hit Windows file-locking and reset the connection (passed fine in the Linux sandbox: 9/9). **Fixed** (`mkdtemp` + `rmtree(ignore_errors=True)`) — deploys with the NPC-stats batch below.
-- The sandbox file-mount truncated freshly-edited files mid-session and briefly corrupted the live backend copy; the host-side `Deploy-And-Restart.bat` (PowerShell robocopy, reads complete host files) repaired it. **Lesson: deploy via the host PowerShell script, not the sandbox mount `cp`.** Staged `F:\` dashboard is out of sync (corrupted by the same issue); live `G:\` dashboard is correct — re-sync staging later.
-
----
-
-## North Star
-
-> Any X4 extension can depend on Neural Link, send a bounded request to Player2 through a local bridge, receive a validated response, and continue safely if the bridge or Player2 is offline.
-
-For AI Influence specifically:
-
-> AI Influence is rebuilt as a separate Forge-authored gameplay mod that depends on Neural Link. The LLM thinks and speaks; the mod validates and acts; X4 remains the authority.
-
----
-
-## The Influence Engine — core architecture
-
-> The realization that makes the whole mod tractable. Supersedes the "let the LLM decide" model. The LLM is a **bounded chooser + narrator**, never the authority.
-
-### Thesis — why this makes the mod easy
-The hard version is *"an LLM controls a galaxy and never breaks the game"* — nearly impossible. We never needed it. Bannerlord-style AI computes decisions with **deterministic math**, then uses the LLM only to **choose among already-legal options and explain itself**. Reframing the LLM from authority → bounded chooser collapses every hard part:
-
-| The "impossible" part | What it actually becomes |
-|---|---|
-| AI that controls the galaxy correctly | a **weighted-sum score** over numbers we already track |
-| AI that never makes illegal/game-breaking moves | a **finite whitelist of N action types** + a deterministic validator |
-| AI that's reliable | deterministic core; the LLM is optional flavor with a **rule-based fallback** |
-| "model the whole universe" | store **meaning**, not the simulation — X4 already runs the universe |
-| a huge new system | mostly **wiring pieces already built** (bridge, memory, event queue, NPC API, dashboard) |
-
-So the mod = **facts in → score the situation → LLM picks a legal move + narrates → validate → X4 applies the effect → record the outcome.** Intelligence is swappable; mechanics are deterministic.
-
-### The closed loop
-```
-X4 events/state → ingest → universe state (factions/relationships/economy/sectors/conflicts)
-  → deterministic scoring → strategic_state pressures
-  → LLM picks one high-scoring LEGAL option + narrates
-  → validator (legal? bounded? cooldown? idempotent?)
-  → incidents/pending_actions → X4 applies whitelisted effect
   → outcome → memory facts shift + relationships update → re-score …
 ```
 The feedback (outcome → next event → re-score) is the "alive" feeling. It runs on a **slow scheduled cadence** (strategic review every ~10–60s hot, minutes broad) — never per tick. That scheduler already exists: the event-queue green-light worker.
@@ -5450,3 +5836,18 @@ AI Influence MVP is done later when:
 - It has one in-game conversation path that reaches Player2 through Neural Link.
 - It remembers one meaningful interaction.
 - It executes no game-state change unless the action is whitelisted, validated, logged, and accepted by X4.
+
+### #61 D4b — escalate counterparty sub-pick → Player2 — ✅ VALIDATED. Decision layer now 100% (no residual).
+- apply_assessment_decision handles escalate:<ally> (Player2-picked recipient); auto-pick only as fallback when no
+  ally chosen. assess_operations_llm offers per-candidate escalate options (select_support_candidates). frago selftest's
+  direct escalate_reinforce call uses the auto fallback (back-compat). VALIDATION: assessment_decision 3/3, frago 8/8,
+  cleanup 9/9, e2e 11/11, negotiation 11/11, route_decision 3/3, adapter 4/4. The #59 residual is closed.
+
+### #50 Decision cadence — ✅ bridge driver VALIDATED (Lua heartbeat wiring ◐ in-game)
+- router.decision_tick(save_id): priority-tiered, self-gating by last-run timestamp. T2 operational (~5min): COA select
+  + routing + assessment. T3 strategic (~15min): negotiation accept + proposal + faction action. Each driver bounded
+  (max_n=2) + defers on Player2 failure. Routes /api/ops/decision_tick + /api/ops/decision_tick_selftest.
+- VALIDATION: decision_tick_selftest 4/4 (first fires both tiers; gated within interval; operational refires at +400s;
+  strategic refires at +1000s) — deterministic gate proven (fresh save → drivers no-op, no LLM).
+- ◐ REMAINING (in-game): the Lua heartbeat must POST /api/ops/decision_tick each beat (MD-side, /refreshmd) to run
+  the tiers live. The bridge side is complete + tested.

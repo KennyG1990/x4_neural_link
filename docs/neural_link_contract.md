@@ -45,15 +45,45 @@ Request.new("POST")
 | GET | `/api/memory/npc/delete?save_id=&npc_id=` | Purge a dead NPC + memory (call on death). |
 | GET | `/health` | Bridge + Player2 health. |
 
-## The action envelope (what the in-game dispatcher executes)
+## The action contract (what Player2 may propose, and what X4 may execute)
 
-Responses/actions carry: `{ "type": "<action_type>", "params": { ... } }`.
+The governing reference is the captured Bannerlord AI Influence pattern:
+
+```
+game context -> Player2 prompt -> JSON response with response/actions[] -> validator -> game execution
+```
+
+X4 normalizes that into:
+
+```json
+{
+  "reply": "in-character text",
+  "actions": [
+    {
+      "type": "<action_type>",
+      "params": {},
+      "description": "optional player-facing proposal text",
+      "needs_confirm": false
+    }
+  ]
+}
+```
+
+Player2 may propose actions. The bridge and X4 dispatcher decide whether each action is legal, bounded, affordable,
+off cooldown, and grounded in live game objects. Unknown or illegal action types are ignored/rejected and audited.
+Failed/unparsed Player2 decisions defer; deterministic scoring must not silently substitute a real action.
 
 **Whitelisted `action_type`s** (the MD dispatcher must have a handler per type it accepts;
 unknown types are ignored — the whitelist is enforced on BOTH sides):
 
 `dialogue_only`, `defensive_stance`, `resource_request`, `escalate_pressure`,
 `ceasefire_feeler`, `trade_offer`, `sanction`, plus the UI-test `show_notification`.
+
+Current refactor target whitelist, in proof order:
+
+`dialogue_only`, `memory_write`, `logbook_entry`, `status_update`,
+`relation_delta_limited`, `threaten`, `attack_intent`, `mission_offer`,
+`trade_request`, `temporary_diplomatic_flag`, `faction_to_faction_proposal`.
 
 ## Player2 API (reference only — consumed by the BRIDGE, not the mod)
 

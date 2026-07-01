@@ -31,19 +31,38 @@ X4 mod (Lua/MD via `djfhe_http`) → **bridge** (`8713`) → Player2 (`4315`). B
 - `factions` + `relationships` tables + methods exist in `memory.py` — **storage only, NOT yet exposed via endpoints/dashboard.**
 
 ## NEXT — the influence engine (the actual goal)
-Storing data is the substrate. The AI acts via a **3-stage engine** (per `Desktop/Bringing Bannerlord Style AI Influence into X4 Foundations.md` + blueprint §10/§11), which is also how Bannerlord AI Influence works — more robust than "LLM reads raw data and decides":
-1. **Deterministic scoring of every factor** → per-faction pressure aggregates. Core (from the doc):
-   `score = 0.30·military_pressure + 0.20·economic_pressure + 0.15·recent_losses + 0.10·logistics_stress + 0.10·(−hidden_affinity) + 0.10·salient_memory + 0.05·player_alignment` − active cooldowns.
-2. **LLM picks among bounded *legal* options + narrates** (intent generator + narrator, not authority).
-3. **Deterministic validator → X4 applies only whitelisted actions.**
-The scheduled **strategic review** = the `EventQueue` worker repurposed (score→LLM→validate→incident). "Faction goes to war over a shortage" = high `economic_pressure` + resentment crossing threshold on a review cycle. Cadence is slow (~10–60s hot, minutes broad) — never per tick.
+Storing data is the substrate. The AI acts through the **Bannerlord-proven Player2 action contract** captured on
+2026-06-30 with the local proxy DB at
+`F:\DEV_ENV\AiInfluenceBannerlord\player2_proxy\runtime\player2_proxy.sqlite3`.
+
+Observed reference behavior:
+- Player2 returned `actions:["relation:main_hero,change:negative"]`; the Bannerlord mod applied a relationship drop.
+- Player2 returned `actions:["attack:main_hero"]`; the Bannerlord mod prepared the NPC attack.
+
+The X4 rule is now:
+1. **Deterministic substrate** gathers facts, legal options, pressure scores, resources, cooldowns, X4 object IDs, and
+   proof state. Scoring is advisory context only.
+2. **Player2 owns intent**: voice, personality, doctrine, preference, route choice, offer acceptance, hostility,
+   requests, and proposed actions.
+3. **Bridge normalizes/audits** the Player2 response as `{response|reply, actions:[{type, params, description?,
+   needs_confirm?}]}`. Failed/unparsed decisions defer; never math-fallback to an action.
+4. **Deterministic validator/X4 executor** applies only whitelisted, legal, bounded effects, then records proof.
+
+The scheduled strategic review should therefore be: substrate/advisory -> Player2 `decide(...)`/action proposal ->
+validator -> incident/action dispatch -> X4 proof. Cadence remains slow (~10-60s hot, minutes broad) and never per tick.
 
 **Build order:**
-1. Expose `relationships` + `factions` (router/server endpoints: upsert/get/list; dashboard readout). Methods already in `memory.py`.
-2. `strategic_state` table (per faction: military_pressure, economic_pressure, logistics_stress, recent_losses, territorial_pressure, piracy_pressure, player_alignment) + the deterministic scoring core.
-3. `incidents`/`pending_actions` table (`action_type, target, faction, confidence, priority, cooldown_until, narrative, effects_json, status`) = the **action whitelist** + a validator (legal-action check).
-4. Repurpose the `EventQueue` worker into the strategic-review loop.
-5. Feed pressures from `economy`/`player_market`, `sectors`, `conflicts`, `agreements`; persist resolved events into durable `world_events`.
+1. Reconcile old deterministic influence paths: route autonomous influence through the universal `decide(...)` adapter
+   and remove index-0/math fallback as action authority.
+2. Normalize the bridge action contract: every Player2 action becomes an object action with `type`, `params`,
+   optional `description`, and optional `needs_confirm`.
+3. Expand the whitelist in proof order: safe status/logbook/memory -> `relation_delta_limited` ->
+   `threaten/attack_intent` -> `mission_offer` -> `trade_request` -> `temporary_diplomatic_flag` ->
+   `faction_to_faction_proposal`.
+4. Keep `strategic_state`, scoring, OPORD wargames, offer scoring, and economy/fleet reads as deterministic advisory
+   and validator inputs, not final decision authority.
+5. For each action type: add parser, audit row, validator, X4 dispatcher handler, dashboard visibility, selftest, and
+   in-game proof before marking ✅.
 
 ## Gotchas (will save you hours)
 - **Sandbox mount truncation:** freshly host-edited files can appear truncated in a sandbox view and break `cp`/`py_compile`. The **host file tools (Read/Edit/Write) are authoritative**; deploy host-side (the watcher's PowerShell robocopy reads complete host files). Trust the watcher's compile-gate, not a sandbox compile of a just-edited file.

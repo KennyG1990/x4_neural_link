@@ -24,7 +24,11 @@ from .memory import (
     run_execution_routing_selftest, run_assessment_frago_selftest, run_opord_events_selftest,
     run_opord_cleanup_selftest, run_ops_health_selftest, run_opord_e2e_selftest,
     run_threat_sources_selftest, run_execution_lifecycle_selftest, run_opord_lease_selftest,
+    run_negotiation_dedup_selftest, run_negotiation_scoring_selftest, run_decision_record_selftest,
+    run_negotiation_consequence_selftest, run_faction_doctrine_brief_selftest,
+    run_relation_move_validator_selftest, run_oc1_resume_selftest,
 )
+from .actions import run_actions_selftest, validate_actions, load_whitelist, prompt_action_spec
 from .player2_client import Player2Client
 from .telemetry import BridgeTelemetry
 
@@ -384,6 +388,10 @@ class NeuralRouter:
         """OPORD pipeline driver — run every built stage in order (recognize → analyse → …) for one save."""
         return self.memory.advance_operations(save_id)
 
+    def ops_debug_force_order(self, save_id: str = "", faction: str = "argon") -> dict[str, Any]:
+        """DEBUG/TEST ONLY: synthesize one pending-ingame fleet order so the in-game issuer can be exercised."""
+        return self.memory.debug_force_pending_order(save_id, faction or "argon")
+
     def mission_analysis_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Deterministic oracle for OPORD Phase 3 mission analysis."""
         return run_mission_analysis_selftest()
@@ -435,6 +443,93 @@ class NeuralRouter:
     def execution_lifecycle_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Oracle for the #1 execution build (job fulfillment + spend + task success from evidence)."""
         return run_execution_lifecycle_selftest()
+
+    def negotiation_consequence_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Oracle for NF3 (a negotiation outcome → bounded relationship consequence + transition world-event)."""
+        return run_negotiation_consequence_selftest()
+
+    def actions_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Oracle for #57 (Player2 {response, actions[]} parse → normalize → whitelist classify)."""
+        return run_actions_selftest()
+
+    def faction_doctrine_brief_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Oracle for #53 (faction Worldview line reflects canon FACTION_PERSONA traits + goal)."""
+        return run_faction_doctrine_brief_selftest()
+
+    def relation_move_validator_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Oracle for #64 (DeadAir-grounded relation-move eligibility+bounds gate)."""
+        return run_relation_move_validator_selftest()
+
+    def oc1_resume_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Oracle for #48 (OPORD consumes resolved negotiations → task complete/fail)."""
+        return run_oc1_resume_selftest()
+
+    def actions_whitelist(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Resolve the live action whitelist from disk (confirms config path resolution against the bridge root)."""
+        wl = load_whitelist(self.root)
+        return {"ok": True, "mvp_enabled": sorted(wl.get("mvp", set())), "gated": sorted(wl.get("gated", set()))}
+
+    def actions_validate(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Validate a Player2 response's actions[] (no execution). payload {response} (dict | JSON string | list)."""
+        p = payload or {}
+        return validate_actions(p.get("response"), root=self.root)
+
+    def actions_proposal_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for #57 PROPOSAL MODE (stub Player2 + temp store): a {response, actions[]} reply is
+        parsed + whitelisted + AUDITED (source player2, status 'proposed', nothing executed); an LLM error → DEFER
+        (no actions, source 'deferred', recorded as deferred)."""
+        import shutil
+        import tempfile
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool, d: str = "") -> None:
+            checks.append({"name": n, "ok": bool(c), "detail": d})
+
+        class _R:
+            def __init__(self, r: str) -> None:
+                self._r = {"status": "ok", "reply": r}
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._r
+
+        class _P2OK:
+            def complete(self, _req: Any) -> Any:
+                return _R('{"response":"Cross us again and there will be consequences.",'
+                          '"actions":[{"type":"dialogue_only"},"relation:argon,change:negative","attack:argon"]}')
+
+        class _P2Err:
+            def complete(self, _req: Any) -> Any:
+                raise RuntimeError("player2 down")
+
+        d = tempfile.mkdtemp(prefix="nl_actprop_")
+        orig_m, orig_p = self.memory, self.player2
+        try:
+            store = MemoryStore(f"{d}/c.sqlite3")
+            sid = "s"
+            store.upsert_faction(sid, "teladi", name="Teladi")
+            self.memory = store
+            self.player2 = _P2OK()
+            v = self.decide_actions(sid, "chat", "teladi", "Teladi Company",
+                                    "An argon captain insults you on open comms.")
+            chk("source_player2", v.get("source") == "player2", str(v.get("source")))
+            chk("reply_parsed", v.get("reply", "").startswith("Cross us"), v.get("reply", ""))
+            # dialogue_only + relation_delta_limited now ALLOWED (#64); attack unknown (default-deny).
+            chk("counts_split", v["counts"] == {"total": 3, "allowed": 2, "gated": 0, "unknown": 1}, str(v["counts"]))
+            chk("allowed_has_relation", any(x["type"] == "relation_delta_limited" for x in v["allowed"])
+                and any(x["type"] == "dialogue_only" for x in v["allowed"]), str(v["allowed"]))
+            chk("attack_unknown", len(v["unknown"]) == 1 and v["unknown"][0]["type"] == "attack", str(v["unknown"]))
+            chk("audited_proposed", bool(v.get("decision_id")), str(v.get("decision_id")))
+            recs = store.list_decision_records(sid) if hasattr(store, "list_decision_records") else []
+            chk("record_status_proposed", any(r.get("final_status") == "proposed" for r in recs), str(len(recs)))
+            # LLM down → defer, nothing proposed
+            self.player2 = _P2Err()
+            v2 = self.decide_actions(sid, "chat", "teladi", "Teladi Company", "Another taunt.")
+            chk("deferred_on_error", v2.get("source") == "deferred" and v2["counts"]["total"] == 0, str(v2.get("source")))
+        finally:
+            self.memory, self.player2 = orig_m, orig_p
+            shutil.rmtree(d, ignore_errors=True)
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
 
     def job_complete(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Mark a job fulfilled (player/NPC completed the contract) → spend + task done. payload {save_id, job_id, claimant, evidence}."""
@@ -498,6 +593,1052 @@ class NeuralRouter:
     def opord_lease_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Deterministic oracle for the OPORD Execution Authority lease/order spine."""
         return run_opord_lease_selftest()
+
+    def negotiation_dedup_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for Negotiations N1 (agreement_key dedup + real counterparty)."""
+        return run_negotiation_dedup_selftest()
+
+    def negotiation_scoring_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for Negotiations NF2 (acceptance scoring + resolution driver)."""
+        return run_negotiation_scoring_selftest()
+
+    def offers_evaluate(self, save_id: str = "") -> dict[str, Any]:
+        """Deterministic ADVISORY/fallback scorer (NOT the decider). The real decision layer is resolve_offers_llm."""
+        return self.memory.evaluate_open_offers(save_id)
+
+    def decide(self, save_id: str, decision_type: str, actor_faction: str, actor_name: str,
+               brief: str, options: list[dict[str, Any]], system_prompt: str | None = None,
+               request_id: str | None = None, advisory: Any = None,
+               linked_operation_id: str | None = None, linked_offer_id: int | None = None) -> dict[str, Any]:
+        """UNIVERSAL DECISION ADAPTER (Player2 Decision Layer spec §3) — the ONE path every thinking action routes
+        through. The deterministic caller passes a grounded BRIEF + a BOUNDED list of legal options
+        [{"key","label"}]; the Player2 faction-actor picks ONE in character. On ANY failure (LLM down / timeout /
+        unparsable) the decision is DEFERRED — choice=None, source='deferred' — NEVER math-substituted (Ken's
+        policy). Writes a full decision_records audit row (§12) and returns its id. The caller then VALIDATES +
+        EXECUTES + finalizes the record. Player2 can only pick from the engine menu, so it cannot invent an action."""
+        import re as _re
+        rid = request_id or f"{decision_type}-{int(time.time()*1000)}-{actor_faction}"
+        raw = ""
+        if not options:
+            result = {"choice": None, "reason": "no legal options", "source": "skipped"}
+        else:
+            menu = "\n".join(f"{i}. {o.get('label') or o.get('key')}" for i, o in enumerate(options, 1))
+            prompt = (f"{brief}\n\nOptions:\n{menu}\n\nReply with ONLY the option number "
+                      f"(1-{len(options)}) then one short in-character sentence of reasoning.")
+            sp = system_prompt or (f"You are the ruling leadership of {actor_name} in the X4 galaxy. Decide in "
+                                   "character. Choose exactly ONE numbered option; never invent one. Number first, "
+                                   "then one sentence.")
+            try:  # #53: doctrine enrichment — every faction decision is flavored by the faction's Worldview.
+                _doc = self.memory.faction_doctrine_brief(save_id, actor_faction)
+                if _doc:
+                    sp = f"{sp}\n\n{_doc}"
+            except Exception:
+                pass
+            payload = {
+                "request_id": rid, "source_mod": f"decider:{decision_type}", "channel": "npc",
+                "target": {"mode": "npc", "game_id": "influence", "save_id": save_id, "npc_name": actor_name,
+                           "npc_short_name": str(actor_faction)[:8], "faction_id": actor_faction,
+                           "system_prompt": sp},
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            result = None
+            try:
+                resp = self.player2.npc_complete(NeuralRequest.from_payload(payload)).to_dict()
+                raw = (resp.get("reply") or "").strip()
+                if resp.get("status") == "ok" and raw:
+                    m = _re.search(r"\b([1-9][0-9]?)\b", raw)
+                    if m:
+                        idx = int(m.group(1)) - 1
+                        if 0 <= idx < len(options):
+                            result = {"choice": options[idx]["key"], "reason": raw[:300],
+                                      "source": "player2", "option_index": idx}
+                if result is None:
+                    result = {"choice": None, "reason": (raw[:200] if raw else "(no/unparsed reply)"),
+                              "source": "deferred"}
+            except Exception as exc:
+                raw = f"(exception) {exc}"
+                result = {"choice": None, "reason": f"(llm error: {exc})", "source": "deferred"}
+        # audit log (spec §12) — never let logging break the decision
+        try:
+            result["decision_id"] = self.memory.record_decision(
+                save_id, decision_type, actor_faction, result["source"], parsed_choice=result.get("choice"),
+                brief=brief, options=options, advisory=advisory, raw_response=raw, request_id=rid,
+                linked_operation_id=linked_operation_id, linked_offer_id=linked_offer_id,
+                final_status=("deferred" if result["source"] in ("deferred", "skipped") else "decided"))
+        except Exception:
+            pass
+        return result
+
+    def decide_actions(self, save_id: str, decision_type: str, actor_faction: str, actor_name: str,
+                       brief: str, system_prompt: str | None = None, request_id: str | None = None,
+                       linked_operation_id: str | None = None, linked_offer_id: int | None = None) -> dict[str, Any]:
+        """PROPOSAL MODE (#57) — the Bannerlord-proven free-form path: instead of picking from a bounded menu, the
+        Player2 actor returns a spoken reply PLUS a list of PROPOSED actions ({response, actions[]}). The bridge
+        parses + whitelists (allowed / gated / unknown) via actions.validate_actions and AUDITS the verdict — it
+        EXECUTES NOTHING. Only `allowed` actions may later be actuated by the in-game MD dispatcher; gated/unknown are
+        recorded and dropped (default-deny). On LLM down/timeout/unparsed → DEFER (no actions, source='deferred').
+        This is the spec boundary in code: Player2 proposes intent, the bridge validates, X4 executes only what passed."""
+        rid = request_id or f"{decision_type}-act-{int(time.time()*1000)}-{actor_faction}"
+        sp = system_prompt or (
+            f"You are the leadership of {actor_name} in the X4 galaxy. Respond IN CHARACTER. "
+            "Reply with ONLY strict JSON of the form "
+            '{"response": "<one or two sentences you say aloud>", "actions": [<zero or more action strings>]}. '
+            "Propose only intent; do not narrate the actions in your response.")
+        # Bannerlord-proven generation-time constraint: enumerate the LEGAL verbs (with grammar) in the prompt so the
+        # model picks only from the whitelist, instead of relying solely on the post-hoc validator. (#57 alignment.)
+        try:
+            _spec = prompt_action_spec(root=self.root)
+            if _spec:
+                sp = f"{sp}\n\n{_spec}"
+        except Exception:
+            pass
+        try:  # #53: doctrine enrichment — the proposing faction speaks/acts from its Worldview.
+            _doc = self.memory.faction_doctrine_brief(save_id, actor_faction)
+            if _doc:
+                sp = f"{sp}\n\n{_doc}"
+        except Exception:
+            pass
+        # Use the STATELESS /v1/chat/completions path (complete), not npc spawn+chat — the Bannerlord-proven method:
+        # a system prompt carrying the JSON contract + a user message, returning raw JSON text we parse. The npc_chat
+        # path returns in-character PROSE (no JSON), which is why proposal mode came back empty live.
+        payload = {
+            "request_id": rid, "source_mod": f"propose:{decision_type}", "channel": "npc",
+            "target": {"max_tokens": 700, "temperature": 0.5},
+            "messages": [{"role": "system", "content": sp}, {"role": "user", "content": brief}],
+        }
+        raw, source = "", "deferred"
+        verdict: dict[str, Any] = {"ok": True, "reply": "", "actions": [], "allowed": [], "gated": [], "unknown": [],
+                                   "counts": {"total": 0, "allowed": 0, "gated": 0, "unknown": 0}}
+        try:
+            resp = self.player2.complete(NeuralRequest.from_payload(payload)).to_dict()
+            raw = (resp.get("reply") or "").strip()
+            if resp.get("status") == "ok" and raw:
+                verdict = validate_actions(raw, root=self.root)
+                source = "player2"
+        except Exception as exc:
+            raw = f"(exception) {exc}"
+        try:
+            verdict["decision_id"] = self.memory.record_decision(
+                save_id, decision_type, actor_faction, source, parsed_choice=None, brief=brief,
+                options=verdict.get("actions"), raw_response=raw, request_id=rid,
+                linked_operation_id=linked_operation_id, linked_offer_id=linked_offer_id,
+                final_status=("deferred" if source != "player2" else "proposed"))
+        except Exception:
+            pass
+        verdict["source"] = source
+        return verdict
+
+    def _scene_situation(self, save_id: str, a: str, b: str, rel: dict[str, Any]) -> str:
+        """#62: the deterministic SITUATION the world hands two faction reps — grounded in their standing + the most
+        recent shared world event. This is the 'message' the scene opens on (perception = deterministic)."""
+        trust = float(rel.get("trust") or 0)
+        if trust <= -50:
+            base = f"{a} and {b} are bitter rivals; tensions run high."
+        elif trust < 0:
+            base = f"{a} and {b} regard each other with suspicion."
+        elif trust >= 50:
+            base = f"{a} and {b} are close partners."
+        else:
+            base = f"{a} and {b} keep a neutral, businesslike relationship."
+        try:
+            for e in self.memory.list_world_events(save_id, limit=15, min_importance=3):
+                pf, sf = e.get("primary_faction"), e.get("secondary_faction")
+                if {pf, sf} == {a, b} and e.get("summary"):
+                    base += f" Recently: {e.get('summary')}"
+                    break
+        except Exception:
+            pass
+        return base
+
+    def run_faction_scene(self, save_id: str, faction_a: str, faction_b: str,
+                          situation: str | None = None) -> dict[str, Any]:
+        """#62: a two-sided NPC>NPC scene between two faction reps. The engine supplies the SITUATION (the message the
+        world hands them); Player2 speaks for BOTH sides via decide_actions (the #57 proposal contract) — A speaks,
+        then B replies GIVEN A's line as the incoming message (NPC>NPC works like player>NPC, world = the 'player').
+        Both sides' actions are whitelisted + audited; nothing executes here (that's #64/execution). Defers cleanly
+        if Player2 is unavailable (no half-scene)."""
+        if not faction_a or not faction_b or faction_a == faction_b:
+            return {"ok": False, "reason": "need two distinct factions"}
+        fa = self.memory.get_faction(save_id, faction_a) or {}
+        fb = self.memory.get_faction(save_id, faction_b) or {}
+        na = str(fa.get("name") or faction_a)
+        nb = str(fb.get("name") or faction_b)
+        rel_ab = self.memory.get_relationship(save_id, faction_a, faction_b) or {}
+        rel_ba = self.memory.get_relationship(save_id, faction_b, faction_a) or {}
+        sit = situation or self._scene_situation(save_id, faction_a, faction_b, rel_ab)
+        brief_a = (f"You encounter a representative of {nb}. Situation: {sit}\n"
+                   f"Your standing toward {nb}: trust {rel_ab.get('trust')}, resentment {rel_ab.get('resentment')}.\n"
+                   "Speak to them in character; propose any actions your doctrine calls for.")
+        a = self.decide_actions(save_id, "npc_scene", faction_a, f"{na} envoy", brief_a)
+        if a.get("source") != "player2":
+            return {"ok": True, "deferred": True, "stage": "a"}
+        brief_b = (f"A representative of {na} says to you: \"{a.get('reply')}\"\nSituation: {sit}\n"
+                   f"Your standing toward {na}: trust {rel_ba.get('trust')}, resentment {rel_ba.get('resentment')}.\n"
+                   "Reply in character; propose any actions your doctrine calls for.")
+        b = self.decide_actions(save_id, "npc_scene", faction_b, f"{nb} envoy", brief_b)
+        if b.get("source") != "player2":
+            return {"ok": True, "deferred": True, "stage": "b",
+                    "a": {"faction": faction_a, "says": a.get("reply"), "allowed": a.get("allowed")}}
+        return {"ok": True, "situation": sit,
+                "a": {"faction": faction_a, "says": a.get("reply"), "allowed": a.get("allowed"),
+                      "gated": a.get("gated"), "decision_id": a.get("decision_id")},
+                "b": {"faction": faction_b, "says": b.get("reply"), "allowed": b.get("allowed"),
+                      "gated": b.get("gated"), "decision_id": b.get("decision_id")}}
+
+    def run_scheduled_scene(self, save_id: str, a: str | None = None, b: str | None = None) -> dict[str, Any]:
+        """#63: pick a TOPICAL faction pair (two factions with a recent shared event) and run ONE NPC>NPC scene, then
+        PERSIST it (a world_event both sides remember, via faction briefings) and SURFACE it to the player (overheard
+        news lines for the logbook). Rate-limited by the caller (one per strategic tick). Defers cleanly.
+        An explicit a/b overrides the topical pick (targeting / testing)."""
+        if a and b:
+            a = a.strip().lower()
+            b = b.strip().lower()
+        else:
+            a = b = None
+            try:  # only auto-pick a topical pair when no explicit pair was given
+                for e in self.memory.list_world_events(save_id, limit=20, min_importance=3):
+                    pf, sf = e.get("primary_faction"), e.get("secondary_faction")
+                    if pf and sf and pf != sf and pf != "player" and sf != "player":
+                        a, b = pf, sf
+                        break
+            except Exception:
+                pass
+        if not a:
+            facs = [f.get("faction_id") for f in self.memory.list_factions(save_id)
+                    if f.get("faction_id") not in (None, "player")]
+            if len(facs) < 2:
+                return {"ok": True, "skipped": "no pair"}
+            a, b = facs[0], facs[1]
+        scene = self.run_faction_scene(save_id, a, b)
+        if not scene.get("ok") or scene.get("deferred"):
+            return {"ok": True, "deferred": bool(scene.get("deferred")), "pair": [a, b]}
+        a_says = (scene.get("a") or {}).get("says") or ""
+        b_says = (scene.get("b") or {}).get("says") or ""
+        try:  # PERSIST — both remember (world_event feeds each faction's situation briefing)
+            self.memory.add_world_event(save_id, event_type="diplomatic",
+                                        summary=f"{a} and {b} exchanged words in a tense meeting.",
+                                        primary_faction=a, secondary_faction=b, importance=2, source="scene")
+        except Exception:
+            pass
+        # SURFACE — overheard lines for the player logbook (news channel → in-game logbook via the existing path)
+        news = [f"Overheard — {a}: \"{a_says[:140]}\"", f"Overheard — {b}: \"{b_says[:140]}\""]
+        # #64: validated relation moves proposed in the scene → in-game actions[] (existing Lua→MD set_faction_relation)
+        acts = self._relation_drain_actions(save_id, a, (scene.get("a") or {}).get("allowed"))
+        acts += self._relation_drain_actions(save_id, b, (scene.get("b") or {}).get("allowed"))
+        return {"ok": True, "pair": [a, b], "a_says": a_says, "b_says": b_says, "news": news, "actions": acts}
+
+    def _relation_drain_actions(self, save_id: str, actor: str, allowed: list | None) -> list[dict[str, Any]]:
+        """#64: turn Player2's ALLOWED relation_delta_limited proposals into VALIDATED, bounded in-game relation
+        actions. Each is eligibility+bounds-checked by validate_relation_move (DeadAir model); a valid move is
+        shadow-applied (bridge attitude) and emitted as {type:'adjust_relation', faction, target, relation:<delta>}
+        for the existing Lua→MD On_action→set_faction_relation path. Delta maps the ±25 trust band to the game's ±1
+        relation scale (/100). The engine VALIDATES; Player2 only proposed (anti-cheat: attitude only)."""
+        out: list[dict[str, Any]] = []
+        for a in allowed or []:
+            if a.get("type") != "relation_delta_limited":
+                continue
+            p = a.get("params") or {}
+            raw_t = str(p.get("target") or p.get("faction") or "")
+            target = (self.memory.resolve_faction_id(raw_t) if hasattr(self.memory, "resolve_faction_id")
+                      else raw_t.strip().lower())
+            change = str(p.get("change") or "").lower()
+            step = 5.0 if any(k in change for k in ("pos", "up", "improv", "ally", "warm")) else -5.0
+            v = self.memory.validate_relation_move(save_id, actor, target, step)
+            if not v.get("ok"):
+                continue
+            self.memory.adjust_relationship(save_id, actor, target, dtrust=int(v["clamped_step"]))
+            out.append({"type": "adjust_relation", "faction": actor, "target": target,
+                        "relation": round(float(v["clamped_step"]) / 100.0, 4)})
+        return out
+
+    def faction_scene_scheduler_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for #63 (stub Player2 + temp store): a scheduled scene picks the topical pair, runs
+        both sides, PERSISTS a world_event both remember, and SURFACES overheard news lines."""
+        import shutil
+        import tempfile
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool, d: str = "") -> None:
+            checks.append({"name": n, "ok": bool(c), "detail": d})
+
+        class _R:
+            def __init__(self, r: str) -> None:
+                self._r = {"status": "ok", "reply": r}
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._r
+
+        class _P2OK:
+            def complete(self, _req: Any) -> Any:
+                return _R('{"response":"You will regret crossing us.",'
+                          '"actions":["status:hostile","relation:argon,change:negative"]}')
+
+        d = tempfile.mkdtemp(prefix="nl_sched_")
+        orig_m, orig_p = self.memory, self.player2
+        try:
+            store = MemoryStore(f"{d}/c.sqlite3")
+            sid = "s"
+            store.upsert_faction(sid, "split", name="Zyarth")
+            store.upsert_faction(sid, "argon", name="Argon")
+            store.add_world_event(sid, event_type="war", summary="Border clash", primary_faction="split",
+                                  secondary_faction="argon", importance=4)
+            self.memory = store
+            self.player2 = _P2OK()
+            r = self.run_scheduled_scene(sid)
+            chk("pair_topical", set(r.get("pair") or []) == {"split", "argon"}, str(r.get("pair")))
+            chk("both_spoke", bool(r.get("a_says")) and bool(r.get("b_says")), str(r))
+            chk("surfaced_news", len(r.get("news") or []) == 2, str(r.get("news")))
+            evs = store.list_world_events(sid, limit=50)
+            chk("persisted_scene_event", any(e.get("source") == "scene" for e in evs), str(len(evs)))
+            # #64: split's proposed relation move toward argon is validated + emitted as an in-game action.
+            rel_acts = [a for a in (r.get("actions") or []) if a.get("type") == "adjust_relation"]
+            chk("relation_action_emitted", len(rel_acts) >= 1 and rel_acts[0]["faction"] == "split"
+                and rel_acts[0]["target"] == "argon" and rel_acts[0]["relation"] < 0, str(r.get("actions")))
+        finally:
+            self.memory, self.player2 = orig_m, orig_p
+            shutil.rmtree(d, ignore_errors=True)
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
+
+    def faction_scene_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for #62 (stub Player2 + temp store): a two-sided scene produces A_says + B_says with
+        whitelisted actions on BOTH sides, and BOTH turns are audited to decision_records."""
+        import shutil
+        import tempfile
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool, d: str = "") -> None:
+            checks.append({"name": n, "ok": bool(c), "detail": d})
+
+        class _R:
+            def __init__(self, r: str) -> None:
+                self._r = {"status": "ok", "reply": r}
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._r
+
+        class _P2OK:
+            def complete(self, _req: Any) -> Any:
+                return _R('{"response":"We remember what your kind did.","actions":["status:hostile","attack:you"]}')
+
+        class _P2Err:
+            def complete(self, _req: Any) -> Any:
+                raise RuntimeError("player2 down")
+
+        d = tempfile.mkdtemp(prefix="nl_scene_")
+        orig_m, orig_p = self.memory, self.player2
+        try:
+            store = MemoryStore(f"{d}/c.sqlite3")
+            sid = "s"
+            store.upsert_faction(sid, "split", name="Zyarth Patriarchy")
+            store.upsert_faction(sid, "teladi", name="Teladi")
+            self.memory = store
+            self.player2 = _P2OK()
+            scene = self.run_faction_scene(sid, "split", "teladi")
+            chk("scene_ok", scene.get("ok") and not scene.get("deferred"), str(scene.get("deferred")))
+            chk("a_says", bool((scene.get("a") or {}).get("says")), str(scene.get("a")))
+            chk("b_says", bool((scene.get("b") or {}).get("says")), str(scene.get("b")))
+            chk("a_allowed_status", any(x.get("type") == "status_update" for x in (scene.get("a") or {}).get("allowed") or []),
+                str((scene.get("a") or {}).get("allowed")))
+            chk("b_gated_or_unknown_attack", not any(x.get("type") == "attack" for x in (scene.get("b") or {}).get("allowed") or []),
+                "attack must NOT be allowed")
+            recs = store.list_decision_records(sid) if hasattr(store, "list_decision_records") else []
+            chk("both_audited", len([r for r in recs if r.get("decision_type") == "npc_scene"]) == 2, str(len(recs)))
+            # defer path: B's LLM down → scene defers at stage b, no half-executed nonsense
+            self.player2 = _P2Err()
+            sc2 = self.run_faction_scene(sid, "split", "teladi")
+            chk("defer_clean", sc2.get("deferred") is True, str(sc2))
+        finally:
+            self.memory, self.player2 = orig_m, orig_p
+            shutil.rmtree(d, ignore_errors=True)
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
+
+    def _decide_offer_llm(self, save_id: str, agreement: dict[str, Any]) -> dict[str, Any]:
+        """D2 negotiation acceptance, routed through the universal adapter. Returns {decision, reason, source}.
+        source != 'player2' → the caller MUST leave the offer pending (retry next tick), never math-decide it."""
+        sit = self.memory.build_negotiation_situation(save_id, agreement)
+        recip, req = sit["recipient"], sit["requester"]
+        rel, rs, doc = sit["relationship"], sit["recipient_state"], sit["doctrine"]
+        offer = sit["offered_value"]
+        brief = (
+            f"{req} proposes a {sit['kind']} with you"
+            + (f" against {sit['enemy']}" if sit["enemy"] else "")
+            + (f" in {sit['sector']}" if sit["sector"] else "")
+            + (f", offering {offer} credits." if offer else ", offering nothing.")
+            + f"\nYour stance toward {req}: trust {rel.get('trust')}, resentment {rel.get('resentment')}, "
+            f"debt {rel.get('debt')}."
+            + f"\nYour situation: war pressure {round(float(rs.get('military_pressure') or 0)*100)}%, "
+            f"recent losses {round(float(rs.get('recent_losses') or 0)*100)}%."
+            + (f"\nYour doctrine/mood: {doc.get('mood')}; goal: {doc.get('current_goal')}."
+               if (doc.get('mood') or doc.get('current_goal')) else "")
+        )
+        options = [{"key": "accept", "label": "Accept the offer"},
+                   {"key": "counter", "label": "Counter — demand better terms"},
+                   {"key": "refuse", "label": "Refuse"},
+                   {"key": "defer", "label": "Stall — give no answer yet"}]
+        sp = (f"You are the ruling leadership of {recip} in the X4 galaxy, weighing a diplomatic offer from {req}. "
+              "Decide in character from your interests, doctrine, and relationships. Choose ONE numbered option.")
+        d = self.decide(save_id, "negotiation", recip, f"{recip} leadership", brief, options,
+                        system_prompt=sp, request_id=f"negodec-{int(time.time()*1000)}-{agreement.get('id')}",
+                        advisory={"score": sit.get("advisory_score"), "decision": sit.get("advisory_decision")},
+                        linked_operation_id=(agreement.get("operation_id") or None),
+                        linked_offer_id=agreement.get("id"))
+        return {"decision": d.get("choice"), "reason": d.get("reason", ""), "source": d.get("source"),
+                "decision_id": d.get("decision_id")}
+
+    def resolve_offers_llm(self, save_id: str = "", max_n: int = 25) -> dict[str, Any]:
+        """SLOW-cadence decision driver (T3): hand each open offer (with a real counterparty) to the Player2 faction
+        actor. DEFERRED decisions (LLM down / unparsed) are LEFT PENDING and retried next tick — never math-decided
+        (Ken's defer policy). Only genuine Player2 decisions are recorded; execution/consequences are NF3/OC."""
+        offers = [a for a in self.memory.list_agreements(save_id)
+                  if a.get("status") in ("pending", "proposed", "pending_response") and (a.get("party_b") or "")]
+        decided, deferred, out, errors = 0, 0, [], []
+        for ag in offers[:int(max_n)]:
+            try:
+                dec = self._decide_offer_llm(save_id, ag)
+                if dec.get("source") != "player2" or not dec.get("decision"):
+                    deferred += 1
+                    continue
+                self.memory.apply_offer_decision(save_id, ag["id"], dec["decision"], dec.get("reason", ""), "player2")
+                # NF3: the decision has CONSEQUENCES — refusal breeds resentment, acceptance builds trust/debt.
+                self.memory.apply_relationship_consequence(save_id, ag.get("party_a"), ag.get("party_b"),
+                                                           dec["decision"], int(ag.get("urgency") or 0))
+                if dec.get("decision_id"):
+                    self.memory.finalize_decision(dec["decision_id"], final_status="applied")
+                decided += 1
+                out.append({"id": ag["id"], "recipient": ag.get("party_b"), "decision": dec["decision"]})
+            except Exception as exc:  # one bad offer must not kill the batch — capture + continue
+                errors.append({"id": ag.get("id"), "error": str(exc)[:200]})
+        return {"ok": True, "decided": decided, "deferred": deferred, "errors": errors, "results": out}
+
+    def opord_player2_demo(self, faction: str = "split") -> dict[str, Any]:
+        """LIVE end-to-end demo (#66): seed a realistic operation in an ISOLATED temp store, keep the REAL Player2
+        client, and drive the whole OPORD chain with the actual LLM — Player2 SELECTS the course of action (decide()
+        with #53 doctrine in the prompt + defer-on-fail), then the OPORD generates with the 4 doctrinal Execution
+        components (#65). Returns the full trace so you can SEE Player2 driving it. Temp store is discarded (no live
+        DB pollution); if Player2 is unreachable the pick DEFERS (honestly reported, never math-substituted)."""
+        import shutil
+        import tempfile
+        faction = (faction or "split").strip().lower()
+        d = tempfile.mkdtemp(prefix="nl_p2demo_")
+        orig_m = self.memory
+        trace: dict[str, Any] = {"ok": True, "faction": faction}
+        try:
+            store = MemoryStore(f"{d}/demo.sqlite3")
+            sid = "demo"
+            store.upsert_faction(sid, faction, name=faction.title())
+            store.upsert_faction(sid, "teladi", name="Teladi")
+            store.upsert_fleet_strength(sid, faction, fight=8, total_ships=14)
+            store.upsert_economy_station(sid, {"station_id": "d1", "faction_id": faction, "sector_id": "Heretic's End"})
+            tk = f"{sid}:{faction}:sector_pressure:teladi:demo"
+            op = store.create_or_get_operation(sid, faction, "sector_pressure", tk, status="warning",
+                                               target_faction="teladi", target_sector="Heretic's End",
+                                               urgency=4, importance=5, evidence_json={"magnitude": 5})["id"]
+            store.analyze_mission(op)
+            store.plan_operation_coas(op)
+            viable = store.list_viable_coas(op)
+            trace["doctrine_brief"] = store.faction_doctrine_brief(sid, faction)
+            trace["coa_options"] = [{"coa_type": c.get("coa_type"), "concept": c.get("concept"),
+                                     "staff_estimate": round(float(c.get("weighted_score") or 0), 2)} for c in viable]
+            # ---- LIVE Player2 selects the COA (self.memory swapped to the temp store; self.player2 stays REAL) ----
+            self.memory = store
+            sel = self.select_pending_coas_llm(sid)
+            trace["selection"] = {"decided": sel.get("decided"), "deferred": sel.get("deferred")}
+            recs = store.list_decision_records(sid) if hasattr(store, "list_decision_records") else []
+            rec = recs[-1] if recs else {}
+            trace["player2"] = {"source": rec.get("source"), "reason": rec.get("raw_response") or rec.get("brief_reason"),
+                                "picked_coa_id": rec.get("parsed_choice"), "decision_id": rec.get("id")}
+            opd = store.get_operation(op)
+            picked = next((c for c in store.list_viable_coas(op)
+                           if str(c.get("id")) == str(opd.get("selected_coa_id"))), None)
+            trace["player2"]["picked_coa_type"] = (picked or {}).get("coa_type")
+            # ---- generate the OPORD if Player2 committed a COA; else honestly report the defer ----
+            if opd.get("selected_coa_id"):
+                store.generate_opord(op)
+                smesc = (store.get_operation(op).get("opord_json") or {})
+                ex = smesc.get("execution") or {}
+                trace["opord_execution"] = {
+                    "intent": ex.get("intent"),
+                    "scheme_of_manoeuvre": ex.get("scheme_of_manoeuvre"),
+                    "main_effort": ex.get("main_effort"),
+                    "end_state": ex.get("end_state"),
+                }
+                trace["mission"] = smesc.get("mission")
+            else:
+                trace["opord_execution"] = None
+                trace["note"] = "Player2 deferred (LLM unreachable/unparsed) — no math substitute, OPORD not generated."
+        except Exception as exc:
+            trace = {"ok": False, "error": str(exc)[:300], "faction": faction}
+        finally:
+            self.memory = orig_m
+            shutil.rmtree(d, ignore_errors=True)
+        return trace
+
+    def select_pending_coas_llm(self, save_id: str = "", max_n: int = 10) -> dict[str, Any]:
+        """D1 decision driver (T1, event-ish): for each op at coa_generated WITHOUT a selected COA, Player2 picks the
+        course of action that fits its doctrine from the viable (legal+affordable) menu; the validator commits it.
+        Defer → the op waits (no math pick). The deterministic score rides along only as advisory in the brief."""
+        ops = [o for o in self.memory.list_operations(save_id)
+               if o.get("status") == "coa_generated" and not o.get("selected_coa_id")]
+        decided, deferred, out = 0, 0, []
+        for o in ops[:int(max_n)]:
+            try:
+                op_id = o["id"]
+                det = self.memory.operation_detail(op_id) or {}
+                viable = [c for c in (det.get("coas") or []) if c.get("viability_status") in ("viable", "selected")]
+                if not viable:
+                    continue
+                fac = next((f for f in self.memory.list_factions(save_id)
+                            if f.get("faction_id") == o.get("faction_id")), {}) or {}
+                adv_best = max(viable, key=lambda c: float(c.get("weighted_score") or 0))
+                brief = (f"Operation: {o.get('mission_statement') or ('contain ' + str(o.get('target_faction')))} "
+                         f"in {o.get('target_sector') or 'the contested zone'} against {o.get('target_faction')}.\n"
+                         f"Intent: {o.get('commander_intent') or 'restore freedom of movement'}.\n"
+                         f"Your doctrine/mood: {fac.get('mood')}; goal: {fac.get('current_goal')}.\n"
+                         "Choose the course of action that best fits your doctrine and situation:")
+                options = [{"key": str(c["id"]),
+                            "label": f"{c.get('coa_type')}: {c.get('concept')} "
+                                     f"(staff estimate {round(float(c.get('weighted_score') or 0), 2)})"}
+                           for c in viable]
+                sp = (f"You are the ruling military leadership of {o.get('faction_id')} in the X4 galaxy choosing a "
+                      "course of action. Pick the ONE option that best fits your doctrine; never invent one.")
+                d = self.decide(save_id, "coa_selection", o.get("faction_id"), f"{o.get('faction_id')} command",
+                                brief, options, system_prompt=sp,
+                                advisory={"advisory_best": adv_best.get("coa_type"),
+                                          "score": adv_best.get("weighted_score")},
+                                linked_operation_id=op_id)
+                if d.get("source") != "player2" or not d.get("choice"):
+                    deferred += 1
+                    continue
+                sr = self.memory.set_selected_coa(op_id, d["choice"])
+                if d.get("decision_id"):
+                    self.memory.finalize_decision(d["decision_id"], validator_result=sr,
+                                                  final_status=("applied" if sr.get("ok") else "rejected_by_validator"))
+                if sr.get("ok"):
+                    decided += 1
+                    out.append({"op_id": op_id, "faction": o.get("faction_id"), "coa_id": d["choice"]})
+                else:
+                    deferred += 1
+            except Exception as exc:
+                out.append({"op_id": o.get("id"), "error": str(exc)[:160]})
+        return {"ok": True, "decided": decided, "deferred": deferred, "results": out}
+
+    def coa_selection_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for D1 (stub Player2 + temp store): a usable pick commits a selected COA (source
+        player2); an LLM error → DEFER (op left without a selected COA, no math pick)."""
+        import shutil
+        import tempfile
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool) -> None:
+            checks.append({"name": n, "ok": bool(c)})
+
+        class _R:
+            def __init__(self, r: str) -> None:
+                self._r = {"status": "ok", "reply": r}
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._r
+
+        class _P2OK:
+            def npc_complete(self, _req: Any) -> Any:
+                return _R("1. This course fits our doctrine.")
+
+        class _P2Err:
+            def npc_complete(self, _req: Any) -> Any:
+                raise RuntimeError("player2 down")
+
+        d = tempfile.mkdtemp(prefix="nl_coasel_")
+        orig_m, orig_p = self.memory, self.player2
+        try:
+            store = MemoryStore(f"{d}/c.sqlite3")
+            sid = "s"
+            store.upsert_fleet_strength(sid, "argon", fight=6, total_ships=12)
+            store.upsert_economy_station(sid, {"station_id": "a1", "faction_id": "argon", "sector_id": "X"})
+
+            def mk(key):
+                op = store.create_or_get_operation(sid, "argon", "sector_pressure", key, status="warning",
+                                                   target_faction="teladi", target_sector="X",
+                                                   evidence_json={"magnitude": 4})["id"]
+                store.analyze_mission(op)
+                store.plan_operation_coas(op)
+                return op
+            self.memory = store
+            op1 = mk("s:argon:sp:teladi:c1")
+            self.player2 = _P2OK()
+            r1 = self.select_pending_coas_llm(sid)
+            chk("decided_one", r1["decided"] == 1)
+            chk("selected_set", bool(store.get_operation(op1).get("selected_coa_id")))
+            op2 = mk("s:argon:sp:teladi:c2")
+            self.player2 = _P2Err()
+            r2 = self.select_pending_coas_llm(sid)
+            chk("deferred_on_error", r2["deferred"] >= 1 and not store.get_operation(op2).get("selected_coa_id"))
+        finally:
+            self.memory, self.player2 = orig_m, orig_p
+            shutil.rmtree(d, ignore_errors=True)
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
+
+    def assess_operations_llm(self, save_id: str = "", max_n: int = 15) -> dict[str, Any]:
+        """D5 decision driver (T2): the commander (Player2) decides over each active op's SITREP — escalate
+        (reinforce), raise reward, hold, or request_conclude — and validators execute (can_conclude gates conclude).
+        Defer → no decision this tick. Deterministic assess_operation (SITREP/BDA/timeout) runs separately."""
+        ops = [o for o in self.memory.list_operations(save_id) if o.get("status") in ("active", "frago_required")]
+        decided, deferred, out = 0, 0, []
+        for o in ops[:int(max_n)]:
+            try:
+                op_id = o["id"]
+                cc = self.memory.can_conclude(op_id)
+                open_jobs = [j for j in self.memory.list_jobs(save_id, "open") if j.get("operation_id") == op_id]
+                fac = next((f for f in self.memory.list_factions(save_id)
+                            if f.get("faction_id") == o.get("faction_id")), {}) or {}
+                brief = (f"Operation in {o.get('target_sector') or 'the AO'} against {o.get('target_faction')}. "
+                         f"New enemy pressure: {cc.get('recent_magnitude')}. Age: {cc.get('age_s')}s. "
+                         f"Open contracts: {len(open_jobs)}. "
+                         f"Conclude-eligible: {cc['ok']} ({', '.join(cc.get('reasons', [])) or 'no'}).\n"
+                         f"Your doctrine/mood: {fac.get('mood')}; goal: {fac.get('current_goal')}.\n"
+                         "Decide how to proceed:")
+                # D4b: WHICH ally to reinforce from is a Player2 sub-pick — offer per-candidate escalate options.
+                allies = self.memory.select_support_candidates(
+                    save_id, o.get("faction_id"), o.get("target_faction") or "", o.get("target_sector") or "", top=2)
+                options = [{"key": f"escalate:{a}", "label": f"Escalate — request reinforcement from {a}"} for a in allies]
+                if not allies:
+                    options.append({"key": "escalate_reinforce", "label": "Escalate — request allied reinforcement"})
+                options.append({"key": "hold", "label": "Hold / conserve — continue as planned"})
+                if open_jobs:
+                    options.insert(len(options) - 1, {"key": "raise_reward",
+                                                      "label": "Raise the contract reward to attract takers"})
+                if cc["ok"]:
+                    options.append({"key": "request_conclude",
+                                    "label": "Conclude the operation (objective met / threat resolved)"})
+                sp = (f"You are the military command of {o.get('faction_id')} in the X4 galaxy assessing an ongoing "
+                      "operation. Choose ONE option that fits your doctrine and the situation; never invent one.")
+                d = self.decide(save_id, "assessment", o.get("faction_id"), f"{o.get('faction_id')} command",
+                                brief, options, system_prompt=sp,
+                                advisory={"can_conclude": cc["ok"], "reasons": cc.get("reasons")},
+                                linked_operation_id=op_id)
+                if d.get("source") != "player2" or not d.get("choice"):
+                    deferred += 1
+                    continue
+                res = self.memory.apply_assessment_decision(op_id, d["choice"], reason="commander decision")
+                if d.get("decision_id"):
+                    self.memory.finalize_decision(d["decision_id"], validator_result=res,
+                                                  final_status=("applied" if res.get("ok") else "rejected_by_validator"))
+                decided += 1
+                out.append({"op_id": op_id, "decision": d["choice"], "applied": res.get("applied")})
+            except Exception as exc:
+                out.append({"op_id": o.get("id"), "error": str(exc)[:160]})
+        return {"ok": True, "decided": decided, "deferred": deferred, "results": out}
+
+    def assessment_decision_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for D5 (stub Player2 + temp store): a usable pick applies the assessment decision
+        (escalate → agreement); an LLM error → DEFER (no decision, op untouched)."""
+        import shutil
+        import tempfile
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool) -> None:
+            checks.append({"name": n, "ok": bool(c)})
+
+        class _R:
+            def __init__(self, r: str) -> None:
+                self._r = {"status": "ok", "reply": r}
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._r
+
+        class _P2OK:
+            def npc_complete(self, _req: Any) -> Any:
+                return _R("1. We must call for reinforcements.")
+
+        class _P2Err:
+            def npc_complete(self, _req: Any) -> Any:
+                raise RuntimeError("player2 down")
+
+        d = tempfile.mkdtemp(prefix="nl_assessdec_")
+        orig_m, orig_p = self.memory, self.player2
+        try:
+            store = MemoryStore(f"{d}/a.sqlite3")
+            sid = "s"
+            now = time.time()
+            for f in ("argon", "antigone", "teladi"):
+                store.upsert_faction(sid, f, name=f.title())
+            store.adjust_relationship(sid, "antigone", "argon", dtrust=60)
+            op = store.create_or_get_operation(sid, "argon", "sector_pressure", "s:argon:sp:teladi:as1",
+                                               status="active", target_faction="teladi", target_sector="X",
+                                               budget_reserved=200000, activated_at=now - 100)["id"]
+            self.memory = store
+            self.player2 = _P2OK()
+            r1 = self.assess_operations_llm(sid)
+            chk("decided_one", r1["decided"] == 1)
+            chk("escalate_made_agreement", any(a.get("kind") == "allied_support" and a.get("operation_id") == op
+                                               for a in store.list_agreements(sid)))
+            self.player2 = _P2Err()
+            r2 = self.assess_operations_llm(sid)
+            chk("deferred_on_error", r2["deferred"] >= 1)
+        finally:
+            self.memory, self.player2 = orig_m, orig_p
+            shutil.rmtree(d, ignore_errors=True)
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
+
+    def route_pending_tasks_llm(self, save_id: str = "", max_n: int = 20) -> dict[str, Any]:
+        """D3/D4 decision driver (T2): for combat tasks left PLANNED (own ships available → a real routing choice),
+        Player2 picks commit-own-fleet / hire-contractors / ask-a-specific-ally; route_task commits. Defer on fail."""
+        decided, deferred, out = 0, 0, []
+        for o in self.memory.list_operations(save_id):
+            if o.get("status") not in ("active", "frago_required"):
+                continue
+            op = self.memory.get_operation(o["id"])
+            det = self.memory.operation_detail(o["id"]) or {}
+            for t in det.get("tasks", []):
+                if decided + deferred >= int(max_n):
+                    break
+                if t.get("status") != "planned" or t.get("task_type") not in (
+                        "patrol_sector", "engage_hostiles", "raid_enemy_logistics"):
+                    continue
+                target = t.get("target_faction") or o.get("target_faction") or ""
+                sector = t.get("target_sector") or o.get("target_sector") or ""
+                allies = self.memory.select_support_candidates(save_id, o.get("faction_id"), target, sector, top=2)
+                fac = next((f for f in self.memory.list_factions(save_id)
+                            if f.get("faction_id") == o.get("faction_id")), {}) or {}
+                options = [{"key": "commit_own_fleet", "label": "Commit our own fleet to the task"},
+                           {"key": "hire_contractors", "label": "Hire contractors (post a market job)"}]
+                for a in allies:
+                    options.append({"key": f"ask:{a}", "label": f"Ask {a} for allied support"})
+                brief = (f"Task: {t.get('task_type')} against {target} in {sector or 'the AO'}. "
+                         f"Own ships are available.\nYour doctrine/mood: {fac.get('mood')}; "
+                         f"goal: {fac.get('current_goal')}.\nHow do you fulfil it?")
+                d = self.decide(save_id, "task_routing", o.get("faction_id"), f"{o.get('faction_id')} command",
+                                brief, options, linked_operation_id=o["id"])
+                if d.get("source") != "player2" or not d.get("choice"):
+                    deferred += 1
+                    continue
+                res = self.memory.route_task(op, t, d["choice"])
+                if d.get("decision_id"):
+                    self.memory.finalize_decision(d["decision_id"], validator_result=res,
+                                                  final_status=("applied" if res.get("ok") else "rejected_by_validator"))
+                decided += 1
+                out.append({"op_id": o["id"], "task": t.get("id"), "choice": d["choice"], "route": res.get("route")})
+        return {"ok": True, "decided": decided, "deferred": deferred, "results": out}
+
+    def route_decision_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for D3/D4 (stub Player2 + temp store): a usable pick routes a planned combat task
+        (commit_own_fleet → internal fleet); an LLM error → DEFER (task left planned, no math route)."""
+        import shutil
+        import tempfile
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool) -> None:
+            checks.append({"name": n, "ok": bool(c)})
+
+        class _R:
+            def __init__(self, r: str) -> None:
+                self._r = {"status": "ok", "reply": r}
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._r
+
+        class _P2OK:
+            def npc_complete(self, _req: Any) -> Any:
+                return _R("1. Our own fleet handles this.")
+
+        class _P2Err:
+            def npc_complete(self, _req: Any) -> Any:
+                raise RuntimeError("player2 down")
+
+        d = tempfile.mkdtemp(prefix="nl_routedec_")
+        orig_m, orig_p = self.memory, self.player2
+        try:
+            store = MemoryStore(f"{d}/r.sqlite3")
+            sid = "s"
+            op = store.create_or_get_operation(sid, "argon", "sector_pressure", "s:argon:sp:teladi:rt",
+                                               status="active", target_faction="teladi", target_sector="X")["id"]
+            t1 = store.attach_task(op, "patrol_sector", status="planned", target_faction="teladi", target_sector="X")
+            self.memory = store
+            self.player2 = _P2OK()
+            r1 = self.route_pending_tasks_llm(sid)
+            chk("decided_one", r1["decided"] == 1)
+            chk("task_issued_internal", any(t["id"] == t1 and t["status"] == "issued"
+                                            and t.get("assigned_actor_type") == "fleet"
+                                            for t in store.operation_detail(op)["tasks"]))
+            t2 = store.attach_task(op, "engage_hostiles", status="planned", target_faction="teladi", target_sector="X")
+            self.player2 = _P2Err()
+            r2 = self.route_pending_tasks_llm(sid)
+            chk("deferred_on_error", r2["deferred"] >= 1 and any(t["id"] == t2 and t["status"] == "planned"
+                                                                 for t in store.operation_detail(op)["tasks"]))
+        finally:
+            self.memory, self.player2 = orig_m, orig_p
+            shutil.rmtree(d, ignore_errors=True)
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
+
+    def propose_deals_llm(self, save_id: str = "", max_n: int = 8) -> dict[str, Any]:
+        """D6 decision driver (T3): the PROPOSER faction's Player2 decides which plausible deal to initiate (or none),
+        grounded in a brief; the chosen deal submits through the Negotiations door (deduped/rate-limited). Defer-on-fail.
+        Replaces the deterministic auto-propose on the heartbeat."""
+        cands = self.memory.agreement_candidates(save_id, int(max_n) * 3)
+        by_prop: dict[str, list] = {}
+        for c in cands:
+            by_prop.setdefault(c["proposer"], []).append(c)
+        decided, proposed, deferred, out = 0, 0, 0, []
+        for prop, deals in by_prop.items():
+            if decided >= int(max_n):
+                break
+            fac = next((f for f in self.memory.list_factions(save_id) if f.get("faction_id") == prop), {}) or {}
+            shown = deals[:4]
+            options = [{"key": f"propose:{i}",
+                        "label": f"Offer {c['kind']} to {c['target']} ({(c['terms'].get('reason') or '')[:40]})"}
+                       for i, c in enumerate(shown)]
+            options.append({"key": "hold", "label": "Make no new offers right now"})
+            brief = (f"You are {prop}. Plausible deals you could initiate now:\n"
+                     + "\n".join(f"  - {c['kind']} with {c['target']}: {c['terms'].get('reason') or ''}" for c in shown)
+                     + f"\nYour doctrine/mood: {fac.get('mood')}; goal: {fac.get('current_goal')}.\n"
+                     "Which one, if any, do you initiate?")
+            d = self.decide(save_id, "proposal_initiation", prop, f"{prop} leadership", brief, options)
+            decided += 1
+            if d.get("source") != "player2" or not d.get("choice"):
+                deferred += 1
+                continue
+            if d["choice"] == "hold":
+                out.append({"proposer": prop, "decision": "hold"})
+                continue
+            try:
+                idx = int(d["choice"].split(":", 1)[1])
+            except Exception:
+                idx = -1
+            if not (0 <= idx < len(shown)):
+                deferred += 1
+                continue
+            c = shown[idx]
+            ag = self.memory.submit_negotiation_intent(save_id, "proposal", c["kind"], prop,
+                                                       recipient=c["target"], terms=c["terms"])
+            if d.get("decision_id"):
+                self.memory.finalize_decision(d["decision_id"], final_status="applied")
+            proposed += 1
+            out.append({"proposer": prop, "target": c["target"], "kind": c["kind"], "agreement_id": ag.get("id")})
+        return {"ok": True, "decided": decided, "proposed": proposed, "deferred": deferred, "results": out}
+
+    def propose_deals_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for D6 (stub Player2 + temp store): a usable pick initiates a deal via the door; an
+        LLM error → DEFER (no proposal)."""
+        import shutil
+        import tempfile
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool) -> None:
+            checks.append({"name": n, "ok": bool(c)})
+
+        class _R:
+            def __init__(self, r: str) -> None:
+                self._r = {"status": "ok", "reply": r}
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._r
+
+        class _P2OK:
+            def npc_complete(self, _req: Any) -> Any:
+                return _R("1. We sue for peace.")
+
+        class _P2Err:
+            def npc_complete(self, _req: Any) -> Any:
+                raise RuntimeError("player2 down")
+
+        d = tempfile.mkdtemp(prefix="nl_propose_")
+        orig_m, orig_p = self.memory, self.player2
+        try:
+            store = MemoryStore(f"{d}/p.sqlite3")
+            sid = "s"
+            for f in ("argon", "teladi", "paranid"):
+                store.upsert_faction(sid, f, name=f.title())
+            store.add_conflict(sid, "argon", "teladi", status="active", intensity=0.5)
+            store.add_conflict(sid, "argon", "paranid", status="active", intensity=0.5)
+            chk("candidate_generated", any(c["kind"] == "ceasefire" for c in store.agreement_candidates(sid)))
+            self.memory = store
+            self.player2 = _P2OK()
+            r1 = self.propose_deals_llm(sid)
+            chk("proposed_one", r1["proposed"] >= 1)
+            chk("agreement_created", any((a.get("kind") == "ceasefire" or a.get("type") == "ceasefire")
+                                         for a in store.list_agreements(sid)))
+            self.player2 = _P2Err()
+            r2 = self.propose_deals_llm(sid)
+            chk("deferred_on_error", r2["deferred"] >= 1)
+        finally:
+            self.memory, self.player2 = orig_m, orig_p
+            shutil.rmtree(d, ignore_errors=True)
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
+
+    def faction_action_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for D8 (stub Player2 + temp store): review_faction's strategic PICK routes through the
+        unified decide() (Player2) — a usable pick yields a decision; an LLM error DEFERS (faction holds, no incident,
+        never the deterministic index-0)."""
+        import shutil
+        import tempfile
+        from .scoring import rank_faction
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool) -> None:
+            checks.append({"name": n, "ok": bool(c)})
+
+        class _R:
+            def __init__(self, r: str) -> None:
+                self._r = {"status": "ok", "reply": r}
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._r
+
+        class _P2OK:
+            def npc_complete(self, _req: Any) -> Any:
+                return _R("1. We press our advantage.")
+
+        class _P2Err:
+            def npc_complete(self, _req: Any) -> Any:
+                raise RuntimeError("player2 down")
+
+        d = tempfile.mkdtemp(prefix="nl_factact_")
+        orig_m, orig_p = self.memory, self.player2
+        try:
+            store = MemoryStore(f"{d}/f.sqlite3")
+            sid = "s"
+            for f in ("argon", "teladi"):
+                store.upsert_faction(sid, f, name=f.title())
+            store.add_conflict(sid, "argon", "teladi", status="active", intensity=0.6)
+            store.adjust_relationship(sid, "argon", "teladi", dresentment=40)
+            state = store.derive_pressures(sid, "argon")
+            opts = rank_faction("argon", state, store.list_relationships(sid, subject="argon"))
+            chk("options_generated", len(opts) >= 1)
+            self.memory = store
+            self.player2 = _P2OK()
+            r1 = self.review_faction(sid, "argon", force=True)
+            chk("player2_decided", r1.get("decision") is not None and not r1.get("deferred"))
+            self.player2 = _P2Err()
+            r2 = self.review_faction(sid, "argon", force=True)
+            chk("defers_on_error", r2.get("deferred") is True and r2.get("decision") is None)
+        finally:
+            self.memory, self.player2 = orig_m, orig_p
+            shutil.rmtree(d, ignore_errors=True)
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
+
+    DECISION_TIER_INTERVALS = {"operational": 300.0, "strategic": 900.0}  # T2 ~5min, T3 ~10-15min
+
+    def decision_tick(self, save_id: str = "", now: float | None = None) -> dict[str, Any]:
+        """#50 priority-tiered decision cadence. Each tick fires only the tiers whose interval has elapsed; each
+        driver is bounded (small max_n) and DEFERS on Player2 failure. The Lua heartbeat calls this; tiers self-gate
+        by last-run timestamp. T2 operational (~5min): COA select / routing / assessment. T3 strategic (~10-15min):
+        negotiation accept / proposal initiation / faction strategic action. (T1 COA is also caught here; T4 narrative
+        = D9, not built.)"""
+        now = time.time() if now is None else float(now)
+        if not hasattr(self, "_decision_tier_last"):
+            self._decision_tier_last = {}
+        fired: dict[str, Any] = {}
+
+        def due(tier: str) -> bool:
+            return now - self._decision_tier_last.get(f"{save_id}:{tier}", 0.0) >= self.DECISION_TIER_INTERVALS[tier]
+
+        if due("operational"):
+            self._decision_tier_last[f"{save_id}:operational"] = now
+            fired["operational"] = {
+                "coa": self.select_pending_coas_llm(save_id, max_n=2),
+                "route": self.route_pending_tasks_llm(save_id, max_n=2),
+                "assess": self.assess_operations_llm(save_id, max_n=2),
+            }
+        if due("strategic"):
+            self._decision_tier_last[f"{save_id}:strategic"] = now
+            fired["strategic"] = {
+                "offers": self.resolve_offers_llm(save_id, max_n=2),
+                "propose": self.propose_deals_llm(save_id, max_n=2),
+                "influence": self.influence_step({"save_id": save_id, "budget": 2}),
+                "scene": self.run_scheduled_scene(save_id),  # #63: one NPC>NPC scene per strategic tick
+            }
+        return {"ok": True, "fired": list(fired.keys()), "now": now, "detail": fired}
+
+    def decision_tick_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for #50: the cadence GATE fires tiers by interval (a fresh save → all drivers no-op
+        with no Player2 calls, so only the gate logic is exercised)."""
+        sid = f"dtick_{int(time.time() * 1000)}"
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool) -> None:
+            checks.append({"name": n, "ok": bool(c)})
+
+        t0 = 1_000_000.0
+        r1 = self.decision_tick(sid, now=t0)
+        chk("first_fires_both", "operational" in r1["fired"] and "strategic" in r1["fired"])
+        r2 = self.decision_tick(sid, now=t0 + 10)
+        chk("gated_within_interval", r2["fired"] == [])
+        r3 = self.decision_tick(sid, now=t0 + 400)
+        chk("operational_refires", "operational" in r3["fired"] and "strategic" not in r3["fired"])
+        r4 = self.decision_tick(sid, now=t0 + 1000)
+        chk("strategic_refires", "strategic" in r4["fired"])
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
+
+    def decisions_list(self, save_id: str = "", limit: int = 50) -> dict[str, Any]:
+        """The decision audit log (spec §12) — newest-first, for the dashboard + debugging."""
+        return {"ok": True, "decisions": self.memory.list_decision_records(save_id, limit)}
+
+    def decision_record_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for the decision audit log (record/finalize/list)."""
+        return run_decision_record_selftest()
+
+    def decide_probe(self, save_id: str = "", faction: str = "argon") -> dict[str, Any]:
+        """DIAGNOSTIC: run the LIVE adapter once on a trivial 2-option brief and return the RAW result so we can see
+        why the live Player2 path succeeds/defers (visibility the browser-triggered batch can't give)."""
+        opts = [{"key": "yes", "label": "Yes, act now"}, {"key": "no", "label": "No, hold for now"}]
+        d = self.decide(save_id or "probe", "probe", faction, f"{faction} leadership",
+                        f"A simple test for {faction}: do you act now or hold?", opts)
+        return {"ok": True, **d}
+
+    def decision_adapter_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Deterministic oracle for the universal Decision Adapter (no live LLM needed): a stub Player2 returning a
+        usable pick maps to the right option key (source=player2); a stub that raises, or returns junk, → DEFER
+        (choice=None, source=deferred) — never a math fallback; empty options → skipped. The live LLM path is
+        exercised separately by resolve_offers_llm."""
+        checks: list[dict[str, Any]] = []
+
+        def chk(n: str, c: bool) -> None:
+            checks.append({"name": n, "ok": bool(c)})
+
+        class _Resp:
+            def __init__(self, reply: str, status: str = "ok") -> None:
+                self._d = {"status": status, "reply": reply}
+
+            def to_dict(self) -> dict[str, Any]:
+                return self._d
+
+        class _P2OK:
+            def npc_complete(self, _req: Any) -> Any:
+                return _Resp("2. They share our enemy; we accept.")
+
+        class _P2Err:
+            def npc_complete(self, _req: Any) -> Any:
+                raise RuntimeError("player2 down")
+
+        class _P2Junk:
+            def npc_complete(self, _req: Any) -> Any:
+                return _Resp("the council remains undecided")
+
+        opts = [{"key": "a", "label": "A"}, {"key": "b", "label": "B"}, {"key": "c", "label": "C"}]
+        orig = self.player2
+        try:
+            self.player2 = _P2OK()
+            d1 = self.decide("s", "test", "argon", "Argon", "brief", opts)
+            chk("picks_player2_choice", d1["source"] == "player2" and d1["choice"] == "b")
+            self.player2 = _P2Err()
+            d2 = self.decide("s", "test", "argon", "Argon", "brief", opts)
+            chk("defers_on_error", d2["source"] == "deferred" and d2["choice"] is None)
+            self.player2 = _P2Junk()
+            d3 = self.decide("s", "test", "argon", "Argon", "brief", opts)
+            chk("defers_on_unparsed", d3["source"] == "deferred" and d3["choice"] is None)
+            d4 = self.decide("s", "test", "argon", "Argon", "brief", [])
+            chk("skips_no_options", d4["source"] == "skipped" and d4["choice"] is None)
+        finally:
+            self.player2 = orig
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
 
     def identity_promote(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Promote an identity's tracking priority. payload: {persistent_npc_key|npc_key, reason}."""
@@ -1120,13 +2261,35 @@ class NeuralRouter:
         if not options:
             return {"ok": True, "faction_id": faction_id, "pressures": state, "decision": None}
 
-        llm_meta = None
-        if use_llm:
-            fac = self.memory.get_faction(save_id, faction_id) or {}
-            llm_meta = self._llm_decide(save_id, faction_id, str(fac.get("name") or faction_id), state, options)
-            top = options[llm_meta["index"]]
-        else:
-            top = options[0]
+        # D8: the faction's strategic PICK is a Player2 decision via the UNIFIED adapter — never the deterministic
+        # top, never _llm_decide's index-0 fallback. On failure it DEFERS (the faction HOLDS this cycle). The
+        # deterministic rank is advisory only. (use_llm is now vestigial; Player2 is the decider by default.)
+        fac = self.memory.get_faction(save_id, faction_id) or {}
+        sit = state or {}
+        opts = [{"key": str(i),
+                 "label": o["action"] + (f" toward {o.get('target')}" if o.get("target") not in ("self", "", None) else "")}
+                for i, o in enumerate(options[:6])]
+        brief = (f"Your situation: military pressure {round(float(sit.get('military_pressure', 0))*100)}%, "
+                 f"economic {round(float(sit.get('economic_pressure', 0))*100)}%, "
+                 f"recent losses {round(float(sit.get('recent_losses', 0))*100)}%.\n"
+                 "Choose your faction's strategic move this cycle:")
+        sp = (f"You are the ruling leadership of {fac.get('name') or faction_id} in the X4 galaxy. Choose ONE numbered "
+              "strategic move that fits your faction's interests and doctrine; never invent one.")
+        d = self.decide(save_id, "faction_action", faction_id, str(fac.get("name") or faction_id), brief, opts,
+                        system_prompt=sp, advisory={"top": options[0]["action"], "score": options[0].get("score")})
+        if d.get("source") != "player2" or d.get("choice") is None:
+            return {"ok": True, "faction_id": faction_id, "pressures": state, "options": options[:5],
+                    "decision": None, "deferred": True, "incident_id": None}
+        try:
+            idx = int(d["choice"])
+        except Exception:
+            idx = -1
+        if not (0 <= idx < len(options)):
+            return {"ok": True, "faction_id": faction_id, "pressures": state, "options": options[:5],
+                    "decision": None, "deferred": True, "incident_id": None}
+        top = options[idx]
+        llm_meta = {"index": idx, "narrative": d.get("reason", ""), "llm_status": "ok",
+                    "latency_ms": 0, "decision_id": d.get("decision_id")}
 
         action = top["action"]
         target = top.get("target") or ""
@@ -1164,7 +2327,7 @@ class NeuralRouter:
             confidence=float(top.get("score", 0)),
             priority=max(0, int(round(float(top.get("score", 0)) * 10))),
             narrative=narrative,
-            effects={"source": "llm" if use_llm else "deterministic", "score": top.get("score")})
+            effects={"source": "player2", "score": top.get("score")})
         if v["requires_confirmation"] and not autonomous:
             # Player-facing path only (e.g. a chat-proposed action): high-impact awaits confirm.
             self.memory.set_incident_status(save_id, inc["id"], "pending")
@@ -1174,6 +2337,8 @@ class NeuralRouter:
             # no confirmation friction, no immersion break. The universe acts on its own; the player reacts.
             applied = self.memory.apply_incident_effects(save_id, action, faction_id, eff_target)
             self.memory.set_incident_status(save_id, inc["id"], "applied")
+            if llm_meta.get("decision_id"):
+                self.memory.finalize_decision(llm_meta["decision_id"], validator_result=v, final_status="applied")
         out = {"ok": True, "faction_id": faction_id, "pressures": state,
                "options": options[:5],
                "decision": {"action": action, "target": eff_target, "score": top.get("score"),
@@ -1208,14 +2373,44 @@ class NeuralRouter:
                 continue
             if (_t.time() - self._last_drain_ts) > self.INFLUENCE_DRAIN_IDLE_S:
                 continue  # game isn't pulling — don't burn the LLM
+            # #67: the live loop is now the Player2 DECISION TICK — tiered + self-gated (#50). This runs the resolver
+            # (proposals get a Player2 verdict and CLOSE, instead of piling), Player2 COA/route/assessment, deal
+            # proposal, and the throttled faction review — replacing the every-22s influence_step spam. Each driver
+            # DEFERS on Player2 failure (never math-substitutes). The tiers self-gate by interval, so most 22s wakeups
+            # do nothing (cheap); real work fires only when a tier is due.
             try:
-                res = self.influence_step({"save_id": save, "budget": 2})
+                tick = self.decision_tick(save)
             except Exception:
                 continue
             try:
-                self._enqueue_drain(save, res)
+                self._enqueue_drain(save, self._drain_from_tick(tick))
             except Exception:
                 pass
+
+    def _drain_from_tick(self, tick: dict[str, Any]) -> dict[str, Any]:
+        """#67: turn a decision_tick result into the game drain feed — the throttled faction-review news/actions PLUS
+        player-facing lines for the Player2 DECISIONS this tick made (negotiation verdicts, COA commitments), so the
+        logbook SHOWS the LLM's intent instead of a wall of unresolved requests. Empty between due tiers (the throttle)."""
+        det = tick.get("detail") or {}
+        strat = det.get("strategic") or {}
+        oper = det.get("operational") or {}
+        base = strat.get("influence") or {}
+        feed = {"news": list(base.get("news") or []), "actions": list(base.get("actions") or []),
+                "articles": list(base.get("articles") or []), "phase_effects": list(base.get("phase_effects") or [])}
+        # Player2 negotiation verdicts — the "requests" the player was drowning in, now RESOLVED in character.
+        for o in ((strat.get("offers") or {}).get("results") or []):
+            feed["news"].append(
+                f"Diplomacy: {o.get('recipient') or 'a faction'} responds to a proposal — {o.get('decision')}.")
+        # Player2 course-of-action commitments (OPORD decisions).
+        for c in ((oper.get("coa") or {}).get("results") or []):
+            feed["news"].append(f"Command: {c.get('faction') or 'a faction'} commits to a course of action.")
+        # #63: NPC>NPC scene — overheard lines surface to the player logbook.
+        for line in ((strat.get("scene") or {}).get("news") or []):
+            feed["news"].append(line)
+        # #64: validated relation moves proposed in the scene → in-game actions (Lua→MD set_faction_relation).
+        for act in ((strat.get("scene") or {}).get("actions") or []):
+            feed["actions"].append(act)
+        return feed
 
     def _enqueue_drain(self, save_id: str, res: dict[str, Any]) -> None:
         q = self._drain.setdefault(save_id, {"news": [], "actions": [], "articles": [], "phase_effects": []})
@@ -1416,17 +2611,21 @@ class NeuralRouter:
         self._gameplay_gen_last[save_id] = now
         out: dict[str, Any] = {"ran": True, "agreements": 0, "offer": None}
         try:
-            ag = self.memory.generate_agreements(save_id, max_new=2)
-            ags = ag.get("agreements") or []
-            out["agreements"] = len(ags)
-            if not dry_run:
-                for a in ags:
-                    fa = self._fac_name(save_id, a.get("party_a"))
-                    fb = self._fac_name(save_id, a.get("party_b"))
+            # D6: LIVE proposal initiation is the PROPOSER's Player2 decision (defer-on-fail), not deterministic auto-
+            # propose. dry_run (selftest) only COUNTS candidates — no LLM, no create, no side effects.
+            if dry_run:
+                out["agreements"] = len(self.memory.agreement_candidates(save_id, 2))
+            else:
+                res = self.propose_deals_llm(save_id, max_n=2)
+                proposed = [r for r in res.get("results", []) if r.get("agreement_id")]
+                out["agreements"] = len(proposed)
+                for a in proposed:
+                    fa = self._fac_name(save_id, a.get("proposer"))
+                    fb = self._fac_name(save_id, a.get("target"))
                     verb = {"ceasefire": "has put out a ceasefire feeler to",
-                            "trade": "is proposing a trade pact with"}.get(a.get("type"), "is opening talks with")
+                            "trade": "is proposing a trade pact with"}.get(a.get("kind"), "is opening talks with")
                     self.player_comms.append({"title": f"{fa.upper()} DIPLOMATIC OVERTURE", "body": f"{fa} {verb} {fb}.",
-                                              "faction": a.get("party_a"), "faction_name": fa, "category": "diplomacy",
+                                              "faction": a.get("proposer"), "faction_name": fa, "category": "diplomacy",
                                               "kind": "agreement", "save_id": save_id, "ts": now})
         except Exception:
             pass
