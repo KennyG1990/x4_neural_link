@@ -263,6 +263,18 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/ops/route_decision_selftest":
             self._send_json(200, self.router.route_decision_selftest())
             return
+        if parsed.path == "/api/ops/contract_frago_selftest":
+            self._send_json(200, self.router.contract_frago_selftest())
+            return
+        if parsed.path == "/api/ops/push_contract_fragos":
+            self._send_json(200, self.router.push_contract_fragos(query.get("save_id", [""])[0]))
+            return
+        if parsed.path == "/api/ops/job_pricing_selftest":
+            self._send_json(200, self.router.job_pricing_selftest())
+            return
+        if parsed.path == "/api/ops/jobs_offers_selftest":
+            self._send_json(200, self.router.jobs_offers_selftest())
+            return
         if parsed.path == "/api/ops/gameplay_announce_once_selftest":
             self._send_json(200, self.router.gameplay_announce_once_selftest())
             return
@@ -657,6 +669,9 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
             "/api/world_events": self.router.world_event_add,
             "/v1/npcs/index": self.router.npc_index,
             "/v1/job/complete": self.router.job_complete,
+            "/v1/jobs/offers": self.router.jobs_offers,
+            "/v1/jobs/claim": self.router.jobs_claim,
+            "/v1/jobs/release": self.router.jobs_release,
             "/v1/opord/orders/pending": self.router.opord_orders_pending,
             "/v1/opord/lease": self.router.opord_lease,
             "/v1/opord/orders/issued": self.router.opord_order_issued,

@@ -44,6 +44,29 @@ function Invoke-Reload([string]$why) {
     try {
       Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2 | Out-Null
       Write-Host ("  reloaded - BRIDGE UP @ {0}" -f (Get-Date -Format HH:mm:ss)) -ForegroundColor Green
+      # ---- CI GATE (workflow v2, 2026-07-01): fast selftest smoke on EVERY reload; RED = the change is NOT done.
+      # Fast deterministic suites only (no LLM, temp stores). Result also appended to runtime\logs\ci_gate.log so
+      # agents can verify the gate without the transcript.
+      $gate = @("actions_selftest", "relation_move_validator_selftest", "decision_record_selftest",
+                "job_escalation_selftest", "route_decision_selftest")
+      $fails = @()
+      foreach ($g in $gate) {
+        try {
+          $r = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/ops/$g" -TimeoutSec 25
+          if (-not $r.ok) { $fails += ("{0} ({1}/{2})" -f $g, $r.passed, $r.total) }
+        } catch { $fails += "$g (unreachable)" }
+      }
+      $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+      $logDir = Join-Path $Root "runtime\logs"
+      if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+      if ($fails.Count -eq 0) {
+        Write-Host ("  CI GATE PASS ({0} suites)" -f $gate.Count) -ForegroundColor Green
+        "PASS $stamp [$($gate.Count) suites]" | Out-File -Append -Encoding utf8 (Join-Path $logDir "ci_gate.log")
+      } else {
+        Write-Host ("  CI GATE **RED**: {0}" -f ($fails -join "; ")) -ForegroundColor Red
+        Write-Host "  The change is NOT done until this gate is green (workflow v2)." -ForegroundColor Red
+        "RED  $stamp $($fails -join '; ')" | Out-File -Append -Encoding utf8 (Join-Path $logDir "ci_gate.log")
+      }
       return
     } catch { Start-Sleep -Milliseconds 700 }
   }

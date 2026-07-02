@@ -4246,7 +4246,9 @@ class MemoryStore:
         reward = int(job.get("reward") or 0)
         raise_to = max(int(reward * (1.0 + self.JOB_RAISE_FRACTION)), reward + 5000)
         fid = str(job.get("issuing_faction") or "")
-        headroom = max(0.0, self.budget_capacity(save_id, fid) - self.budget_spent(save_id, fid))
+        # committed-aware headroom (this job's current reward is already inside committed, so the check below
+        # correctly bounds only the INCREMENT)
+        headroom = max(0.0, self.budget_available(save_id, fid))
         options: list[dict] = []
         if (raise_to - reward) <= headroom:
             options.append({"key": f"raise:{raise_to}",
@@ -4254,6 +4256,119 @@ class MemoryStore:
         options.append({"key": "hold", "label": "Hold the listing unchanged and wait"})
         options.append({"key": "cancel", "label": "Withdraw the listing (need no longer worth the price)"})
         return options, raise_to
+
+    def pending_contract_fragos(self, save_id: str) -> list[dict]:
+        """#27 FRAGO push (bridge half): for each CLAIMED job linked to an operation, return frago reports newer
+        than the job's last-push marker — the situation changed while the player is flying the contract."""
+        out: list[dict] = []
+        for j in self.list_jobs(save_id, status="claimed"):
+            op_id = j.get("operation_id")
+            if not op_id:
+                continue
+            ev = j.get("evidence_json") if isinstance(j.get("evidence_json"), dict) else {}
+            marker = float(ev.get("frago_ts") or 0)
+            op = self.operation_detail(str(op_id))
+            if not op:
+                continue
+            for r in op.get("reports", []):
+                if str(r.get("report_type")) == "frago" and float(r.get("created_at") or 0) > marker:
+                    out.append({"job_id": j.get("id"), "operation_id": op_id,
+                                "faction": j.get("issuing_faction"),
+                                "summary": str(r.get("summary") or "Situation changed; orders amended."),
+                                "report_ts": float(r.get("created_at") or 0)})
+        return out
+
+    def mark_contract_frago(self, save_id: str, job_id: str, ts: float) -> None:
+        """Advance the job's frago-push marker (idempotence for #27)."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT evidence_json FROM market_jobs WHERE save_id=? AND id=?",
+                               (save_id, job_id)).fetchone()
+        ev = {}
+        if row:
+            try:
+                dec = self._decode_op_row(dict(row))
+                ev = dec.get("evidence_json") if isinstance(dec.get("evidence_json"), dict) else {}
+            except Exception:
+                ev = {}
+        ev["frago_ts"] = float(ts)
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE market_jobs SET evidence_json=? WHERE save_id=? AND id=?",
+                         (self._enc("evidence_json", ev), save_id, job_id))
+            conn.commit()
+
+    def resolve_job_sector(self, save_id: str, faction_id: str, target_faction: str = "",
+                           explicit: str = "") -> str:
+        """A location-typed job must point SOMEWHERE real ("the operational area" is a placeholder wearing a
+        uniform — Ken 2026-07-01). Precedence: explicit (op/task sector) → the latest hostile_event sector
+        involving the pair → the issuing faction's most-attacked recent sector → ''. All sources are observed
+        game data; nothing is invented."""
+        if str(explicit or "").strip():
+            return str(explicit).strip()
+        try:
+            events = self.list_hostile_events(save_id, window_s=7200.0, limit=200)
+        except Exception:
+            events = []
+        for e in events:  # newest first
+            pair = {e.get("attacker_faction"), e.get("victim_faction")}
+            if faction_id in pair and (not target_faction or target_faction in pair) and e.get("sector"):
+                return str(e["sector"])
+        counts: dict[str, int] = {}
+        for e in events:
+            if e.get("victim_faction") == faction_id and e.get("sector"):
+                counts[str(e["sector"])] = counts.get(str(e["sector"]), 0) + 1
+        return max(counts, key=counts.get) if counts else ""
+
+    def price_job(self, save_id: str, faction_id: str, job_type: str, urgency: int = 0,
+                  target_faction: str = "") -> int:
+        """Deterministic THREAT-SCALED contract pricing (fixes the flat-70k / reward-0-crawl defects, Ken audit
+        2026-07-01): reward = base[type] × (1 + 0.15·urgency) × (1 + conflict intensity vs the target), rounded
+        to 1000s, capped by true budget_available. Magnitude flows from hostile_events → conflict intensity →
+        urgency → PRICE, so the mission board reads as a threat map priced in credits. Engine math, not an
+        intent decision (ADR-001-compatible)."""
+        base = float(self.OPORD_JOB_REWARDS.get(job_type, 50000))
+        intensity = 0.0
+        try:
+            for c in self.list_conflicts(save_id, status="active"):
+                pair = {c.get("faction_a"), c.get("faction_b")}
+                if faction_id in pair and (not target_faction or target_faction in pair):
+                    intensity = max(intensity, float(c.get("intensity") or 0))
+        except Exception:
+            pass
+        reward = base * (1.0 + 0.15 * max(0, int(urgency or 0))) * (1.0 + max(0.0, min(1.0, intensity)))
+        afford = max(0.0, self.budget_available(save_id, faction_id))
+        return int(min(reward, afford) // 1000 * 1000)
+
+    def jobs_committed(self, save_id: str, faction_id: str) -> float:
+        """Rewards PROMISED on open/claimed jobs — outstanding liabilities against the faction treasury. Posting a
+        contract commits the money; completion converts committed → spent (Ken's rule: the mission's reward is
+        money from the faction's own pocket, not printed)."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT COALESCE(SUM(reward),0) AS s FROM market_jobs WHERE save_id=? AND "
+                               "issuing_faction=? AND status IN ('open','claimed')", (save_id, faction_id)).fetchone()
+        return float(row["s"] or 0)
+
+    def budget_available(self, save_id: str, faction_id: str) -> float:
+        """True spendable headroom: derived capacity − already spent − committed on outstanding contracts."""
+        return (self.budget_capacity(save_id, faction_id) - self.budget_spent(save_id, faction_id)
+                - self.jobs_committed(save_id, faction_id))
+
+    def player_eligible_jobs(self, save_id: str) -> list[dict]:
+        """G1 (#75/ADR-003): OPEN market jobs the PLAYER may see as mission offers — visibility='public' plus a
+        standing gate (a faction that deeply distrusts the player doesn't post them contracts: trust > -50).
+        NPC/faction claimants do NOT use this filter — they read the full table via their own decision drivers."""
+        out = []
+        for j in self.list_jobs(save_id, status="open"):
+            if str(j.get("visibility") or "public") != "public":
+                continue
+            if int(j.get("reward") or 0) <= 0:
+                continue  # unpriced job (announce-once creates at 0; the FRAGO escalation loop prices it) — no
+                # offer until a real reward is backed by budget (words≠resources)
+            fid = str(j.get("issuing_faction") or "")
+            rel = self.get_relationship(save_id, fid, "player") or {}
+            if float(rel.get("trust") or 0) <= -50:
+                continue
+            out.append(j)
+        return out
 
     def apply_job_escalation(self, save_id: str, job_id: str, choice: str) -> dict:
         """Deterministic executor for a Player2 job-escalation verdict. raise:<n> re-prices (bounded upstream),
@@ -4329,6 +4444,32 @@ class MemoryStore:
             conn.commit()
         return {"ok": n > 0, "id": job_id, "status": "claimed" if n else "not_open", "claimant": claimant}
 
+    def release_job(self, save_id: str, job_id: str, claimant: str = "") -> dict:
+        """G5 abort slice: the claimant walked away (player aborted the mission) — reopen the job so the
+        market re-lists it. If the announce-once unique index (save_id, job_key on open rows) says the market
+        already minted a fresh open job for the same work, the aborted row is CANCELLED instead (the work is
+        re-listed either way). Idempotent: only a claimed row transitions.
+        PURE state transition — the abort trust penalty is POLICY and lives in router.jobs_release (the
+        say/try/allowed/changed rule: policy effects must be visible and logged, never swallowed in the store)."""
+        now = time.time()
+        fac = ""
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT issuing_faction FROM market_jobs WHERE id=? AND save_id=?",
+                               (job_id, save_id)).fetchone()
+            fac = (row[0] or "") if row else ""
+            try:
+                n = conn.execute("UPDATE market_jobs SET status='open', updated_at=? WHERE id=? AND save_id=? "
+                                 "AND status='claimed'", (now, job_id, save_id)).rowcount or 0
+                conn.commit()
+                status = "open" if n else "not_claimed"
+            except sqlite3.IntegrityError:
+                n = conn.execute("UPDATE market_jobs SET status='cancelled', updated_at=? WHERE id=? AND save_id=? "
+                                 "AND status='claimed'", (now, job_id, save_id)).rowcount or 0
+                conn.commit()
+                status = "cancelled" if n else "not_claimed"
+        return {"ok": n > 0, "id": job_id, "status": status, "claimant": claimant,
+                "issuing_faction": fac}
+
     def complete_job(self, save_id: str, job_id: str, claimant: str = "", evidence: Any = None) -> dict:
         """Fulfillment PROOF: complete the job, complete its linked task, and SPEND the reward from the issuing
         faction's budget (the spec's 'budget spends only on execution' — reservation was at OPORD issue). Bumps the
@@ -4358,6 +4499,14 @@ class MemoryStore:
                 self.attach_report(op_id, "task_update",
                                    f"Job {job.get('job_type')} completed by {claimant or 'a claimant'}; {reward} spent.",
                                    severity=2, evidence={"job_id": job_id, "reward": reward, "claimant": claimant})
+        try:
+            # Honouring a contract builds trust with the claimant (attitude-only — ADR-005 legal; feeds
+            # briefings/scenes so factions REMEMBER who does their work). Called OUTSIDE any lock (deadlock rule).
+            if claimant:
+                self.adjust_relationship(save_id, fac, claimant, dtrust=3,
+                                         summary=f"{claimant} honoured a {job.get('job_type')} contract for {fac}")
+        except Exception:
+            pass
         return {"ok": True, "id": job_id, "status": "completed", "reward_spent": reward, "faction_spent_total": spent_total}
 
     def fail_job(self, save_id: str, job_id: str, reason: str = "") -> dict:
@@ -4878,8 +5027,13 @@ class MemoryStore:
             return {"ok": True, "task_id": task_id, "route": "internal_fleet"}
         if choice == "hire_contractors":
             jt = "privateer" if ttype == "raid_enemy_logistics" else "patrol"
+            # THREAT-SCALED + AFFORDABLE pricing (Ken audit 2026-07-01): magnitude→urgency→intensity now sets the
+            # price; budget_available caps it (a broke faction posts unpriced; escalation sweetens if ignored).
+            sector = self.resolve_job_sector(save_id, faction, target, explicit=sector)
             job = self.create_or_update_job(save_id, faction, jt, target_sector=sector, target_faction=target,
-                                            reward=self.OPORD_JOB_REWARDS.get(jt, 50000),
+                                            reward=self.price_job(save_id, faction, jt,
+                                                                  urgency=int(op.get("urgency") or 0),
+                                                                  target_faction=target),
                                             urgency=int(op.get("urgency") or 0), operation_id=op_id,
                                             operation_task_id=task_id, evidence={"operation_id": op_id, "sector": sector})
             self.update_task(task_id, status="issued", job_id=str(job.get("id")), issued_at=time.time())

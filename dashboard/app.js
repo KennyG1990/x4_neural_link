@@ -660,9 +660,10 @@ function renderBudgets(resp, saveId) {
       ${td(b.faction_id, "mono")}
       ${td(money(b.capacity))}
       ${td(money(b.spent), b.spent ? "warn" : "")}
-      ${td(money(b.remaining), "ok")}
+      ${td(money(b.committed), b.committed ? "warn" : "")}
+      ${td(money(b.available != null ? b.available : b.remaining), "ok")}
     </tr>
-  `).join("") || `<tr><td colspan="4" class="dim">No economy-bearing factions for ${esc(saveId)} yet.</td></tr>`;
+  `).join("") || `<tr><td colspan="5" class="dim">No economy-bearing factions for ${esc(saveId)} yet.</td></tr>`;
 }
 
 function renderLlmBudget(resp) {

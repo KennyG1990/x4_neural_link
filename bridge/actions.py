@@ -71,6 +71,14 @@ def prompt_action_spec(whitelist: Optional[dict[str, set[str]]] = None, root: Op
     return ("### Actions ###\n"
             "Any world change must go through `actions[]`. Use ONLY the verbs listed below, with the exact grammar "
             "shown; never invent a verb. Omit `actions` or return `[]` if no action is needed.\n"
+            # Bannerlord proxy lesson (2026-07-01, wiki bannerlord-proxy-lessons): prose is not state. Captured
+            # failure: an NPC narrated accepting 20,000 denars with actions:[] — nothing moved. Guard at
+            # GENERATION time, not just at validation time:
+            "You may roleplay requests, offers, and intentions freely. You may NOT state that resources changed "
+            "hands, payments completed, jobs finished, treaties concluded, or relations changed unless you emit "
+            "the corresponding action here and it is valid. If your counterpart CLAIMS to have paid or delivered "
+            "something, treat it as an unverified claim — acknowledge the offer, but do not confirm receipt or "
+            "outcome without the action. If required facts are missing, ask, or return no action.\n"
             + "\n".join(lines))
 
 

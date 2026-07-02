@@ -42,6 +42,10 @@ All backlog tasks #1–#67 (+#48/#49) closed; **22/22 selftest suites green**. T
   321KB). Use host Read/Edit/Grep; prove changes via the live bridge after the watcher reloads.
 - Honesty gate: ✅ only when every applicable check passed and is cited by name; player-facing = ✅ only after
   in-game visual proof (else ◐). Update ROADMAP.md at the close of every unit of work.
+- WORKFLOW v2 (2026-07-01): agents NEVER run git — commits are Ken's own via Antigravity (ROADMAP close title =
+  suggested message); the watcher CI-gates reloads with fast selftests; significant diffs get cross-model peer
+  review (Codex ↔ Claude); read BACKLOG.md first (open work) — ROADMAP.md is verified history only; check
+  decisions.md (ADRs) during reconcile. Never read-modify-write through the sandbox mount — host file tools only.
 
 ## Frontier
 

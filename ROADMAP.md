@@ -1,5 +1,330 @@
 # X4 Neural Link + AI Influence Roadmap
 
+### #88 addendum — LIVE IN-GAME EVIDENCE (Ken flying, 2026-07-02) — accept/abort/activate/penalty ALL PROVEN; one open diagnostic
+- **PROVEN IN-GAME (debuglog + bridge + Ken's screen):** accept → `AIC contract ACCEPTED` → `ACTIVATED
+  jtype=patrol patrolsector=Second Contact II Flashpoint` (sector-by-name resolution WORKS) · abort →
+  `AIC contract ABORTED` + mission cleared + **trust −2 bridge / −0.02 in-game rep** (both layers agreed) ·
+  re-accept on a fresh job row · **Player2's escalation raise VISIBLE to the player** (patrol 232k→290k,
+  urgency 3→4 — Ken: "they increased the reward") · map hex-trail guidance to the unexplored target sector.
+- **DEFECT FOUND+FIXED live:** RML_Patrol.StartMission reads destination-entry elements {2}..{8} unguarded —
+  1-element entry threw 6 property errors and killed objective setup. Fixed with the full 8-element shape from
+  story_diplomacy_intro.xml:4614 `[sector, null, 0m, knownname, objective.patrol, 1min, 10min, null]`;
+  Forge-clean; fresh accept ran StartMission with ZERO errors.
+- **OPEN DIAGNOSTIC:** Ken reports no yellow objective line on our mission entry (vanilla missions show
+  "1: <objective>"). RML_FlyTo provably runs set_objective step=1 flyto object=sector (rml_flyto.xml:315) and
+  the fresh instance threw no errors. Awaiting Ken's popup screenshot to discriminate: (a) empty objectives =
+  attach failure; (b) "Undock" line = WORKING (rml_patrol.xml:301 gives docked players an undock objective
+  first); (c) flyto line = working, earlier look was the pre-fix instance.
+
+### #90 G5 repricing — FRAGO raises now reach the mission board (withdraw + re-offer) — ◐ in-game pending 2026-07-02
+- The Lua contract tracker stores the REWARD per job (was a bare `true`): a bridge-side FRAGO escalation raise
+  changes the offers-poll reward → the stale offer is withdrawn and re-offered at the new price in the same
+  tick (fresh briefing rides along). Player-visible consequence of Player2's escalation decisions.
+- NPC-claim withdrawal (G5 item) needs NO new code: a claimed job leaves the eligible-offers list → the
+  existing gone→withdraw path pulls it off the board; the accepted-mission guard (#85) protects the player's
+  own contract cue. Noted as covered.
+- VALIDATED: tracker semantics unit-proven (new→offer · same→silent · raise→withdraw+reoffer · gone→withdraw);
+  reprice path guards legacy `true` values from pre-update resident Lua; staged synced. ◐ in-game: see a board
+  offer's price jump after an escalation tick (/reloadui first).
+
+### #89 Abort-penalty policy moved store→router, failures now VISIBLE — ✅ 2026-07-02
+- Same-day fix of #85's worst-implementation pick: `memory.release_job` is again a PURE state transition
+  (returns issuing_faction); the trust -2 policy lives in `router.jobs_release`, and a FAILED penalty writes a
+  `policy_error` world event instead of `except: pass` (say/try/allowed/changed rule).
+- VALIDATED: live route returns the new shape (issuing_faction field — reload proven); penalty semantics
+  (player -2 / NPC no-ding) unit-proven pre-refactor, logic relocated unchanged; sandbox import blocked by
+  mount truncation (known gotcha, host authoritative).
+
+### #88 G4 PATROL SLICE — accepted contracts now run vanilla gameplay + pay out — ◐ in-game pending 2026-07-02
+- Implements the #87 prescription, patrol-first: OnAccepted → `signal_cue Activate` → `update_mission endtime
+  +4h` + target-sector resolution BY NAME (`find_sector` galaxy-wide + knownname match — DeadAir
+  dynamicwar.xml:649 shape; fallback offer-station's sector) → **`Patrol_Ref ref="md.RML_Patrol.Patrol"`**
+  (Destinations=[[sector]], Faction, EnemyFactions from the job row) — vanilla's own patrol engine runs our
+  contract. Late-binding note: RML params work because the subtree enables AFTER Activate's actions (the
+  $OfferCue timing lesson, inverted).
+- End stages vanilla-exact (gm_patrol:982-1073): `MissionEnded` RML feedback ≤0 → type="failed" + bridge
+  release(+penalty); success → `reward_player $reward` + `add_faction_relation +0.04 missioncompleted` +
+  `remove_mission type="completed"` + logbook + **new Lua ContractCompleted → POST /v1/job/complete** (vetted
+  treasury spend + trust +3, complete_job). `MissionTimeout` 4h → failed + release. Money coherent: in-game
+  payment = reward_player; treasury spend = bridge books the same committed reward.
+- Non-patrol types v1: activate with endtime+timeout only (no RML yet) — they recycle via timeout instead of
+  hanging forever. DEFERRED explicitly: escort/supply/bounty/recon RML handoffs (template after patrol proves
+  in-game); FactionRelations_Changed guard (rare edge; event shape needs grounding first).
+- **VALIDATED (cited):** Forge validate MD+Lua 0 structural / 0 unexpected / 0 missing Lua registers (staged
+  synced). ◐ IN-GAME PENDING (the G6 gate): /refreshmd + /reloadui → accept a PATROL contract → objective
+  arrow + kill/loiter progress from RML → complete → reward_player credits + rep + dashboard budget_spent.
+
+### #87 VANILLA MISSION PARITY AUDIT (Ken directive) — full overlap; G4 re-spec'd to hand off to vanilla RMLs — ✅ 2026-07-02
+- Deliverable: wiki [[vanilla-mission-parity-audit]] (linked in _index, READ BEFORE G4). Extracted the 7-stage
+  canonical skeleton from gm_escort + gm_patrol (identical): GENERATE → OFFER → BRIEFING → ACCEPT → ACTIVATE
+  (endtime + **RML library handoff** — vanilla splits mission FRAMING (gm_*) from GAMEPLAY (rml_*, ~60 libs)) →
+  GUARDS (abort/timeout/relations) → END (reward_player + RewardNotoriety + remove_mission type).
+- Type map: all SIX of our job types have a vanilla archetype AND a ready RML engine (patrol→RML_Patrol,
+  escort→RML_Escort/TargetShip=G4a's freighter, supply→RML_Deliver_Wares, bounty→RML_Destroy_Entities,
+  recon→RML_Scan, privateer→RML_Support_Invasion). Params map 1:1 from our job row.
+- Per-stage status: 1-4 ✅ (stage 4 reached vanilla parity in #84) · 5 ❌ (no endtime, no gameplay handoff) ·
+  6 ◐ (abort ✅ — now `remove_mission type="aborted"` for engine abort accounting, this entry's code change,
+  Forge-clean; timeout + relations guard ❌) · 7 ❌ (= G4). G4 re-spec'd in BACKLOG to the vanilla-exact shape;
+  patrol first, in-game verify, then template.
+- VALIDATED: skeleton/params read from Ken's own unpacked game files (gm_escort, gm_patrol, rml_patrol,
+  rml_escort); type="aborted" change Forge validate 0 structural; staged synced.
+
+### #86 FRAGO push MD half — situation changes now amend the player's LIVE contract — ◐ in-game pending 2026-07-02
+- Ken's priority-one task, unblocked by #84. EXTENDS the existing drain (no parallel channel): bridge
+  `contract_frago` actions (from #83) ride the influence-drain → Lua action rebuild now forwards
+  `job_id`/`summary` → new top-level MD `Frago_dispatch` cue matches the live mission cue via `Registry.$ByJob`
+  and applies `update_mission description="FRAGO — <summary>"` (kuertee shipping shape — engine accepts
+  name/description although the doc XSD lists only cue/duration) + show_notification "FRAGO from <faction> High
+  Command" + logbook entry.
+- Registry lifecycle reworked for targeting: entry KEPT on accept (was removed — FRAGO couldn't find the cue),
+  removed on abort/withdraw/cleanup instead; new `Reregister_on_load` child re-enters ACCEPTED instances after
+  the Registry cue's load-reset (2s delay dodges same-event ordering).
+- **VALIDATED (cited):** Forge validate 0 structural / 0 unexpected on MD+Lua (staged synced) · bridge
+  `contract_frago_selftest` **5/5** (stable; first-run-after-reload flake identified — the selftest swaps
+  router.memory globally while the background daemon ticks: harness defect, banked below) · sandbox unit:
+  pending→mark→new-frago sequence fires correctly. ◐ IN-GAME PENDING: fly a claimed contract, force an operation
+  frago, SEE the mission description change + notification (needs /refreshmd + /reloadui).
+- TOOL ITEM (CI-gate hardening): selftests must stop swapping `self.memory` globally — inject the store as a
+  parameter so background ticks can't race the temp store (first-run 4/5 flake).
+
+### #85 [AI TEST] force-war slice STRIPPED (+ every-load defect found) & abort now costs reputation — ◐ in-game pending 2026-07-02
+- **Strip (Ken order):** `[TEST] Declare war on me` wheel choice + ForceWar_handler removed from
+  ai_influence_conversation.xml; ai_influence_proving.xml stubbed (mount forbids deletes). **DEFECT found during
+  removal:** On_Force_War's condition was `md.Setup.Start` — it re-forced Alliance-of-the-Word→player to -1.0 on
+  EVERY GAME LOAD (matches Ken's logbook screenshot), not on hotkey press. The OPORD threat-forcer hotkey is
+  deliberately KEPT until D-cleanup (recent debug tooling, different family). RESIDUE: the live save still
+  carries the forced -1.0 alliance→player relation from the last load — restoring it is Ken's call ("was 0").
+- **Abort reputation (Ken order):** MD Aborted cue now applies `add_faction_relation -0.02
+  reason=missionfailed` (vanilla's completion-notoriety mechanism, gm_bringitems:1040, negated; no
+  missionaborted enum exists) + a "Contract abandoned" logbook entry. Bridge `release_job` dings trust -2 for
+  PLAYER claimants only (completion is +3), with audit summary, adjust OUTSIDE the non-reentrant lock.
+- **VALIDATED (cited):** Forge validate 0 structural/0 unexpected on all three MD files (after syncing the
+  DRIFTED staged workspace F:\DEV_ENV\projects\Mods\X4Mods — it was missing aic_contracts.xml entirely; Forge
+  fs reads staged-first) · sandbox unit: player claim→release → trust -2 + summary row; NPC release → unchanged.
+  ◐ IN-GAME PENDING: /refreshmd + /reloadui, then accept→abort → mission cleared + rep loss visible + "AIC
+  contract ABORTED" + job open on bridge.
+
+### #84 G3 accept→claim SOLVED (attempt 6) — mission offers are now REAL claimable missions — ✅ IN-GAME 2026-07-01
+- **ROOT CAUSES (three, all grounded):** (1) `event_offer_accepted` NEVER fires for modded `create_offer` offers —
+  proven by kuertee_emergent_missions_escort.xml:327's comment "event_offer_accepted doesn't work"; the engine
+  (menu_map.lua / menu_missionbriefing.lua) instead **signals the offer's ACTOR with param 'accept'**. All five
+  prior listener shapes were doomed regardless. (2) md.xsd makes the `cue` attr use="required" — attempt-3's bare
+  form was schema-illegal and never registered. (3) An accepted offer only enters the Mission Manager via
+  `<create_mission cue offercue/>` (gm_bringitems.xml:846) + `set_objective_from_briefing` — we never called it,
+  so accepted missions evaporated (Ken's report).
+- **BUILT:** `Accepted` = `<event_object_signalled object="$Client" param="'accept'"/>` + hasmissionoffer/
+  hasmission guards (kuertee's exact shape, lines 325-352) → shared `OnAccepted` library (create_mission,
+  set_objective_from_briefing, stat.missions_accepted, remove_offer, raise contract_claimed, registry cleanup);
+  `Accepted_offerevent` (static-sibling-name vanilla form) kept as guarded backup; Withdraw_contract now guards
+  `$accepted` (cancel_cue on an accepted cue killed the live mission); Cleanup_on_load uses parent-in-actions.
+- **VALIDATED (cited):** Forge validate = structurally clean (known single-file artifacts only) · debuglog
+  `AIC contract ACCEPTED job=job_28344c07fd` (game 302.29) · IN-GAME: mission entered Ken's Mission Manager
+  (he aborted it — proof it existed) · bridge `/api/jobs` → `status=claimed`. FULL CHAIN: board offer → Accept →
+  actor signal → MD → create_mission → Lua POST /v1/jobs/claim → DB row claimed. **G3 ✅. Unblocks G4/G5/G6 + #83 MD half.**
+- **ABORT SLICE (shipped with this, ◐ in-game pending):** `Aborted` cue (`event_mission_aborted`,
+  kuertee:436) → remove_mission (clears the lingering log entry Ken hit) + raise contract_aborted → new Lua
+  `ContractAborted` → new bridge `/v1/jobs/release` (claimed→open; announce-once UNIQUE collision → cancelled;
+  route-proven live: job_28344c07fd released ok:true). Needs /refreshmd + /reloadui + an accept-abort pass.
+- **Forge findings:** #8 validation missed XSD use="required" on event conditions; #9 `parent` keyword
+  false-positives as unresolved cue ref; (#4 offer-accept lint now has its ground truth: lint for
+  event_offer_accepted usage and suggest the actor-signal pattern.)
+- SMESC render fix ridealong (Ken screenshot): EXECUTION double main-effort/phasing deduped (only append
+  structured fields when the LLM scheme prose lacks them), "a escort"→"an escort" article fix in _human,
+  double-period kill. Sandbox unit both cases: 1× main effort, 1× phasing, clean grammar.
+
+### #75-G3 addendum 3 — accept-listener attempt 3 FAILED live; mechanism identified for attempt 4 — ◐ 2026-07-01
+- LIVE TEST (Ken accepted "Teladi Supply Contract" 100,000 Cr — sentence-case title + correct reward prove the
+  full current data path works): NO "AIC contract ACCEPTED" line, no claim POST. Three listener shapes now proven
+  dead (child cue="parent" · child cue="$OfferCue" · top-level bare <event_offer_accepted/>): the event does NOT
+  fire for our create_offer offers. ATTEMPT 4 must copy the gm libraries' REAL mechanism — acceptance arrives as
+  a cue SIGNAL with feedback ($ID == '$accepted_offer', gm_bringitems.xml:622) through lib_generic's CreateOffer
+  plumbing. Research lib_generic's accept chain FIRST; no fourth guess. (Forge finding #4 upgraded: an
+  offer-accept simulation/lint is now a three-failures-deep RC gap.)
+
+### #83 FRAGO push to ACTIVE contracts — bridge half ✅ verified 2026-07-01 (MD half = UI task, blocked by G3)
+- Ken's priority order. BUILT: `memory.pending_contract_fragos` (CLAIMED jobs linked to ops → frago reports newer
+  than the job's frago_ts marker) + `mark_contract_frago` (idempotence); `router.push_contract_fragos` → news
+  ping "FRAGO from <faction> High Command: <summary>" + `contract_frago` action {job_id, summary} into the drain
+  (actions channel — the MD half will route it to update_mission/set_objective on the live mission). Wired into
+  the decision_tick STRATEGIC tier + _drain_from_tick. Routes: /api/ops/contract_frago_selftest,
+  /api/ops/push_contract_fragos.
+- VALIDATED (cited): contract_frago_selftest **5/5** (quiet before frago · fires once for the claimed job with
+  correct news+action · idempotent · open jobs ignored · a NEW frago fires again). Regression: job_pricing 7/7,
+  decision_tick 4/4.
+- ◐ REMAINING (UI): MD handler in aic_contracts (On_action route for type=='contract_frago' → update the accepted
+  mission's objective text + comm ping) — rides after G3's accept→claim lands (needs a claimed mission to update).
+- ALSO BANKED this stretch: **/reloadui reloads Lua, /refreshmd reloads MD in-game (F11 chat)** — kills the
+  full-restart rule; LUAV=3 marker VERIFIED live (current Lua resident, task/briefing present in offer events).
+  Registry sequencing: quickload resets the MD dedupe registry, /reloadui resets the Lua tracker — to force a
+  full re-offer do BOTH (F5/F9 then /reloadui).
+
+### #82 Real sectors on every location job (kills "the operational area") — ✅ bridge-verified 2026-07-01
+- Ken-endorsed worst-implementation pick executed: `memory.resolve_job_sector` — precedence explicit (op/task) →
+  latest hostile_event sector involving the pair → the faction's most-attacked recent sector (all observed data,
+  nothing invented). Wired into route_task hire_contractors + the announce supply path (patrol path already
+  carried the real contested sector). MD `flyto` objective at the resolved sector rides G4.
+- VALIDATED: job_pricing_selftest **7/7** (3 new precedence checks); jobs_offers 8/8.
+
+### #81 Briefings in ENGLISH + font-safe (Ken screenshot review) — ✅ verified 2026-07-01
+- (a) "▯" artifacts = X4's UI font lacks em-dash/arrow glyphs → `_fontsafe` pass on all player-facing composer
+  output (ASCII only, typographic chars mapped, whitespace collapsed). (b) "intensity 1.0" telemetry → prose
+  buckets ("open war rages" / "heavy fighting continues" / "recurring skirmishes persist" / "tensions are
+  elevated"). (c) machine tokens (escort_supply_convoy) → `_human()` de-tokenizer on scheme/main-effort/phases;
+  "Phasing: Execute, then Assess, then Consolidate."
+- VALIDATED: jobs_offers_selftest **8/8** (new `fontsafe_ascii_no_tokens`); live compose reads: "Kha'ak forces
+  are hostile; open war rages. Expect armed contact." NIT for #65's upstream generator: "a escort" article
+  agreement (BACKLOG small).
+
+### #80 THREAT-SCALED CONTRACT PRICING (fixes flat-70k + reward-0 crawl) — ✅ verified 2026-07-01
+- KEN'S AUDIT: magnitude flowed hostile_event → conflict intensity → urgency → task priority, then DIED at the
+  cash register — OPORD_JOB_REWARDS was a static per-type table (every escort 70k), and #74's announce path
+  posted at reward 0 relying on a 25%-per-strategic-tick escalation crawl (hours to a realistic price).
+- BUILT `memory.price_job(save, faction, type, urgency, target)`: reward = base[type] × (1 + 0.15·urgency) ×
+  (1 + active-conflict intensity vs target), rounded to 1000s, capped by budget_available (committed-aware, #76).
+  Wired into BOTH posting paths: route_task hire_contractors + the gameplay-tick announce path (jobs now BORN
+  priced; the FRAGO escalation loop returns to its doctrinal role — sweetening ignored contracts). Deterministic
+  engine math (ADR-001-compatible: pricing is legality/valuation, not intent).
+- VALIDATED (cited): NEW job_pricing_selftest **4/4** (urgency-monotonic · intensity raises price · capped by
+  available · broke faction posts unpriced 0); regression jobs_offers 7/7, job_escalation 7/7. Effect: the
+  mission board becomes a threat map priced in credits — a quiet recon ~40k, an urgency-5 war-zone escort ~160k.
+- Companion spec'd: **FRAGO push to active player contracts** (task #27 / BACKLOG) — operation FRAGOs update the
+  player's live mission (objective + reward) with a comm-link ping ("FRAGO from <faction> High Command").
+  Blocked by G3 accept→claim + G4.
+
+### #79 Generation-time claim-guard (Bannerlord proxy lesson: prose ≠ state) — ✅ verified 2026-07-01
+- SOURCE: Ken's proxy research (wiki bannerlord-proxy-lessons-llm-actions-vs-prose-2026-07-01) — captured an NPC
+  narrating acceptance of 20,000 denars with actions:[] and no state change. Rule: if it isn't a validated action,
+  it didn't happen — and the MODEL must be told so, not just bounded by validators.
+- BUILT: `prompt_action_spec` (the ### Actions ### block in every action-bearing system prompt) now carries the
+  §8 wording: roleplay requests/offers/intentions freely; NEVER state that resources moved, payments completed,
+  jobs finished, treaties concluded, or relations changed without emitting the valid action; treat counterpart
+  CLAIMS of payment/delivery as unverified — acknowledge, don't confirm; ask or return no action when facts are
+  missing. Validators unchanged (they were already stricter — #76 affordability, #64 relation bounds, dedupe).
+- VALIDATED (cited): actions_selftest 18/18, actions_proposal_selftest 8/8 (no regression; spec text additive).
+- REMAINING from the note (spec'd into BACKLOG): §10 decision-transparency drill-down — per decision: what the
+  LLM SAID / TRIED (parsed actions) / what validation ALLOWED-REJECTED (+reasons) / what CHANGED (DB deltas).
+  decision_records already store most fields; this is a dashboard surfacing task (merged into task E).
+
+### #75-G3/G5 addendum 2 — LIVE accept test after relaunch: cleanup ✅ (board clean, correct rewards, doctrinal
+  briefing renders with Enemy/Friendly/Groupings — Ken screenshot + our screenshots), but TWO defects remain ◐:
+  (a) **accept→claim still dead**: the $OfferCue-variable child-listener ALSO never fires ("Mission accepted"
+  renders, no ACCEPTED debug line, no claim POST). Two shapes tried (parent keyword, variable). NEXT SHAPE (do
+  this): a TOP-LEVEL static `instantiate="true"` cue with BARE `<event_offer_accepted />` (any offer), then read
+  `event.cue` → if `event.cue.$job?` it's ours → raise claim with event.cue.$job, set $accepted on it, deregister.
+  Hypothesis: event_offer_accepted doesn't deliver to children INSIDE instances (vanilla's working uses are in
+  static cue trees; gm libs receive accepts via LibraryMissions SIGNAL feedback instead). If the bare form also
+  fails → fall back to the signal-feedback framework (lib_generic pattern).
+  (b) **Objectives box still shows the SMESC, not the element task** — bridge payload RULED OUT (live offers
+  carry task="Contractor element (you): …"); the break is Lua→MD ($d.$task nil at MD?) or the offers were built
+  by a pre-task Lua at relaunch. Diagnose with one debug_text of $d.$task? in Offer_contract.
+  FORGE FINDING (logged in Forge ROADMAP #4): an offer-accept-listener lint/simulation would have caught (a)
+  offline — two reload cycles spent on an event-delivery rule the validator can't see.
+
+### #78 (G3c) SMESC fidelity upgrade — doctrinal subparagraphs from LIVE data — ✅ bridge-verified 2026-07-01
+- Per Ken's doctrine assessment (CFJP 5.0 shape): SITUATION now carries **a. Enemy Forces** (conflict-ledger cause +
+  intensity, most-recent hostile_events activity, MDCOA fallback) / **b. Friendly Forces** (real combat-ship count
+  from the op's mission analysis + higher's intent) / **c. Constraints** (the op's actual constraints). MISSION
+  gains the WHEN and the CAF double-statement ("I say again"). EXECUTION renders the operation's REAL
+  **concept of operations** — scheme_of_manoeuvre + main_effort + phases from the #65 opord_json (generated since
+  #65, rendered to the player for the first time). SERVICE & SUPPORT gains the op's repair policy + salvage-rights
+  line. COMMAND & SIGNAL split into a. Command (authority, succession, FRAGO) / b. Signal (report via comm-link,
+  issuing rep as POC).
+- LIVE COMPOSE (active save, Ministry escort contract): "Enemy Forces: Xenon — active hostilities (relations at
+  war; intensity 1.0)" · "ministry has 603 combat ships available" · constraints "protect supply lines; protect
+  civilian traffic" — all real state, zero invention. jobs_offers_selftest **7/7**.
+- ◐ in-game render rides the next reload's fresh offers (same gate as #77).
+
+### #77 (G3b) Mission briefings ARE the orders — five-paragraph SMESC briefing per contract — ◐ bridge-verified 2026-07-01
+- KEN'S DIRECTION (screenshot: empty briefing + =ReadText1025-0=): the briefing must read like a military order —
+  the player is being cut into a WAR EFFORT, not taking odd jobs. Format anchored to his NATO/CAF doctrine doc
+  (five-paragraph SMESC).
+- BUILT: `router.compose_job_briefing` — 1.SITUATION (real op authorization, else live conflict-ledger cause,
+  else pressure fallback) · 2.MISSION (who/what/where/why, per job type) · 3.EXECUTION (**the linked operation's
+  REAL commander_intent + desired_end_state** when OPORD-linked; doctrine defaults otherwise; ROE line) ·
+  4.SERVICE & SUPPORT (reward committed from the faction treasury, released on proof — #76 money rules) ·
+  5.COMMAND & SIGNAL (issuing High Command, reporting, FRAGO warning). Deterministic composition (ADR-002 legal).
+  Wired: /v1/jobs/offers ships `briefing`; Lua passes it as the offer description + maps job_type →
+  missiontype.{fight|deliver|destroy|find} (kills the =ReadText1025-0= artifact).
+- VALIDATED (cited): jobs_offers_selftest **6/6** (new `briefing_five_paragraph_order`); LIVE compose on the
+  active save pulls the Ministry operation's actual intent ("Restore freedom of movement without triggering wider
+  war"). ✗→FIXED en route: a 100× reward regression (my "money is cents" theory was WRONG — one observation had
+  spawned a bad unit theory; corrected in the AAR: cast with `1Cr * N` = N credits, never multiply at the boundary).
+- AMENDED same session (Ken review of the in-game render — SMESC confirmed rendering, verbatim-CAF quality, two
+  format defects): (1) the OBJECTIVES box duplicated the SMESC — it must carry the ELEMENT'S TASK. Added doctrinal
+  task-verb tasking per job type (PATROL and SECURE / ESCORT / DELIVER / INTERDICT and DESTROY / FIND and DESTROY /
+  RECONNOITRE) rendered as "Contractor element (you): <TASK>. Report completion for payment." with matching
+  objective.{custom|deliver|destroy|find} actions; (2) EXECUTION gained "(a) Groupings and Tasks" (contractor
+  element vs faction local forces) + "(b) Coordinating instructions" per the CAF format. jobs_offers_selftest
+  **7/7** (new `objective_is_element_task` + Groupings check); live payload verified.
+- ◐ REMAINING: in-game render of briefing+task rides the NEXT reload's fresh offers (Lua reward revert included);
+  stale savegame offers at 700 Cr / 7,000,000 Cr need the G5 load-time cleanup. Verify: any NEW contract →
+  Open Briefing → five paragraphs incl. Groupings and Tasks; Objectives box shows ONLY the element task.
+
+### #76 CONTRACT MONEY IS REAL — committed-liability accounting, affordability gates, pocket-aware prompts, trust on completion — ✅ verified 2026-07-01
+- AUDIT (Ken's questions): (1) relationships were NOT affected by jobs — only agreements had consequences (NF3);
+  (2) faction budget = DERIVED capacity (owned stations × credit rate × production health) − spent; OPORD ops
+  reserve separately, but MARKET JOBS were neither reserved nor affordability-checked; (3) the 70k was drained
+  only at COMPLETION (complete_job → record_budget_spend) — **route_task hire_contractors POSTED flat 50–70k
+  rewards with NO treasury check: the money-printing path.**
+- FIXED: `jobs_committed` (SUM of open+claimed rewards = outstanding liabilities) + `budget_available`
+  (capacity − spent − committed) in memory; hire_contractors reward now capped at available (a broke faction
+  posts an UNPRICED job the escalation loop prices later); escalation raise headroom is committed-aware; the
+  Player2 escalation BRIEF now states the treasury outright ("your faction's own pocket — capacity/spent/
+  committed/available") per Ken's rule; complete_job now also builds TRUST (+3, attitude-only, ADR-005 legal —
+  factions remember who does their work); budget_list + dashboard panel gained Committed / Available columns.
+- VALIDATED (cited): job_escalation_selftest **7/7** (new `raise_gated_by_committed`: capacity below outstanding
+  commitments → raise option vanishes), jobs_offers_selftest **5/5** (new `completion_spends_and_trusts`:
+  spent += reward AND trust ≥ +3), route_decision 3/3. LIVE: budget_list shows 5 factions each carrying 70,000
+  committed against real capacity (ministry 1.0M cap → 930k available) — promises now visibly encumber treasuries.
+- STILL OPEN (G4): the PLAYER-side payout mirror on mission completion, and in-game faction REP on completion
+  (RewardNotoriety) — bridge trust is done, vanilla rep rides G4.
+
+### #75-G3 aic_contracts — offers LIVE ON SCREEN with correct rewards; accept→claim link is the one open item — ◐ 2026-07-01
+- ✅ SEEN IN-GAME (screenshots): the Mission Offers panel lists our job-market contracts next to vanilla missions —
+  PARANID ESCORT 70,000 Cr, TELADI SUPPLY 100,000 Cr (correct scale), grouped, with briefing panel (faction/reward/
+  difficulty/2h duration) and a working Accept button ("Mission accepted — PARANID ESCORT CONTRACT" rendered).
+  Zero MD errors in the debuglog on the final build.
+- BUILT: md/aic_contracts.xml (Registry dedupe table · Offer_contract instantiate on 'contract_offer' ui event:
+  find faction station → create_cue_actor client → create_offer with money reward → registry · Accepted child cue →
+  raise AIChat.contract_claimed · Withdraw_contract on 'contract_withdraw' → remove_offer + cancel + deregister);
+  aic_uix.lua PollContractOffers (econ tick %8==1, de-burst rule; new→offer, gone→withdraw; all early-returns log)
+  + ContractClaimed → POST /v1/jobs/claim. Bridge: player_eligible_jobs now excludes reward<=0 (unpriced jobs wait
+  for the FRAGO pricing loop — words≠resources).
+- FIXED EN ROUTE (2 reload iterations): (a) money type — Lua floats aren't money; **MD money is CENTS**, convert
+  credits*100 at the Lua boundary; (b) null-string attr hardening on title/desc.
+- ✗ OPEN (the ONE unproven link): `event_offer_accepted cue="parent"` inside the instance never fired on accept
+  (no "AIC contract ACCEPTED" debug line, no claim POST). NEXT SESSION: replace the child-cue pattern with
+  vanilla's proven shape — a SEPARATE listener cue watching a stored $OfferCue var (genericmissions.xml:704
+  ShowOffer `<event_offer_accepted cue="$OfferCue"/>`) — i.e. keep the offer cue in Registry.$ByJob and give
+  Accepted a top-level instantiate cue that matches via the registry. Validate: accept → debuglog ACCEPTED →
+  /api/jobs shows status=claimed claimant=player.
+- G5 NOTES BANKED (lifecycle): (a) savegame-persisted offer instances DUPLICATE on reload (Lua registry resets →
+  re-offers; old instances survive in the save at stale prices — e.g. 700 Cr pre-fix rows, one 7,000,000 Cr
+  double-scaled row) → on game load, cancel all prior Offer_contract instances and let the poll re-create fresh;
+  (b) offers expire naturally at duration ("Offer expired — ZYARTH…" observed) — expiry needs a claim-window
+  policy vs the job row; (c) desc cosmetic: money prints cents in strings (use formatted output or omit).
+### #75-G2 RESEARCH: vanilla mission-offer MD recipe — ✅ done 2026-07-01 (unblocks G3)
+- GROUNDED against unpacked vanilla md/: gm_patrol.xml + gm_largesupply.xml are EXACT analogs of our patrol/supply
+  jobs — parameterized `<library name="Start">` with RewardCr (exact credits, GenerateReward=false),
+  MissionDuration, Difficulty, OfferObject, Client (auto-created from ClientOwner), and **CancelOfferCue** (native
+  offer-withdrawal hook). Offers render via `<create_offer …><briefing/></create_offer>` (gm_bringitems.xml:553).
+  G3 design: bypass genericmissions.xml's random generator and `<cue ref="md.GM_Patrol.Start">` directly with
+  job-row params; claim on accept → /v1/jobs/claim; withdraw via CancelOfferCue when the job vanishes from
+  /v1/jobs/offers; FRAGO repricing = withdraw + re-offer; G4 payout = vanilla pays the player, bridge MIRRORS the
+  spend (complete_job + record_budget_spend) so game credits and faction ledger reconcile with no double-pay.
+- Full recipe + gotchas (cross-mod library refs vs Forge validation, version-pinned libraries):
+  `F:\StarForge\wiki\x4-neural-link\mission-offer-recipe.md` (linked in _index).
+
+### #75-G1 /v1/jobs/offers + /v1/jobs/claim (player claim-surface, bridge half) — ✅ verified 2026-07-01
+- BUILT: memory.player_eligible_jobs (open + visibility=public + standing gate trust > -50; NPC claimants do NOT
+  use this filter — ADR-003 two-surfaces), router.jobs_offers (Lua-pollable payload: job_id/type/faction+name/
+  sector/target/ware/reward/urgency/age/summary) + jobs_claim (FCFS via claim_job row lock). POST routes
+  /v1/jobs/offers, /v1/jobs/claim; selftest route /api/ops/jobs_offers_selftest.
+- VALIDATED (cited): jobs_offers_selftest **4/4** (public offered · direct hidden · hostile-faction hidden ·
+  claimed disappears); live route on the active save returned 4 real eligible contracts (holyorder escort 70k,
+  age 131s — #74's announce-once path is feeding the market); regression job_escalation 6/6. Host-side commit
+  rides the hourly committer (workflow v2).
+
 ### #75 MISSION OFFERS AS THE PLAYER CLAIM-SURFACE OVER market_jobs — SPEC'D 2026-07-01 (Ken decision)
 - DECISION (Ken, screenshots 2026-07-01): jobs are "technically missions" for the player. The universal work
   object is the market_jobs ROW (one listing, dedupe key, budget-backed reward); surfaces are per-actor APIs —
