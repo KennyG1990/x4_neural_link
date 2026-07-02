@@ -25,7 +25,13 @@ function Get-Sig {
 function Stop-Bridge {
   $conns = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
   foreach ($c in $conns) { try { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue } catch {} }
-  Start-Sleep -Milliseconds 500
+  # 2026-07-02 crash post-mortem: 500ms was not enough — the new python raced the old port teardown
+  # (WinError 10048) and DIED, leaving the bridge down. Wait until the port is actually free (up to 8s).
+  for ($w = 0; $w -lt 16; $w++) {
+    $still = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if (-not $still) { break }
+    Start-Sleep -Milliseconds 500
+  }
 }
 
 function Invoke-Reload([string]$why) {
@@ -38,9 +44,25 @@ function Invoke-Reload([string]$why) {
   }
   Stop-Bridge
   # Run the bridge directly from this folder (no deploy/copy). __file__-relative root.
-  Start-Process -FilePath "python" -ArgumentList "-m", "bridge.server" -WorkingDirectory $Root -WindowStyle Hidden
-  Start-Sleep -Seconds 2
-  for ($i = 0; $i -lt 12; $i++) {
+  # 2026-07-02: up to 2 start attempts — if health never appears (startup crash), try once more before
+  # giving up, and say so loudly either way.
+  $started = $false
+  foreach ($try in 1, 2) {
+    Start-Process -FilePath "python" -ArgumentList "-m", "bridge.server" -WorkingDirectory $Root -WindowStyle Hidden
+    Start-Sleep -Seconds 2
+    for ($h = 0; $h -lt 12; $h++) {
+      try { Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2 | Out-Null; $started = $true; break }
+      catch { Start-Sleep -Seconds 1 }
+    }
+    if ($started) { break }
+    Write-Host ("  start attempt {0} FAILED - retrying..." -f $try) -ForegroundColor Yellow
+    Stop-Bridge
+  }
+  if (-not $started) {
+    Write-Host "  BRIDGE DOWN - both start attempts failed. Manual attention needed." -ForegroundColor Red
+    return
+  }
+  for ($i = 0; $i -lt 1; $i++) {
     try {
       Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2 | Out-Null
       Write-Host ("  reloaded - BRIDGE UP @ {0}" -f (Get-Date -Format HH:mm:ss)) -ForegroundColor Green
@@ -84,7 +106,15 @@ while ($true) {
   Start-Sleep -Seconds 1
   $new = Get-Sig
   if ($new -ne $sig) {
-    Start-Sleep -Milliseconds 400   # debounce: let the editor finish writing
+    # 2026-07-02: STABLE-SIGNATURE debounce — agents edit several files seconds apart; reload only once the
+    # tree has been quiet for 2 consecutive checks (was a fixed 400ms, which raced multi-file edit bursts).
+    $stable = $new
+    for ($d = 0; $d -lt 20; $d++) {
+      Start-Sleep -Milliseconds 700
+      $probe = Get-Sig
+      if ($probe -eq $stable) { break }
+      $stable = $probe
+    }
     Invoke-Reload "change detected"
     $sig = Get-Sig
   }

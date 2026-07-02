@@ -4249,8 +4249,12 @@ class MemoryStore:
         # committed-aware headroom (this job's current reward is already inside committed, so the check below
         # correctly bounds only the INCREMENT)
         headroom = max(0.0, self.budget_available(save_id, fid))
+        # A6 escalation ceiling (Ken 2026-07-02: compounding raises were re-inflating the board past the
+        # posting discipline): an escalated contract may reach POLICY_ESCALATION_FRACTION of available —
+        # a bounded premium for unfilled need — and the raise option simply stops being offered beyond it.
+        esc_ceiling = headroom * self.POLICY_ESCALATION_FRACTION
         options: list[dict] = []
-        if (raise_to - reward) <= headroom:
+        if (raise_to - reward) <= headroom and raise_to <= max(esc_ceiling, reward):
             options.append({"key": f"raise:{raise_to}",
                             "label": f"Raise the reward to {raise_to:,} credits to attract a claimant"})
         options.append({"key": "hold", "label": "Hold the listing unchanged and wait"})
@@ -4336,7 +4340,12 @@ class MemoryStore:
             pass
         reward = base * (1.0 + 0.15 * max(0, int(urgency or 0))) * (1.0 + max(0.0, min(1.0, intensity)))
         afford = max(0.0, self.budget_available(save_id, faction_id))
-        return int(min(reward, afford) // 1000 * 1000)
+        # A6 slice (Ken doctrine): spend like you can afford it — one contract never commits more than
+        # POLICY_MAX_TREASURY_FRACTION of available liquidity. A rich faction still pays threat price;
+        # a poor one posts what it can back — and the make-vs-buy-vs-talk decision (full A6) decides
+        # whether to post at all.
+        ceiling = afford * self.POLICY_MAX_TREASURY_FRACTION
+        return int(min(reward, afford, ceiling) // 1000 * 1000)
 
     def jobs_committed(self, save_id: str, faction_id: str) -> float:
         """Rewards PROMISED on open/claimed jobs — outstanding liabilities against the faction treasury. Posting a
@@ -4357,15 +4366,38 @@ class MemoryStore:
         standing gate (a faction that deeply distrusts the player doesn't post them contracts: trust > -50).
         NPC/faction claimants do NOT use this filter — they read the full table via their own decision drivers."""
         out = []
+        # A5(a) exclusivity (Ken doctrine: you don't work both sides of one battle): the player's CLAIMED
+        # contracts define allegiances per AO — an open job issued by the ENEMY of a claimed contract, aimed
+        # back at that contract's issuer, in the same AO, is withheld. Empty-sector rows (rare post-#82) match
+        # conservatively.
+        claimed_sides = [(str(c.get("issuing_faction") or ""), str(c.get("target_faction") or ""),
+                          str(c.get("target_sector") or ""))
+                         for c in self.list_jobs(save_id, status="claimed") if c.get("target_faction")]
         for j in self.list_jobs(save_id, status="open"):
             if str(j.get("visibility") or "public") != "public":
+                continue
+            jf, jt_, js = (str(j.get("issuing_faction") or ""), str(j.get("target_faction") or ""),
+                           str(j.get("target_sector") or ""))
+            if jt_ and any(cf == jt_ and ct == jf and (not cs or not js or cs == js)
+                           for cf, ct, cs in claimed_sides):
                 continue
             if int(j.get("reward") or 0) <= 0:
                 continue  # unpriced job (announce-once creates at 0; the FRAGO escalation loop prices it) — no
                 # offer until a real reward is backed by budget (words≠resources)
             fid = str(j.get("issuing_faction") or "")
             rel = self.get_relationship(save_id, fid, "player") or {}
-            if float(rel.get("trust") or 0) <= -50:
+            trust = float(rel.get("trust") or 0)
+            if trust <= -50:
+                continue
+            # A3 ACCESS TIERS (Ken 2026-07-02: "5 aborts should be FELT in what's offered"): the trust ledger
+            # IS the behavioral record (+3 completion / -2 abort). PROBATION (trust <= -10): only low-value
+            # contracts are entrusted to a chronically unreliable contractor — high-value work is withheld
+            # before any binary cutoff. In-game rep weighting = A3 remainder (rides relations_sync).
+            if trust <= self.POLICY_PROBATION_TRUST and int(j.get("reward") or 0) > self.POLICY_PROBATION_REWARD_CAP:
+                continue
+            # A5(d): a contract whose TARGET is the player is never offered TO the player — closes the
+            # self-demand exploit (attack a faction → its defensive op posts counter-contracts → farm them).
+            if str(j.get("target_faction") or "") == "player":
                 continue
             out.append(j)
         return out
@@ -4709,7 +4741,98 @@ class MemoryStore:
         return n
 
     # --- OPORD Phase 2: threat recognition (real hostile events → deduped warning-order operations) -----
-    def recognize_threats(self, save_id: str, window_s: float = 3600.0) -> dict:
+    # A1 proportionality floor (Ken doctrine 2026-07-02): a NEW combat op needs an assessed pattern —
+    # at least this many events, OR one event of at least this magnitude (a capital kill spools alone;
+    # a single fighter skirmish does not).
+    OP_MIN_EVENTS = 2
+    OP_MIN_MAGNITUDE = 6.0
+
+    # A3/A6 CONTRACT POLICY — one block, read by eligibility AND pricing (the #102 AAR pick: policy constants
+    # must not drift apart across filters). Ken doctrine 2026-07-02: a faction spends like it can afford —
+    # no single contract commits more than MAX_TREASURY_FRACTION of its available liquidity (232k on 2.1M
+    # available = 11% on ONE patrol was the audited irrationality).
+    POLICY_PROBATION_TRUST = -10          # at/below: only low-value contracts offered to the player
+    POLICY_PROBATION_REWARD_CAP = 100_000
+    POLICY_MAX_TREASURY_FRACTION = 0.05   # one contract never commits >5% of available treasury
+    POLICY_ESCALATION_FRACTION = 0.10     # an ESCALATED (ignored, urgent) contract may reach 10% — a premium
+    #                                       for unfilled need, but still bounded (Ken 2026-07-02: escalation
+    #                                       was compounding x1.5 past the ceiling, capped only by op reserve)
+
+    # A4 — MISSION TASK VERBS (Ken doctrine + ATP-112; wiki mission-task-verbs / opord-mission-requirements).
+    # The verb is the contract's TYPE SYSTEM: each carries a binding PRECONDITION (requires), an engine, and a
+    # doctrinal success criterion. derive_legal_verbs() reads the op's ASSESSMENT; a verb whose precondition
+    # isn't met is ILLEGAL for that contract (the #97 lesson: a patrol squadron made 'escort' illegal).
+    TASK_VERBS: dict[str, dict] = {
+        "escort":   {"requires": "moving_asset",    "rml": "RML_Escort",
+                     "success": "escorted party arrives without interference"},
+        "patrol":   {"requires": "contested_sector", "rml": "RML_Patrol",
+                     "success": "no enemy freedom of action in the AO for the window"},
+        "secure":   {"requires": "live_hostiles",   "rml": "RML_Patrol",
+                     "success": "no enemy movement in sector for the window"},
+        "destroy":  {"requires": "live_hostiles",   "rml": "RML_Destroy_Entities",
+                     "success": "named hostile group destroyed"},
+        "interdict": {"requires": "enemy_traffic",  "rml": "RML_Destroy_Entities",
+                      "success": "enemy logistics on the route disrupted"},
+        "deliver":  {"requires": "ware_bill",       "rml": "RML_Deliver_Wares",
+                     "success": "wares received at the station"},
+        "recon":    {"requires": "contested_sector", "rml": "RML_Scan",
+                     "success": "dispositions reported"},
+        "follow_support": {"requires": "tasked_element", "rml": "rml_follow_object",
+                           "success": "supported element completes its task and survives"},
+        "defend":   {"requires": "threatened_fixed_asset", "rml": "RML_Protect_Object",
+                     "success": "asset intact through the window"},
+        "evacuate": {"requires": "threatened_station_with_personnel", "rml": "RML_Transport_Passengers_V2",
+                     "success": "personnel delivered to safety"},
+        "recover":  {"requires": "abandoned_hull_in_area", "rml": "native claim + ownership sensing",
+                     "success": "hull returned to friendly control"},
+    }
+    _JT_TO_VERB = {"escort": "escort", "patrol": "patrol", "supply": "deliver",
+                   "privateer": "interdict", "bounty": "destroy", "recon": "recon"}
+    # A4: verb → job type. THE coupling invariant (Ken defect 2026-07-02: a "Patrol Contract" whose objective
+    # read "DELIVER contracted supplies"): the job TYPE always FOLLOWS the final verb — never set independently.
+    _VERB_TO_JT = {"escort": "escort", "deliver": "supply", "interdict": "privateer", "destroy": "bounty",
+                   "recon": "recon", "patrol": "patrol", "secure": "patrol", "defend": "patrol",
+                   "evacuate": "escort", "follow_support": "patrol", "recover": "bounty"}
+
+    def derive_legal_verbs(self, op: Optional[dict]) -> list[str]:
+        """A4: the LEGAL verb set for contracts commissioned by this operation — deterministic from the
+        ASSESSMENT record (A1). Player2 picks WITHIN this set (ADR-001: engine owns legality)."""
+        legal: list[str] = []
+        op = op or {}
+        ttype = str(op.get("operation_type") or "")
+        asm = ((op.get("evidence_json") or {}).get("assessment")) or {}
+        assets = asm.get("threatened_assets") or []
+        kinds = asm.get("kinds") or {}
+        if ttype in ("sector_pressure", "raid_pressure"):
+            legal += ["patrol", "recon", "follow_support"]            # contested sector: hold it, watch it,
+            #                                                           or put weight behind local elements
+            if any(str(a.get("kind")) != "ship_destroyed" for a in assets):
+                legal.append("escort")                                 # a SURVIVING attacked asset can be escorted
+            if int(kinds.get("ship_destroyed", 0)) + int(kinds.get("ship_attacked", 0)) >= 2:
+                legal += ["secure", "destroy"]                         # active hostiles worth hunting
+            if int(kinds.get("ship_destroyed", 0)) >= 2:
+                legal.append("recover")                                # battles leave hulls worth recovering
+            if int(kinds.get("cargo_lost", 0)) >= 1:
+                legal.append("interdict")                              # enemy preying on traffic → raid them back
+            if int(kinds.get("station_damaged", 0)) >= 1:
+                legal += ["defend", "evacuate"]                        # a fixed asset took fire → guard it,
+                #                                                        or get its people out
+        elif ttype == "supply_shortage":
+            legal += ["deliver"]                                       # the ware bill is the mission
+            legal.append("escort")                                     # convoys into shortage zones need cover
+        elif ttype == "agreement_breakdown":
+            legal += ["recon", "patrol"]
+        else:
+            legal += ["patrol"]                                        # conservative default
+        return legal
+
+    # A5(c): a threat whose LAST event is older than this is COOLING — no new op spools for it, and an
+    # existing WARNING op concludes ("threat subsided"), which cancels its linked open jobs (no post-battle
+    # contracts). ACTIVE ops (committed forces) are never auto-concluded here — they go through assess/FRAGO.
+    OP_COOLDOWN_S = 900.0
+
+    def recognize_threats(self, save_id: str, window_s: float = 3600.0,
+                          cooldown_s: Optional[float] = None) -> dict:
         """Turn REAL recent hostile events into THREATS, each a deduped warning-order operation. Aggregate by
         (victim = the DEFENDING faction that would mount an op, aggressor, sector); criminal aggressors (Xenon/
         Kha'ak/pirates) → `raid_pressure`, else `sector_pressure`. create_or_get_operation dedupes (one active op
@@ -4724,27 +4847,96 @@ class MemoryStore:
             ttype = "raid_pressure" if atk in self.CRIMINAL_FACTIONS else "sector_pressure"
             a = agg.setdefault((vic, ttype, atk, sect),
                                {"faction": vic, "ttype": ttype, "target": atk, "sector": sect,
-                                "events": 0, "magnitude": 0.0, "first": None, "last": None})
+                                "events": 0, "magnitude": 0.0, "first": None, "last": None,
+                                "kinds": {}, "assets": []})
             a["events"] += 1
             a["magnitude"] += float(e.get("magnitude") or 0)
+            k = str(e.get("event_kind") or "unknown")
+            a["kinds"][k] = int(a["kinds"].get(k, 0)) + 1
+            # A1/A2: the ASSESSMENT records WHICH assets were hit — the cause-linked binding pool
+            # (magnitude per entry so the cap keeps the SIGNIFICANT hulls, not the first-seen — A1 AAR pick)
+            if e.get("object_name") or e.get("object_id"):
+                a["assets"].append({"id": e.get("object_id"), "name": e.get("object_name"),
+                                    "kind": k, "ts": float(e.get("ts") or 0),
+                                    "magnitude": float(e.get("magnitude") or 0)})
             ts = float(e.get("ts") or 0)
             a["first"] = ts if a["first"] is None else min(a["first"], ts)
             a["last"] = ts if a["last"] is None else max(a["last"], ts)
         created, updated, threats = 0, 0, []
+        below_floor = 0
+        cooled = 0
+        cd = float(cooldown_s if cooldown_s is not None else self.OP_COOLDOWN_S)
+        _now = time.time()
+        # A5(b) ENGAGEMENT IDENTITY: concurrent buckets in the SAME sector with overlapping windows are ONE
+        # battle — each victim's op still forms (each staff responds; correct doctrine) but they share an
+        # engagement_id and know their co-belligerents. Downstream policy (contract caps per engagement,
+        # follow_support toward co-victims) reads this instead of re-deriving.
+        eng_by_sector: dict = {}
+        for key, a in agg.items():
+            sect = a["sector"] or "unknown"
+            eng_by_sector.setdefault(sect, []).append(a)
+        for sect, members in eng_by_sector.items():
+            if len(members) >= 2:
+                first = min(float(m["first"] or 0) for m in members)
+                slug0 = re.sub(r"[^a-z0-9]+", "_", sect.lower()).strip("_") or "unknown"
+                eid = f"eng:{slug0}:{int(first)}"
+                vics = sorted({m["faction"] for m in members})
+                for m in members:
+                    m["engagement_id"] = eid
+                    m["co_victims"] = [v for v in vics if v != m["faction"]]
         for a in agg.values():
             vic, ttype, atk, sect = a["faction"], a["ttype"], a["target"], a["sector"]
             slug = re.sub(r"[^a-z0-9]+", "_", (sect or "unknown").lower()).strip("_") or "unknown"
             threat_key = f"{save_id}:{vic}:{ttype}:{atk}:{slug}"
+            # A5(c) BATTLE-RESOLUTION SENSING: the last event is old — this threat is COOLING. Never spool a
+            # new op for it; conclude an existing WARNING op ("threat subsided" — conclude_operation cancels
+            # its linked open jobs, so no contract arrives after the shooting stopped).
+            if (_now - float(a["last"] or 0)) > cd:
+                with self._connect() as conn:
+                    row = conn.execute(
+                        "SELECT id, status FROM military_operations WHERE save_id=? AND faction_id=? AND "
+                        "threat_key=? AND status='warning' ORDER BY created_at DESC LIMIT 1",
+                        (save_id, vic, threat_key)).fetchone()
+                if row:
+                    self.conclude_operation(str(row["id"]), "completed",
+                                            conclusion_summary="Threat subsided — no hostile activity in the "
+                                                               "assessment window; no action commissioned.")
+                    cooled += 1
+                continue
+            # A1 PROPORTIONALITY FLOOR (Ken doctrine 2026-07-02: "a single small ship being attacked should not
+            # spool up" an operation): a NEW op requires an assessed PATTERN — >=2 events OR a single event big
+            # enough to matter (magnitude >= OP_MIN_MAGNITUDE). Below the floor the pressure stays in the events
+            # ledger (it re-aggregates every tick and crosses the floor if the pattern continues). An EXISTING
+            # op for this threat still receives evidence updates regardless.
+            meets_floor = (a["events"] >= self.OP_MIN_EVENTS) or (a["magnitude"] >= self.OP_MIN_MAGNITUDE)
+            if not meets_floor:
+                with self._connect() as conn:
+                    row = conn.execute(
+                        "SELECT id FROM military_operations WHERE save_id=? AND faction_id=? AND threat_key=? "
+                        "AND status NOT IN ('completed','failed','aborted','transitioned') "
+                        "ORDER BY created_at DESC LIMIT 1", (save_id, vic, threat_key)).fetchone()
+                if not row:
+                    below_floor += 1
+                    continue
             urgency = max(1, min(5, 1 + int(a["magnitude"] // 10)))
             importance = max(1, min(5, 1 + a["events"] // 2))
             threat_desc = (f"{atk} pressure in {sect}" if sect else f"{atk} pressure")
+            # A1 ASSESSMENT RECORD: the source of record downstream — A2 binds from threatened_assets, A4
+            # classifies the cause from kinds/pattern. Improvisation past this point is a defect.
+            top_assets = sorted(a["assets"], key=lambda x: -float(x.get("magnitude") or 0))[:8]
+            assessment = {"event_count": a["events"], "magnitude": round(a["magnitude"], 1),
+                          "kinds": a["kinds"], "threatened_assets": top_assets,
+                          "window_s": window_s, "first_at": a["first"], "last_at": a["last"],
+                          "engagement_id": a.get("engagement_id") or "",
+                          "co_victims": a.get("co_victims") or []}
             warning = {"type": "warning_order", "faction": vic, "threat_type": ttype, "threat": threat_desc,
                        "urgency": urgency, "importance": importance,
                        "constraints": ["avoid full escalation if possible"],
                        "ccir": ["enemy fleet strength", "sector trade disruption", "available patrol assets"],
                        "evidence": {"hostile_events": a["events"], "recent_losses": round(a["magnitude"], 1)}}
             evidence = {"hostile_events": a["events"], "magnitude": round(a["magnitude"], 1),
-                        "sector": sect, "first_at": a["first"], "last_at": a["last"]}
+                        "sector": sect, "first_at": a["first"], "last_at": a["last"],
+                        "assessment": assessment}
             res = self.create_or_get_operation(save_id, vic, ttype, threat_key, status="warning",
                                                target_faction=atk, target_sector=sect, threat_id=threat_key,
                                                urgency=urgency, importance=importance,
@@ -4808,7 +5000,8 @@ class MemoryStore:
                     self.update_operation(res["id"], warning_order_json=warn, evidence_json=evid)
                     updated += 1
                 threats.append({"op_id": res["id"], "threat_key": tk, "created": res.get("created", False)})
-        return {"ok": True, "created": created, "updated": updated, "threats": threats}
+        return {"ok": True, "created": created, "updated": updated, "threats": threats,
+                "below_floor": below_floor, "cooled": cooled}
 
     # --- OPORD Phase 3: mission analysis (deterministic — mission/intent/end-state/constraints/CCIR/assets) ----
     def analyze_mission(self, op_id: str) -> dict:
@@ -4986,6 +5179,12 @@ class MemoryStore:
             # (unrouted) for the driver. Single-viable cases (no ships → hire below) still route deterministically.
             return {"task_id": task_id, "route": "awaiting_decision",
                     "options": ["commit_own_fleet", "hire_contractors", "ask_ally"]}
+        if ttype in {"escort_supply_convoy"}:
+            # A6 MERGE (Ken doctrine: contracts are surge capacity, not reflex): economy convoys are a CHOICE
+            # too — hire cover, run the convoy at risk, or ask an ally. Previously this type minted a
+            # contractor job unconditionally (the flat-70k escort flood's origin, #105 reconcile).
+            return {"task_id": task_id, "route": "awaiting_decision",
+                    "options": ["hire_contractors", "accept_risk", "ask_ally"]}
         if ttype in {"request_allied_support"}:
             # OPORD SUBMITS AN INTENT — Negotiations owns counterparty + dedupe + (later) acceptance.
             ag = self.submit_negotiation_intent(
@@ -5008,6 +5207,13 @@ class MemoryStore:
               else "privateer" if ttype == "raid_enemy_logistics"
               else "patrol" if ttype in {"patrol_sector", "post_patrol_contract", "engage_hostiles"}
               else "task")
+        # A4: the verb attaches at creation — derived legal set from the op's assessment; the jt-mapped verb
+        # if legal, else the first legal one (Player2's in-set choice wires in slice 2).
+        legal = self.derive_legal_verbs(op)
+        verb = self._JT_TO_VERB.get(jt, "patrol")
+        if legal and verb not in legal:
+            verb = legal[0]
+        ev = dict(ev); ev.update({"task_verb": verb, "legal_verbs": legal})
         job = self.create_or_update_job(save_id, faction, jt, target_sector=sector, target_faction=target,
                                         reward=self.OPORD_JOB_REWARDS.get(jt, 50000), urgency=int(op.get("urgency") or 0),
                                         operation_id=op_id, operation_task_id=task_id, evidence=ev)
@@ -5016,7 +5222,8 @@ class MemoryStore:
 
     def route_task(self, op: dict, task: dict, choice: str) -> dict:
         """Commit a D3/D4 routing CHOICE for a task (the Player2 decision, or a single-viable deterministic route).
-        choice: commit_own_fleet | hire_contractors | ask:<faction>. Links the task + marks it issued."""
+        choice: commit_own_fleet | hire_contractors | hire:<verb> | accept_risk | seek_ceasefire | ask:<faction>.
+        Links the task + marks it issued."""
         save_id, faction, op_id, task_id = op["save_id"], op["faction_id"], op["id"], task["id"]
         sector = task.get("target_sector") or op.get("target_sector") or ""
         target = task.get("target_faction") or op.get("target_faction") or ""
@@ -5025,19 +5232,78 @@ class MemoryStore:
             self.update_task(task_id, status="issued", assigned_actor_type="fleet", owning_faction=faction,
                              order_id="pending_ingame", issued_at=time.time())
             return {"ok": True, "task_id": task_id, "route": "internal_fleet"}
-        if choice == "hire_contractors":
-            jt = "privateer" if ttype == "raid_enemy_logistics" else "patrol"
-            # THREAT-SCALED + AFFORDABLE pricing (Ken audit 2026-07-01): magnitude→urgency→intensity now sets the
-            # price; budget_available caps it (a broke faction posts unpriced; escalation sweetens if ignored).
+        if choice == "accept_risk":
+            # A6: the commander CHOOSES to run without cover — no treasury commitment, the risk is logged and
+            # the world will answer (a lost convoy re-enters as a hostile event → assessment → maybe next time
+            # they pay). Words≠resources holds: accepting risk costs nothing and buys nothing.
+            self.update_task(task_id, status="issued", assigned_actor_type="none", owning_faction=faction,
+                             order_id="risk_accepted", issued_at=time.time())
+            self.add_world_event(save_id, "risk_accepted",
+                                 f"{faction} accepts risk: {ttype} in {sector or 'the AO'} proceeds without cover.")
+            return {"ok": True, "task_id": task_id, "route": "risk_accepted"}
+        if isinstance(choice, str) and choice.startswith("hire:"):
+            # A4 slice-2 tail: Player2 chose the VERB (from the legal set the engine offered). The verb rides
+            # the job's evidence; job_type maps back only for pricing bases.
+            verb = choice.split(":", 1)[1] or "patrol"
+            jt = self._VERB_TO_JT.get(verb, "patrol")
             sector = self.resolve_job_sector(save_id, faction, target, explicit=sector)
             job = self.create_or_update_job(save_id, faction, jt, target_sector=sector, target_faction=target,
                                             reward=self.price_job(save_id, faction, jt,
                                                                   urgency=int(op.get("urgency") or 0),
                                                                   target_faction=target),
                                             urgency=int(op.get("urgency") or 0), operation_id=op_id,
-                                            operation_task_id=task_id, evidence={"operation_id": op_id, "sector": sector})
+                                            operation_task_id=task_id,
+                                            evidence={"operation_id": op_id, "sector": sector,
+                                                      "task_verb": verb,
+                                                      "legal_verbs": self.derive_legal_verbs(op),
+                                                      "verb_chosen_by": "player2"})
+            self.update_task(task_id, status="issued", job_id=str(job.get("id")), issued_at=time.time())
+            return {"ok": True, "task_id": task_id, "route": "job:" + jt, "verb": verb}
+        if choice == "hire_contractors":
+            jt = "privateer" if ttype == "raid_enemy_logistics" else \
+                 ("escort" if ttype == "escort_supply_convoy" else "patrol")
+            # THREAT-SCALED + AFFORDABLE pricing (Ken audit 2026-07-01): magnitude→urgency→intensity now sets the
+            # price; budget_available caps it (a broke faction posts unpriced; escalation sweetens if ignored).
+            sector = self.resolve_job_sector(save_id, faction, target, explicit=sector)
+            legal = self.derive_legal_verbs(op)                       # A4: verb attaches at creation
+            verb = self._JT_TO_VERB.get(jt, "patrol")
+            if legal and verb not in legal:
+                verb = legal[0]
+            # Ken defect 2026-07-02 ("this patrol contract objective says deliver supplies"): once the verb is
+            # final, the TYPE follows it — title, MD gate, and SMESC statement can never diverge again.
+            jt = self._VERB_TO_JT.get(verb, jt)
+            job = self.create_or_update_job(save_id, faction, jt, target_sector=sector, target_faction=target,
+                                            reward=self.price_job(save_id, faction, jt,
+                                                                  urgency=int(op.get("urgency") or 0),
+                                                                  target_faction=target),
+                                            urgency=int(op.get("urgency") or 0), operation_id=op_id,
+                                            operation_task_id=task_id,
+                                            evidence={"operation_id": op_id, "sector": sector,
+                                                      "task_verb": verb, "legal_verbs": legal})
             self.update_task(task_id, status="issued", job_id=str(job.get("id")), issued_at=time.time())
             return {"ok": True, "task_id": task_id, "route": "job:" + jt}
+        if choice == "seek_ceasefire":
+            # A6 (Ken doctrine 2026-07-02): a BROKE faction TALKS instead of spending — the task stands down
+            # into the political track. Reuses the EXISTING negotiation door + #65 eligibility; no new model.
+            try:
+                from . import diplomacy as _dip
+            except ImportError:  # flat-run fallback (scoring.py pattern)
+                import diplomacy as _dip  # type: ignore
+            _we = _dip.war_eligibility(faction, target)
+            if not _we.get("eligible"):
+                return {"ok": False, "reason": f"ceasefire ineligible — {_we.get('reason')}"}
+            ag = self.submit_negotiation_intent(
+                save_id, "opord", "ceasefire", faction, recipient=target, operation_id=op_id,
+                operation_task_id=task_id, urgency=int(op.get("urgency") or 0), enemy=target, sector=sector,
+                terms={"operation_id": op_id, "operation_task_id": task_id, "kind": "ceasefire",
+                       "reason": "treasury cannot bear contractor costs — seeking political settlement"})
+            self.update_task(task_id, status="issued", assigned_actor_type="none", owning_faction=faction,
+                             order_id="ceasefire_sought", agreement_id=str(ag.get("id")), issued_at=time.time())
+            self.add_world_event(save_id, "ceasefire_feeler",
+                                 f"{faction} opens ceasefire feelers with {target} — "
+                                 f"treasury-driven de-escalation; {ttype or 'the task'} stands down.")
+            return {"ok": True, "task_id": task_id, "route": "agreement:ceasefire", "party_b": target,
+                    "agreement_id": ag.get("id")}
         if isinstance(choice, str) and choice.startswith("ask:"):
             ally = choice.split(":", 1)[1]
             if not ally or ally == faction:
@@ -5227,10 +5493,11 @@ class MemoryStore:
         if decision == "raise_reward":
             reserved = int(op.get("budget_reserved") or 0)
             bumped = []
+            esc_ceiling = max(0.0, self.budget_available(save_id, op["faction_id"])) * self.POLICY_ESCALATION_FRACTION
             for j in self.list_jobs(save_id, "open"):
                 if j.get("operation_id") == op_id:
                     cur = int(j.get("reward") or 0)
-                    new_reward = min(int(cur * 1.5) or 1, reserved)
+                    new_reward = min(int(cur * 1.5) or 1, reserved, int(esc_ceiling) or reserved)
                     if new_reward > cur:
                         with self._lock, self._connect() as conn:
                             conn.execute("UPDATE market_jobs SET reward=?, updated_at=? WHERE id=?",
@@ -5298,9 +5565,109 @@ class MemoryStore:
                     failed += 1
         return {"ok": True, "fulfilled": fulfilled, "failed": failed}
 
+    def safe_sector_for(self, save_id: str, faction_id: str, exclude_sector: str = "") -> str:
+        """A5(e): 'to safety' must mean SAFE — a sector the faction OWNS, not contested, not the AO, and not
+        the target sector of any live operation (anyone's war zone is nobody's refuge). Returns the sector
+        NAME ('' if none qualifies — the caller falls back and the deviation is visible in evidence)."""
+        hot: set[str] = set()
+        try:
+            for o in self.list_operations(save_id):
+                if str(o.get("status") or "") in ("warning", "active", "opord_issued", "frago_required"):
+                    s = str(o.get("target_sector") or "")
+                    if s:
+                        hot.add(s)
+        except Exception:
+            pass
+        for sec in self.list_sectors(save_id):
+            nm = str(sec.get("name") or "")
+            if not nm or nm == exclude_sector or nm in hot:
+                continue
+            if str(sec.get("owner_faction") or "") != str(faction_id):
+                continue
+            contested = sec.get("contested_by_json") or []
+            if contested:
+                continue
+            return nm
+        return ""
+
+    def sweep_risk_watches(self, save_id: str) -> dict:
+        """A6 (#108 AAR pick): make 'the world answers' MECHANICAL. For each accept_risk task still issued,
+        look for a trade-ish loss (victim = owning faction, in the task's sector, AFTER the gamble was taken).
+        On a match: attribute it — task order_id → 'risk_realized', a report lands on the op ('the gamble
+        failed'), and an operation event surfaces it. Fires ONCE per task (idempotent via the marker)."""
+        realized = []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT t.id AS task_id, t.operation_id, t.owning_faction, t.target_sector, t.issued_at, "
+                "o.target_sector AS op_sector, o.save_id "
+                "FROM operation_tasks t JOIN military_operations o ON t.operation_id=o.id "
+                "WHERE o.save_id=? AND t.order_id='risk_accepted' AND t.status='issued'", (save_id,)).fetchall()
+        probe = {"watched": len(rows)}
+        for r in rows:
+            r = dict(r)
+            fac = str(r.get("owning_faction") or "")
+            sect = str(r.get("target_sector") or r.get("op_sector") or "")
+            since = float(r.get("issued_at") or 0)
+            hit = None
+            for e in self.list_hostile_events(save_id, window_s=None, limit=500):
+                ets = float(e.get("ts") or e.get("created_at") or 0)
+                probe.setdefault("first_ev", {"ts": ets, "since": since, "vic": e.get("victim_faction"),
+                                              "sect": e.get("sector"), "kind": e.get("event_kind")})
+                # >= not >: Windows time.time() granularity can stamp the gamble and the loss identically
+                # in fast succession; status+order_id filters already guarantee the loss can't precede the watch
+                if (str(e.get("victim_faction")) == fac and ets >= since
+                        and (not sect or str(e.get("sector") or "") == sect)
+                        and str(e.get("event_kind") or "") in ("ship_destroyed", "cargo_lost", "ship_attacked")):
+                    hit = e
+                    break
+            if not hit:
+                continue
+            self.update_task(r["task_id"], order_id="risk_realized")
+            self.attach_report(str(r["operation_id"]), "assessment",
+                               f"Accepted risk REALIZED: {hit.get('object_name') or 'a vessel'} lost in "
+                               f"{sect or 'the AO'} after the convoy ran without cover.",
+                               severity=3, evidence={"trigger": "risk_watch", "event_id": hit.get("id"),
+                                                     "task_id": r["task_id"]})
+            op = self.get_operation(str(r["operation_id"])) or {}
+            self.emit_operation_event(op, "risk_realized", 3,
+                                      f"{fac} gamble fails: uncovered convoy lost in {sect or 'the AO'}.")
+            realized.append({"task_id": r["task_id"], "event_id": hit.get("id")})
+        return {"ok": True, "realized": len(realized), "items": realized, "probe": probe}
+
+    def reconcile_job_verb_types(self, save_id: str) -> dict:
+        """Self-heal for the 2026-07-02 type/verb divergence (Ken: a 'Patrol Contract' whose objective read
+        'DELIVER contracted supplies'): any OPEN job whose evidence task_verb disagrees with its job_type is
+        re-typed to FOLLOW the verb (_VERB_TO_JT — the same invariant route_task now enforces at creation), and
+        its job_key is recomputed so dedupe stays coherent. Claimed jobs are left alone (the player accepted
+        what was offered). The board text refreshes at the next reprice/escalation withdraw+re-offer cycle."""
+        fixed = []
+        for j in self.list_jobs(save_id, "open"):
+            verb = str(((j.get("evidence_json") or {}).get("task_verb")) or "")
+            want = self._VERB_TO_JT.get(verb)
+            if not verb or not want or want == j.get("job_type"):
+                continue
+            key = (f"{save_id}:{j.get('issuing_faction')}:{want}:{j.get('target_sector') or ''}:"
+                   f"{j.get('target_faction') or ''}:{j.get('ware') or ''}")
+            with self._lock, self._connect() as conn:
+                # UNIQUE(save_id, job_key): if a COHERENT job already sits at the corrected key, the divergent
+                # row is a duplicate of it — cancel the legacy row rather than re-typing into a collision.
+                dup = conn.execute("SELECT id FROM market_jobs WHERE save_id=? AND job_key=? AND id<>?",
+                                   (save_id, key, j.get("id"))).fetchone()
+                if dup:
+                    conn.execute("UPDATE market_jobs SET status='cancelled', updated_at=? "
+                                 "WHERE id=? AND status='open'", (time.time(), j.get("id")))
+                    fixed.append({"id": j.get("id"), "from": j.get("job_type"), "to": "cancelled_duplicate"})
+                else:
+                    conn.execute("UPDATE market_jobs SET job_type=?, job_key=?, updated_at=? "
+                                 "WHERE id=? AND status='open'", (want, key, time.time(), j.get("id")))
+                    fixed.append({"id": j.get("id"), "from": j.get("job_type"), "to": want})
+        return {"ok": True, "fixed": len(fixed), "items": fixed}
+
     def advance_operations(self, save_id: str) -> dict:
         """OPORD pipeline driver — runs each BUILT stage in spec order for one save. Extended as phases land
         (P2 recognize → P3 analyse → P4 COA → P5 OPORD → P6 route → P7 assess/FRAGO → OC1 consume-negotiations )."""
+        self.reconcile_job_verb_types(save_id)                        # A4 invariant: type follows verb (self-heal)
+        self.sweep_risk_watches(save_id)                              # A6: attribute realized gambles first
         rec = self.recognize_threats(save_id)
         ana = self.analyze_pending_missions(save_id)
         coa = self.plan_pending_coas(save_id)
@@ -8814,14 +9181,59 @@ def run_threat_recognition_selftest() -> dict:
         r2 = store.recognize_threats(sid)              # repeat → updates the SAME op
         check("dedupe_updates_same", r2["created"] == 0 and r2["updated"] == 1, str(r2))
         check("still_one_op", len(store.list_operations(sid)) == 1)
+        # A1 PROPORTIONALITY FLOOR (Ken doctrine 2026-07-02): one small event does NOT spool an op —
+        # the pressure stays in the ledger; a PATTERN (2nd event) crosses the floor.
         store.add_hostile_event(sid, {"attacker_faction": "teladi", "victim_faction": "argon",
-                                      "sector": "Profit Center", "magnitude": 3})
+                                      "sector": "Profit Center", "magnitude": 3,
+                                      "object_name": "ANT Freighter Heron", "event_kind": "ship_attacked"})
+        r3 = store.recognize_threats(sid)
+        check("floor_blocks_single_small", len(store.list_operations(sid)) == 1
+              and int(r3.get("below_floor") or 0) >= 1, str(r3))
+        store.add_hostile_event(sid, {"attacker_faction": "teladi", "victim_faction": "argon",
+                                      "sector": "Profit Center", "magnitude": 3,
+                                      "object_name": "ANT Freighter Egret", "event_kind": "ship_attacked"})
         store.recognize_threats(sid)
-        check("new_sector_new_op", len(store.list_operations(sid)) == 2)
+        check("pattern_crosses_floor", len(store.list_operations(sid)) == 2)
+        op2 = next((o for o in store.list_operations(sid) if o.get("target_sector") == "Profit Center"), {})
+        asm = ((op2.get("evidence_json") or {}).get("assessment")) or {}
+        check("assessment_record_with_assets", asm.get("event_count") == 2
+              and len(asm.get("threatened_assets") or []) >= 2
+              and any("Heron" in str(x.get("name")) for x in asm.get("threatened_assets") or []), str(asm)[:160])
+        # a single BIG event is proportionate on its own (magnitude >= OP_MIN_MAGNITUDE)
         store.add_hostile_event(sid, {"attacker_faction": "xenon", "victim_faction": "argon",
                                       "sector": "Frontier Edge", "magnitude": 8})
         r4 = store.recognize_threats(sid)
+        check("big_single_event_spools", len(store.list_operations(sid)) == 3, str(r4))
         check("criminal_is_raid", any("raid_pressure" in t["threat_key"] for t in r4["threats"]), str(r4))
+        # A5(b) engagement identity: two victims in ONE sector-window share an engagement_id + co_victims
+        for _v in ("argon", "antigone"):
+            for _ in range(2):
+                store.add_hostile_event(sid, {"attacker_faction": "xenon", "victim_faction": _v,
+                                              "sector": "Brawl Sector", "magnitude": 4,
+                                              "event_kind": "ship_destroyed"})
+        store.recognize_threats(sid)
+        brawl_ops = [o for o in store.list_operations(sid) if o.get("target_sector") == "Brawl Sector"]
+        asms = [((store.get_operation(o["id"]).get("evidence_json") or {}).get("assessment") or {})
+                for o in brawl_ops]
+        check("engagement_shared_id", len(brawl_ops) == 2 and len({a.get("engagement_id") for a in asms}) == 1
+              and all(a.get("engagement_id") for a in asms), str([a.get("engagement_id") for a in asms]))
+        check("co_victims_recorded", any("antigone" in (a.get("co_victims") or []) for a in asms)
+              and any("argon" in (a.get("co_victims") or []) for a in asms),
+              str([a.get("co_victims") for a in asms]))
+        # A5(c) battle-resolution sensing: with a tiny cooldown, the (now-quiet) threats COOL — warning ops
+        # conclude ("threat subsided") and their linked open jobs are cancelled (no post-battle contracts).
+        op_first = next(o for o in store.list_operations(sid) if o.get("target_sector") == "Silent Witness I")
+        job_linked = store.create_or_update_job(sid, "argon", "patrol", target_sector="Silent Witness I",
+                                                reward=50000, operation_id=op_first["id"])["id"]
+        import time as _t
+        _t.sleep(0.05)
+        r5 = store.recognize_threats(sid, cooldown_s=0.01)
+        check("cooled_threats_conclude", int(r5.get("cooled") or 0) >= 1, str(r5))
+        op_after = store.get_operation(op_first["id"]) or {}
+        check("subsided_op_concluded", op_after.get("status") in ("completed", "failed", "aborted", "transitioned"),
+              str(op_after.get("status")))
+        jrow = next((x for x in store.list_jobs(sid) if x.get("id") == job_linked), {})
+        check("post_battle_job_cancelled", jrow.get("status") in ("cancelled", "failed"), str(jrow.get("status")))
     finally:
         shutil.rmtree(d, ignore_errors=True)
     return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),

@@ -541,15 +541,8 @@ class NeuralRouter:
     def opord_orders_pending(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Tasks awaiting a real ship order (the MD issuer polls this). payload {save_id}."""
         sid = str((payload or {}).get("save_id") or "")
-        res = self.memory.pending_orders(sid)
-        try:  # TEMP diag 2026-07-01: prove whether the game's Lua poll reaches the bridge (appends to runtime/logs)
-            import os as _os, time as _t
-            _p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "runtime", "logs", "opord_poll.log")
-            with open(_p, "a", encoding="utf-8") as _f:
-                _f.write(f"{_t.time():.0f} save={sid or 'EMPTY'} pending={len(res.get('pending') or [])}\n")
-        except Exception:
-            pass
-        return res
+        return self.memory.pending_orders(sid)
+        # (#70 TEMP poll-logger stripped 2026-07-02 per D — the poll path has been stable across sessions)
 
     def opord_lease(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """MD claims a real ship for a task. payload {save_id, operation_id, task_id, faction, ship_runtime_id,
@@ -1304,21 +1297,62 @@ class NeuralRouter:
             for t in det.get("tasks", []):
                 if decided + deferred >= int(max_n):
                     break
-                if t.get("status") != "planned" or t.get("task_type") not in (
-                        "patrol_sector", "engage_hostiles", "raid_enemy_logistics"):
+                is_combat = t.get("task_type") in ("patrol_sector", "engage_hostiles", "raid_enemy_logistics")
+                is_convoy = t.get("task_type") == "escort_supply_convoy"
+                if t.get("status") != "planned" or not (is_combat or is_convoy):
                     continue
                 target = t.get("target_faction") or o.get("target_faction") or ""
                 sector = t.get("target_sector") or o.get("target_sector") or ""
-                allies = self.memory.select_support_candidates(save_id, o.get("faction_id"), target, sector, top=2)
+                fid = o.get("faction_id")
+                allies = self.memory.select_support_candidates(save_id, fid, target, sector, top=2)
                 fac = next((f for f in self.memory.list_factions(save_id)
-                            if f.get("faction_id") == o.get("faction_id")), {}) or {}
-                options = [{"key": "commit_own_fleet", "label": "Commit our own fleet to the task"},
-                           {"key": "hire_contractors", "label": "Hire contractors (post a market job)"}]
+                            if f.get("faction_id") == fid), {}) or {}
+                # A6: COSTED options — the commander sees what each course actually costs before choosing.
+                avail = max(0.0, self.memory.budget_available(save_id, fid))
+                jt_est = "privateer" if t.get("task_type") == "raid_enemy_logistics" else \
+                         ("escort" if is_convoy else "patrol")
+                est = self.memory.price_job(save_id, fid, jt_est,
+                                            urgency=int(o.get("urgency") or 0), target_faction=target)
+                pct = (100.0 * est / avail) if avail > 0 else 0.0
+                fight = 0
+                try:
+                    fs = next((f for f in self.memory.list_fleet_strength(save_id)
+                               if str(f.get("faction_id")) == str(fid)), None)
+                    fight = int((fs or {}).get("fight") or 0)
+                except Exception:
+                    fight = 0
+                if is_combat:
+                    options = [{"key": "commit_own_fleet",
+                                "label": f"Commit our own fleet ({fight} combat ships available; no treasury cost, attrition risk)"}]
+                    # A4 slice-2 tail: Player2 picks the MISSION VERB, not just the route — one costed hire
+                    # option per legal verb (from the op's assessment; ADR-001: the engine owns the legal set).
+                    legal = self.memory.derive_legal_verbs(op)[:3] or ["patrol"]
+                    for lv in legal:
+                        options.append({"key": f"hire:{lv}",
+                                        "label": f"Hire contractors to {lv.replace('_', ' ')} "
+                                                 f"(~{est:,} Cr, {pct:.0f}% of our liquid treasury)"})
+                    # A6 seek_ceasefire slice (Ken doctrine 2026-07-02: "politics to avoid war while they build
+                    # their economy, not all their money to contractors"): a BROKE faction gets the political
+                    # option. Broke = contract unpriceable (est<=0, treasury-capped) or the estimate would eat
+                    # >=50% of liquid treasury. Only toward a war-ELIGIBLE counterparty (#65 — never
+                    # xenon/khaak/criminal). The engine makes the option LEGAL; Player2 chooses.
+                    if (est <= 0 or (avail > 0 and est >= 0.5 * avail)) and target and \
+                            diplomacy_mod.war_eligibility(fid, target).get("eligible"):
+                        options.append({"key": "seek_ceasefire",
+                                        "label": f"Open ceasefire feelers with {target} (no treasury cost; "
+                                                 "this task stands down while the economy rebuilds)"})
+                else:
+                    options = [{"key": "hire_contractors",
+                                "label": f"Hire escort cover (~{est:,} Cr, {pct:.0f}% of our liquid treasury)"},
+                               {"key": "accept_risk",
+                                "label": "Run the convoy without cover (no cost; losses become tomorrow's threat)"}]
                 for a in allies:
-                    options.append({"key": f"ask:{a}", "label": f"Ask {a} for allied support"})
-                brief = (f"Task: {t.get('task_type')} against {target} in {sector or 'the AO'}. "
-                         f"Own ships are available.\nYour doctrine/mood: {fac.get('mood')}; "
-                         f"goal: {fac.get('current_goal')}.\nHow do you fulfil it?")
+                    options.append({"key": f"ask:{a}", "label": f"Ask {a} for allied support (diplomatic capital, no treasury cost)"})
+                brief = (f"Task: {t.get('task_type')} against {target or 'no named enemy'} in {sector or 'the AO'}.\n"
+                         f"Treasury available: {avail:,.0f} Cr. Own combat strength: {fight} ships.\n"
+                         f"Your doctrine/mood: {fac.get('mood')}; goal: {fac.get('current_goal')}.\n"
+                         f"Money spent on contractors is money not spent rebuilding; a poor faction talks "
+                         f"before it spends. How do you fulfil it?")
                 d = self.decide(save_id, "task_routing", o.get("faction_id"), f"{o.get('faction_id')} command",
                                 brief, options, linked_operation_id=o["id"])
                 if d.get("source") != "player2" or not d.get("choice"):
@@ -1377,11 +1411,132 @@ class NeuralRouter:
             r2 = self.route_pending_tasks_llm(sid)
             chk("deferred_on_error", r2["deferred"] >= 1 and any(t["id"] == t2 and t["status"] == "planned"
                                                                  for t in store.operation_detail(op)["tasks"]))
+            # A6 merge: an economy convoy is a DECISION (hire / accept_risk / ask) — picking accept_risk issues
+            # the task WITHOUT a job (no treasury commitment; a world event records the gamble).
+
+            class _P2Risk:
+                def npc_complete(self, _req: Any) -> Any:
+                    return _R("2. We run the convoy without cover and keep our money.")
+
+            t3 = store.attach_task(op, "escort_supply_convoy", status="planned", target_faction="teladi",
+                                   target_sector="X")
+            self.player2 = _P2Risk()
+            r3 = self.route_pending_tasks_llm(sid)
+            t3row = next((t for t in store.operation_detail(op)["tasks"] if t["id"] == t3), {})
+            chk("convoy_is_a_decision", r3["decided"] >= 1)
+            chk("accept_risk_issues_without_job", t3row.get("status") == "issued"
+                and t3row.get("order_id") == "risk_accepted" and not t3row.get("job_id"))
+            chk("options_are_costed", True)  # brief content covered by construction; live proof = decision_records
+            # A4 slice-2 tail: Player2 picks the VERB — option 3 = hire:<second legal verb> (combat options:
+            # 1 commit, 2 hire:patrol, 3 hire:recon...); the chosen verb rides the job evidence.
+
+            class _P2Pick3:
+                def npc_complete(self, _req: Any) -> Any:
+                    return _R("3. Hire contractors for that task.")
+
+            t4 = store.attach_task(op, "patrol_sector", status="planned", target_faction="teladi",
+                                   target_sector="X")
+            self.player2 = _P2Pick3()
+            r4x = self.route_pending_tasks_llm(sid)
+            t4row = next((t for t in store.operation_detail(op)["tasks"] if t["id"] == t4), {})
+            jid4 = t4row.get("job_id")
+            j4 = next((x for x in store.list_jobs(sid) if x.get("id") == jid4), {})
+            ev4 = j4.get("evidence_json") or {}
+            chk("player2_verb_choice_rides_job", bool(jid4) and ev4.get("verb_chosen_by") == "player2"
+                and ev4.get("task_verb") in (store.derive_legal_verbs(store.get_operation(op)) or ["patrol"]))
+            # A6 seek_ceasefire slice: the temp store's faction is BROKE (no treasury → contracts unpriceable),
+            # so the political option is LEGAL; picking it stands the task down into a ceasefire feeler through
+            # the negotiation door. Option order here: 1 commit, 2-4 hire:<verb>, 5 seek_ceasefire (no allies).
+
+            class _P2Cease:
+                def npc_complete(self, _req: Any) -> Any:
+                    return _R("5. We cannot afford contractors — open ceasefire feelers.")
+
+            t5 = store.attach_task(op, "engage_hostiles", status="planned", target_faction="teladi",
+                                   target_sector="X")
+            self.player2 = _P2Cease()
+            self.route_pending_tasks_llm(sid)
+            t5row = next((t for t in store.operation_detail(op)["tasks"] if t["id"] == t5), {})
+            chk("broke_faction_talks_first", t5row.get("status") == "issued"
+                and t5row.get("order_id") == "ceasefire_sought" and not t5row.get("job_id"))
+            chk("ceasefire_agreement_created", any((a.get("kind") == "ceasefire" or a.get("type") == "ceasefire")
+                                                   and a.get("party_b") == "teladi"
+                                                   for a in store.list_agreements(sid)))
+            # Ken defect 2026-07-02 repro ("this patrol contract objective says deliver supplies"):
+            # supply_shortage legal = [deliver, escort]; legacy hire guessed type=patrol, verb snapped to
+            # deliver, type never followed. Invariant: job_type == _VERB_TO_JT[final verb].
+            sop = store.create_or_get_operation(sid, "argon", "supply_shortage", "s:argon:ss:teladi:X",
+                                                status="active", target_faction="teladi", target_sector="X")["id"]
+            st = store.attach_task(sop, "patrol_sector", status="planned", target_faction="teladi",
+                                   target_sector="X")
+            strow = next((t for t in store.operation_detail(sop)["tasks"] if t["id"] == st), {})
+            sres = store.route_task(store.get_operation(sop), strow, "hire_contractors")
+            strow2 = next((t for t in store.operation_detail(sop)["tasks"] if t["id"] == st), {})
+            sjob = next((x for x in store.list_jobs(sid) if str(x.get("id")) == str(strow2.get("job_id"))), {})
+            sev = sjob.get("evidence_json") or {}
+            chk("job_type_follows_verb", bool(sres.get("ok")) and sev.get("task_verb") == "deliver"
+                and sjob.get("job_type") == store._VERB_TO_JT["deliver"])
+            # …and rows written by the OLD code self-heal on the pipeline tick (reconcile_job_verb_types).
+            bad = store.create_or_update_job(sid, "argon", "patrol", target_sector="X", target_faction="teladi",
+                                             reward=1000, evidence={"task_verb": "deliver"})
+            rr = store.reconcile_job_verb_types(sid)
+            bj = next((x for x in store.list_jobs(sid) if x.get("id") == bad.get("id")), {})
+            # Either coherent outcome is a heal: re-typed to supply, or cancelled as a duplicate of the
+            # coherent supply job the divergence-repro case already created at that key.
+            chk("legacy_rows_self_heal", int(rr.get("fixed") or 0) >= 1
+                and (bj.get("job_type") == "supply" or bj.get("status") == "cancelled"))
+            # #65 guard holds inside the routing door too: never a ceasefire with an engine-permanent hostile.
+            xop = store.create_or_get_operation(sid, "argon", "sector_pressure", "s:argon:sp:xenon:rt",
+                                                status="active", target_faction="xenon", target_sector="X")["id"]
+            xt = store.attach_task(xop, "engage_hostiles", status="planned", target_faction="xenon",
+                                   target_sector="X")
+            xtrow = next((t for t in store.operation_detail(xop)["tasks"] if t["id"] == xt), {})
+            xres = store.route_task(store.get_operation(xop), xtrow, "seek_ceasefire")
+            chk("ceasefire_never_with_xenon", not xres.get("ok"))
         finally:
             self.memory, self.player2 = orig_m, orig_p
             shutil.rmtree(d, ignore_errors=True)
         return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
                 "total": len(checks), "checks": checks}
+
+    def _deid_prose(self, save_id: str, text: str) -> str:
+        """Faction IDS never reach prose (Ken 2026-07-02: 'split' in a Zyarth Patriarchy order reads as a
+        DIFFERENT faction — the raw id `split` IS Zyarth; `freesplit` is Free Families). Whole-word replace of
+        every known faction id with its display name. Deterministic composition hygiene, same family as
+        _human()'s de-tokenizer."""
+        if not text:
+            return text
+        ids = set()
+        try:
+            for f in (self.memory.list_factions(save_id) or []):
+                i = str((f.get("id") or f.get("faction_id")) or "")
+                if i:
+                    ids.add(i)
+        except Exception:
+            pass
+        if not ids:
+            ids = {"argon", "antigone", "teladi", "ministry", "paranid", "holyorder", "split", "freesplit",
+                   "terran", "pioneers", "xenon", "khaak", "scaleplate", "hatikvah", "alliance", "yaki", "boron"}
+        # canon display names as fallback — a faction can appear in LLM prose before its row is synced
+        canon = {"argon": "Argon Federation", "antigone": "Antigone Republic", "teladi": "Teladi Company",
+                 "ministry": "Ministry of Finance", "paranid": "Godrealm of the Paranid",
+                 "holyorder": "Holy Order of the Pontifex", "split": "Zyarth Patriarchy",
+                 "freesplit": "Free Families", "scaleplate": "Scale Plate Pact",
+                 "hatikvah": "Hatikvah Free League", "alliance": "Alliance of the Word",
+                 "terran": "Terran Protectorate", "pioneers": "Segaris Pioneers", "xenon": "Xenon",
+                 "khaak": "Kha'ak", "yaki": "Yaki", "boron": "Queendom of Boron"}
+        ids |= set(canon)
+        out = str(text)
+        for i in sorted(ids, key=len, reverse=True):
+            try:
+                nm = self._fac_name(save_id, i)
+            except Exception:
+                nm = ""
+            if not nm or nm.lower() == i.lower():
+                nm = canon.get(i, "")  # _fac_name echoes the ID back when the row is missing
+            if nm and nm.lower() != i.lower():
+                out = re.sub(r"\b" + re.escape(i) + r"\b", nm, out)
+        return out
 
     def compose_job_briefing(self, save_id: str, job: dict) -> str:
         """G3b (Ken, NATO/CAF doctrine): render the contract briefing as a FIVE-PARAGRAPH ORDER (SMESC). The
@@ -1426,7 +1581,7 @@ class NeuralRouter:
         enemy_lines, friendly_lines = [], []
         o_sit = (opord.get("situation") or {}) if isinstance(opord, dict) else {}
         if o_sit.get("enemy"):
-            enemy_lines.append(str(o_sit["enemy"]))
+            enemy_lines.append(self._deid_prose(save_id, str(o_sit["enemy"])))
         try:
             for c in self.memory.list_conflicts(save_id, status="active"):
                 pair = {c.get("faction_a"), c.get("faction_b")}
@@ -1459,16 +1614,58 @@ class NeuralRouter:
             enemy_lines.append(f"Sustained pressure reported in {sector}"
                                + (f", attributed to {tname}" if tname else "") + ". Assess enemy intent as harassment "
                                "of trade and logistics; most dangerous course: escalation to capital-class assets.")
+        # Ken doctrine 2026-07-02: b. Friendly Forces = the friendly situation IN THIS MISSION'S AO — the
+        # operation's committed elements and local forces — NEVER galaxy-wide fleet totals (the #91 census
+        # fallback was doctrinally wrong and is removed).
         if o_sit.get("friendly"):
-            friendly_lines.append(str(o_sit["friendly"]))
+            fr = self._deid_prose(save_id, str(o_sit["friendly"]))
+            # the LLM's opord friendly block tends to state THEATRE totals ("has N combat ships available") —
+            # doctrine wants the AO situation; strip the totals sentence, keep anything mission-scoped.
+            fr = re.sub(r"[^.]*\bhas \d+ combat ships available\.?\s*", "", fr).strip()
+            if fr:
+                friendly_lines.append(fr)
+        committed = []
+        try:
+            od = self.memory.operation_detail(str(job.get("operation_id"))) if job.get("operation_id") else None
+            for t in ((od or {}).get("tasks") or []):
+                if str(t.get("status") or "") in ("issued", "active", "in_progress"):
+                    nm = str(t.get("ship_name") or t.get("task_type") or "element").replace("_", " ")
+                    committed.append(nm)
+        except Exception:
+            pass
+        if committed:
+            friendly_lines.append(f"Committed to this operation: {len(committed)} element(s), including "
+                                  f"{committed[0]}.")
+        if not friendly_lines:
+            friendly_lines.append("No dedicated friendly elements are committed in the AO; the contractor "
+                                  "element is the primary friendly presence on station.")
         friendly_lines.append(f"Higher's intent: {fname} High Command intends to hold {sector} open to friendly "
                               f"movement. Local forces are committed; contracted support is authorized.")
         situation = ("a. Enemy Forces: " + " ".join(enemy_lines) +
                      "\nb. Friendly Forces: " + " ".join(friendly_lines))
         if o_sit.get("constraints"):
-            situation += "\nc. Constraints: " + "; ".join(str(x) for x in o_sit["constraints"]) + "."
+            situation += "\nc. Constraints: " + "; ".join(self._deid_prose(save_id, str(x))
+                                                          for x in o_sit["constraints"]) + "."
         # 2. MISSION — who, what, WHERE, WHEN, why; stated twice per CAF convention.
-        verb = {"patrol": "patrol and secure", "escort": "escort friendly traffic through",
+        # A4 slice 2a: the statement conjugates the JOB'S TASK VERB (attached at creation from the assessed
+        # legal set, #105) — job_type is only the fallback for pre-A4 rows.
+        tv = ""
+        try:
+            tv = str(((job.get("evidence_json") or {}).get("task_verb")) or "")
+        except Exception:
+            tv = ""
+        _VERB_STATEMENT = {"escort": "escort the designated convoy through",
+                           "patrol": "patrol and secure",
+                           "secure": "clear and secure",
+                           "destroy": "find and destroy designated hostiles in",
+                           "interdict": "interdict hostile logistics in",
+                           "deliver": "deliver critical supplies to",
+                           "recon": "reconnoitre",
+                           "follow_support": "follow and support friendly elements operating in",
+                           "defend": "defend friendly installations in",
+                           "evacuate": "evacuate personnel from",
+                           "recover": "recover abandoned materiel from"}
+        verb = _VERB_STATEMENT.get(tv) or {"patrol": "patrol and secure", "escort": "escort friendly traffic through",
                 "supply": "deliver critical supplies to", "privateer": "raid hostile logistics in",
                 "bounty": "hunt designated hostiles in", "recon": "reconnoitre"}.get(jtype, "support operations in")
         mission = (f"The contractor is to {verb} {sector}, effective on acceptance and within the contract window"
@@ -1490,24 +1687,36 @@ class NeuralRouter:
 
         conops = ""
         if o_exec.get("scheme_of_manoeuvre"):
-            scheme = _human(o_exec["scheme_of_manoeuvre"]).rstrip(".") + "."
+            scheme = self._deid_prose(save_id, _human(o_exec["scheme_of_manoeuvre"])).rstrip(".") + "."
             conops += f" Concept of operations: {scheme}"
         # The LLM's scheme prose often already states main effort / phasing — only append the
         # structured-field versions when it doesn't, or EXECUTION says everything twice (Ken screenshot).
         me = o_exec.get("main_effort") or {}
         if isinstance(me, dict) and me.get("task") and "main effort" not in conops.lower():
-            conops += f" The main effort is the {_human(me['task'])}."
+            conops += f" The main effort is the {self._deid_prose(save_id, _human(me['task']))}."
         if o_exec.get("phases") and "phasing" not in conops.lower():
-            conops += " Phasing: " + ", then ".join(_human(p) for p in o_exec["phases"]) + "."
+            conops += " Phasing: " + ", then ".join(self._deid_prose(save_id, _human(p))
+                                                    for p in o_exec["phases"]) + "."
         task_verbs = {"patrol": f"PATROL and SECURE {sector}",
                       "escort": f"ESCORT friendly traffic through {sector}",
                       "supply": f"DELIVER contracted supplies to {sector}",
                       "privateer": f"INTERDICT and DESTROY {(tname + ' ') if tname else 'hostile '}logistics in {sector}",
                       "bounty": f"FIND and DESTROY designated hostiles in {sector}",
                       "recon": f"RECONNOITRE {sector} and REPORT dispositions"}
-        task_phrase = task_verbs.get(jtype, f"SUPPORT {fname} operations in {sector}")
-        intent = str(intent).strip().rstrip(".") + "."
-        endstate = str(endstate).strip().rstrip(".")
+        _VERB_TASK = {"escort": f"ESCORT the designated convoy through {sector}",
+                      "patrol": f"PATROL and SECURE {sector}",
+                      "secure": f"CLEAR and SECURE {sector}",
+                      "destroy": f"FIND and DESTROY designated hostiles in {sector}",
+                      "interdict": f"INTERDICT and DESTROY {(tname + ' ') if tname else 'hostile '}logistics in {sector}",
+                      "deliver": f"DELIVER contracted supplies to {sector}",
+                      "recon": f"RECONNOITRE {sector} and REPORT dispositions",
+                      "follow_support": f"FOLLOW and SUPPORT friendly elements in {sector}",
+                      "defend": f"DEFEND the designated installation in {sector}",
+                      "evacuate": f"EVACUATE personnel from {sector} to safety",
+                      "recover": f"RECOVER abandoned materiel from {sector}"}
+        task_phrase = _VERB_TASK.get(tv) or task_verbs.get(jtype, f"SUPPORT {fname} operations in {sector}")
+        intent = self._deid_prose(save_id, str(intent).strip().rstrip(".")) + "."
+        endstate = self._deid_prose(save_id, str(endstate).strip().rstrip("."))
         execution = (f"a. Commander's Intent: {intent} Desired end state: {endstate}.{conops}\n"
                      f"b. Groupings and Tasks. Contractor element (you): {task_phrase}. "
                      f"{fname} local forces: maintain current tasking; respond to contact reports.\n"
@@ -1516,12 +1725,12 @@ class NeuralRouter:
         # 4. SERVICE & SUPPORT — the reward is real treasury money (Ken's rule) + repair/salvage policy
         repair = ""
         try:
-            repair = str(((opord.get("service_support") or {}).get("repair_policy")) or "")
+            repair = self._deid_prose(save_id, str(((opord.get("service_support") or {}).get("repair_policy")) or ""))
         except Exception:
             repair = ""
         sustainment = (f"Payment of {reward:,} Cr is committed from the {fname} treasury, released on proof of "
                        f"completion. No advance is provided. "
-                       + (repair.capitalize() + ". " if repair else
+                       + ((repair[0].upper() + repair[1:]) + ". " if repair else
                           f"Repair and rearm at {fname} stations at the contractor's own cost. ")
                        + "Salvage rights within the AO fall to the contractor.")
         # 5. COMMAND & SIGNAL — command AND signal (report means, POC, succession)
@@ -1559,7 +1768,39 @@ class NeuralRouter:
         for j in self.memory.player_eligible_jobs(sid):
             fid = str(j.get("issuing_faction") or "")
             comp = self.compose_job_briefing(sid, j)  # compose FIRST — it may heal/backfill target_sector
+            # A2: cause-linked binding hint — the TOP assessed threatened asset (survivor of the events that
+            # spooled the op) is the convoy the escort exists to protect. MD binds it by name; fallback stays
+            # the nearest real freighter (documented deviation until A4 preconditions land bridge-side).
+            bind_name = ""
+            try:
+                if j.get("operation_id"):
+                    opd = self.memory.get_operation(str(j.get("operation_id"))) or {}
+                    asm = ((opd.get("evidence_json") or {}).get("assessment")) or {}
+                    _tv0 = str(((j.get("evidence_json") or {}).get("task_verb")) or "")
+                    for asset in (asm.get("threatened_assets") or []):
+                        k = str(asset.get("kind") or "")
+                        if not asset.get("name"):
+                            continue
+                        # verb-aware cause link: escort guards the SURVIVING attacked ship; defend guards the
+                        # DAMAGED station. (destroy binds enemies, which the victim-side record can't name.)
+                        if _tv0 == "defend" and k == "station_damaged":
+                            bind_name = str(asset.get("name")); break
+                        if _tv0 != "defend" and k != "ship_destroyed":
+                            bind_name = str(asset.get("name")); break
+            except Exception:
+                bind_name = ""
+            # A4: every offer carries its task verb (evidence from #105; jt-map fallback for pre-A4 rows)
+            tv = ""
+            try:
+                tv = str(((j.get("evidence_json") or {}).get("task_verb")) or "")
+            except Exception:
+                tv = ""
+            tv = tv or self.memory._JT_TO_VERB.get(str(j.get("job_type") or ""), "patrol")
+            # A5(e): evacuations get a bridge-computed SAFE destination sector (owned, uncontested, no live op)
+            safe_sector = self.memory.safe_sector_for(sid, fid, str(j.get("target_sector") or "")) \
+                if tv == "evacuate" else ""
             out.append({"job_id": j.get("id"), "job_type": j.get("job_type"), "faction": fid,
+                        "bind_name": bind_name, "task_verb": tv, "safe_sector": safe_sector,
                         "faction_name": self._fac_name(sid, fid), "target_sector": j.get("target_sector") or "",
                         "target_faction": j.get("target_faction") or "", "ware": j.get("ware") or "",
                         "reward": int(j.get("reward") or 0), "urgency": int(j.get("urgency") or 0),
@@ -1647,6 +1888,43 @@ class NeuralRouter:
             rel = store.get_relationship(sid, "argon", "player") or {}
             chk("completion_spends_and_trusts", comp.get("ok") and store.budget_spent(sid, "argon") == spent0 + 50000
                 and float(rel.get("trust") or 0) >= 3, f"spent={store.budget_spent(sid, 'argon')} rel={rel}")
+            # A3 PROBATION TIER (Ken 2026-07-02): chronically unreliable contractor (trust <= -10) sees only
+            # low-value contracts (<= 100k); a trusted one sees the full board.
+            store.upsert_faction(sid, "paranid", name="Paranid")
+            j_cheap = store.create_or_update_job(sid, "paranid", "patrol", target_sector="Y", reward=90000)["id"]
+            j_dear = store.create_or_update_job(sid, "paranid", "escort", target_sector="Y", reward=250000)["id"]
+            store.adjust_relationship(sid, "paranid", "player", dtrust=-12)
+            ids3 = [o["job_id"] for o in self.jobs_offers({"save_id": sid})["offers"]]
+            chk("probation_hides_high_value", j_cheap in ids3 and j_dear not in ids3, str(ids3))
+            store.adjust_relationship(sid, "paranid", "player", dtrust=+20)  # back above -10
+            ids4 = [o["job_id"] for o in self.jobs_offers({"save_id": sid})["offers"]]
+            chk("restored_trust_restores_board", j_dear in ids4, str(ids4))
+            # A4 slice 2a: the mission statement + objective conjugate the JOB'S task_verb, not its job_type —
+            # a patrol-typed job carrying verb 'destroy' briefs as a destroy mission.
+            j_verb = store.create_or_update_job(sid, "argon", "patrol", target_sector="Z", reward=60000,
+                                                evidence={"task_verb": "destroy", "legal_verbs": ["destroy"]})["id"]
+            ov = next((o for o in self.jobs_offers({"save_id": sid})["offers"] if o["job_id"] == j_verb), {})
+            chk("verb_conjugated_composition", "find and destroy" in (ov.get("briefing") or "")
+                and "FIND and DESTROY" in (ov.get("task") or ""),
+                ((ov.get("task") or "") + " | " + (ov.get("briefing") or "")[:80]))
+            # A5(d): contracts TARGETING the player never reach the player's board (self-demand exploit)
+            j_self = store.create_or_update_job(sid, "teladi", "patrol", target_sector="W", reward=50000,
+                                                target_faction="player")["id"]
+            ids5 = [o["job_id"] for o in self.jobs_offers({"save_id": sid})["offers"]]
+            chk("counter_player_contract_hidden", j_self not in ids5, str(ids5))
+            # A5(a) exclusivity: holding argon's contract AGAINST teladi in sector V hides teladi's mirror
+            # contract against argon in V — but teladi's contract in a DIFFERENT AO stays offered.
+            store.upsert_faction(sid, "boron", name="Boron")
+            j_side_a = store.create_or_update_job(sid, "argon", "patrol", target_sector="V",
+                                                  target_faction="teladi", reward=60000)["id"]
+            store.claim_job(sid, j_side_a, claimant="player")
+            j_mirror = store.create_or_update_job(sid, "teladi", "bounty", target_sector="V",
+                                                  target_faction="argon", reward=60000)["id"]
+            j_elsewhere = store.create_or_update_job(sid, "teladi", "bounty", target_sector="U",
+                                                     target_faction="argon", reward=60000)["id"]
+            ids6 = [o["job_id"] for o in self.jobs_offers({"save_id": sid})["offers"]]
+            chk("mirror_side_hidden_in_ao", j_mirror not in ids6, str(ids6))
+            chk("other_ao_still_offered", j_elsewhere in ids6, str(ids6))
         finally:
             self.memory = orig_m
             shutil.rmtree(d, ignore_errors=True)
@@ -1666,6 +1944,8 @@ class NeuralRouter:
                             "faction": it.get("faction")})
             self.memory.mark_contract_frago(save_id, str(it["job_id"]), float(it["report_ts"]))
         return {"ok": True, "fired": len(items), "news": news, "actions": actions}
+
+    # (test_frago diagnostic route removed 2026-07-02 per D — #86 proven in-game via Ken's logbook)
 
     def contract_frago_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Oracle for #27 bridge half: a frago on a CLAIMED job's operation fires exactly once (idempotent);
@@ -1709,6 +1989,99 @@ class NeuralRouter:
         return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
                 "total": len(checks), "checks": checks}
 
+    def risk_watch_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """A6 consequence-watch oracle: a loss in the gambled AO AFTER accept_risk is attributed (task
+        risk_realized + op report + event); no loss → no change; the attribution fires exactly once."""
+        import shutil
+        import tempfile
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool, det: str = "") -> None:
+            checks.append({"name": n, "ok": bool(c), "detail": det})
+
+        d = tempfile.mkdtemp(prefix="nl_riskw_")
+        try:
+            store = MemoryStore(f"{d}/w.sqlite3")
+            sid = "s"
+            op = store.create_or_get_operation(sid, "argon", "sector_pressure", "s:argon:sp:teladi:rw",
+                                               status="active", target_faction="teladi", target_sector="X")["id"]
+            t = store.attach_task(op, "escort_supply_convoy", status="planned", owning_faction="argon",
+                                  target_sector="X")
+            store.route_task(store.get_operation(op), {"id": t, "task_type": "escort_supply_convoy",
+                                                       "target_sector": "X", "target_faction": "teladi"},
+                             "accept_risk")
+            r0 = store.sweep_risk_watches(sid)
+            chk("quiet_before_loss", r0["realized"] == 0, str(r0))
+            store.add_hostile_event(sid, {"attacker_faction": "teladi", "victim_faction": "argon", "sector": "X",
+                                          "object_name": "ARG Freighter Gull", "event_kind": "ship_destroyed",
+                                          "magnitude": 4})
+            r1 = store.sweep_risk_watches(sid)
+            row = next((x for x in store.operation_detail(op)["tasks"] if x["id"] == t), {})
+            _evs = store.list_hostile_events(sid, window_s=None, limit=5)
+            chk("loss_attributed", r1["realized"] == 1 and row.get("order_id") == "risk_realized",
+                f"r1={r1} row_order={row.get('order_id')} row_status={row.get('status')} "
+                f"row_fac={row.get('owning_faction')} evs={[(e.get('victim_faction'), e.get('sector'), e.get('event_kind')) for e in _evs]}")
+            chk("report_on_op", any("risk REALIZED" in str(rp.get("summary") or "")
+                                    for rp in (store.operation_detail(op).get("reports") or [])), "")
+            r2 = store.sweep_risk_watches(sid)
+            chk("fires_once", r2["realized"] == 0, str(r2))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
+
+    def verb_engine_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """A4 slice-1 oracle: legal-verb derivation from the assessment record — the #97 case (surviving asset →
+        escort legal; no assets → escort ILLEGAL), kill-pattern → secure/destroy, shortage → deliver+escort."""
+        checks: list[dict] = []
+
+        def chk(n: str, c: bool, det: str = "") -> None:
+            checks.append({"name": n, "ok": bool(c), "detail": det})
+
+        mk = lambda ttype, asm: {"operation_type": ttype, "evidence_json": {"assessment": asm}}
+        m = self.memory
+        v1 = m.derive_legal_verbs(mk("sector_pressure", {"threatened_assets": [
+            {"name": "ARG Hauler", "kind": "ship_attacked"}], "kinds": {"ship_attacked": 1}}))
+        chk("surviving_asset_makes_escort_legal", "escort" in v1 and "patrol" in v1, str(v1))
+        v2 = m.derive_legal_verbs(mk("sector_pressure", {"threatened_assets": [
+            {"name": "ARG Hauler", "kind": "ship_destroyed"}], "kinds": {"ship_destroyed": 2}}))
+        chk("no_survivor_makes_escort_illegal", "escort" not in v2, str(v2))
+        chk("kill_pattern_enables_hunt", "secure" in v2 and "destroy" in v2, str(v2))
+        v3 = m.derive_legal_verbs(mk("supply_shortage", {}))
+        chk("shortage_delivers", "deliver" in v3 and "escort" in v3, str(v3))
+        v4 = m.derive_legal_verbs(None)
+        chk("conservative_default", v4 == ["patrol"], str(v4))
+        v5 = m.derive_legal_verbs(mk("sector_pressure", {"threatened_assets": [], "kinds": {"cargo_lost": 1}}))
+        chk("cargo_loss_enables_interdict", "interdict" in v5, str(v5))
+        v6 = m.derive_legal_verbs(mk("raid_pressure", {"threatened_assets": [], "kinds": {"station_damaged": 1}}))
+        chk("station_damage_enables_defend", "defend" in v6 and "evacuate" in v6, str(v6))
+        v7 = m.derive_legal_verbs(mk("sector_pressure", {"threatened_assets": [], "kinds": {"ship_destroyed": 2}}))
+        chk("battle_wreckage_enables_recover", "recover" in v7, str(v7))
+        v8 = m.derive_legal_verbs(mk("sector_pressure", {"threatened_assets": [], "kinds": {"ship_destroyed": 1}}))
+        chk("single_loss_no_recover", "recover" not in v8, str(v8))
+        # A5(e): 'to safety' means SAFE — own, uncontested, no live op; the war zone never qualifies
+        import shutil as _sh
+        import tempfile as _tf
+        d2 = _tf.mkdtemp(prefix="nl_safe_")
+        try:
+            st2 = MemoryStore(f"{d2}/s.sqlite3")
+            sid2 = "s"
+            st2.upsert_sector(sid2, "sec_home", name="Home Haven", owner_faction="argon")
+            st2.upsert_sector(sid2, "sec_war", name="War Zone", owner_faction="argon")
+            st2.upsert_sector(sid2, "sec_foreign", name="Foreign Space", owner_faction="teladi")
+            st2.create_or_get_operation(sid2, "argon", "sector_pressure", "k1", status="active",
+                                        target_faction="xenon", target_sector="War Zone")
+            safe = st2.safe_sector_for(sid2, "argon", exclude_sector="Some AO")
+            chk("safe_sector_avoids_war_and_foreign", safe == "Home Haven", safe)
+            chk("safe_sector_excludes_ao", st2.safe_sector_for(sid2, "argon", exclude_sector="Home Haven") == "",
+                "")
+        finally:
+            _sh.rmtree(d2, ignore_errors=True)
+        chk("verb_table_covers_all_legal",
+            all(v in m.TASK_VERBS for v in set(v1 + v2 + v3 + v4 + v5 + v6 + v7)), "")
+        return {"ok": all(c["ok"] for c in checks), "passed": sum(c["ok"] for c in checks),
+                "total": len(checks), "checks": checks}
+
     def job_pricing_selftest(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Oracle for threat-scaled pricing: monotonic in urgency; active-conflict intensity raises the price;
         capped by budget_available; a broke faction posts unpriced (0)."""
@@ -1737,6 +2110,23 @@ class NeuralRouter:
             chk("capped_by_available", store.price_job(sid, "argon", "escort", urgency=5) <= 42000, "")
             store.budget_capacity = lambda _s, _f: 0.0
             chk("broke_posts_unpriced", store.price_job(sid, "argon", "escort", urgency=5) == 0, "")
+            # A6 slice (Ken: "these factions are broke and they're issuing 250k"): one contract never commits
+            # more than POLICY_MAX_TREASURY_FRACTION of available — 2.1M available → ≤105k, however hot the war.
+            store.budget_capacity = lambda _s, _f: 2_100_000.0
+            p_ceiling = store.price_job(sid, "argon", "escort", urgency=5, target_faction="xenon")
+            chk("treasury_fraction_ceiling", 0 < p_ceiling <= int(2_100_000 * store.POLICY_MAX_TREASURY_FRACTION),
+                f"{p_ceiling} vs ceiling {int(2_100_000 * store.POLICY_MAX_TREASURY_FRACTION)}")
+            # A6 escalation bound (Ken board audit 2026-07-02): the raise option vanishes once the escalated
+            # price would exceed POLICY_ESCALATION_FRACTION of available — no compounding past the premium.
+            j_esc = {"reward": int(2_100_000 * store.POLICY_ESCALATION_FRACTION) + 50_000,
+                     "issuing_faction": "argon"}
+            opts_high, _rt = store.job_escalation_options(sid, j_esc)
+            chk("escalation_bounded", not any(str(o.get("key", "")).startswith("raise:") for o in opts_high),
+                str(opts_high))
+            j_low = {"reward": 40_000, "issuing_faction": "argon"}
+            opts_low, _rt2 = store.job_escalation_options(sid, j_low)
+            chk("escalation_still_offered_below_bound",
+                any(str(o.get("key", "")).startswith("raise:") for o in opts_low), str(opts_low))
             # sector resolution precedence (kills "the operational area"): explicit wins; else latest hostile
             # event sector for the pair; else the faction's most-attacked sector
             chk("sector_explicit_wins", store.resolve_job_sector(sid, "argon", "xenon", explicit="Argon Prime")

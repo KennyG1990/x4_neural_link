@@ -36,6 +36,20 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
+        # 2026-07-02: unhandled exceptions in GET routes used to close the connection with NO response,
+        # so the CI gate could only say "unreachable". Surface the traceback as a 500 instead.
+        try:
+            self._do_get_impl()
+        except Exception:
+            import traceback
+            trace = traceback.format_exc()
+            print(f"[Neural Link] GET {self.path} crashed:\n{trace}")
+            try:
+                self._send_json(500, {"ok": False, "error": "internal error", "trace": trace.splitlines()[-12:]})
+            except Exception:
+                pass  # headers already sent — nothing more we can do
+
+    def _do_get_impl(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         if parsed.path == "/" or parsed.path == "/dashboard":
@@ -268,6 +282,12 @@ class NeuralLinkHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/ops/push_contract_fragos":
             self._send_json(200, self.router.push_contract_fragos(query.get("save_id", [""])[0]))
+            return
+        if parsed.path == "/api/ops/risk_watch_selftest":
+            self._send_json(200, self.router.risk_watch_selftest())
+            return
+        if parsed.path == "/api/ops/verb_engine_selftest":
+            self._send_json(200, self.router.verb_engine_selftest())
             return
         if parsed.path == "/api/ops/job_pricing_selftest":
             self._send_json(200, self.router.job_pricing_selftest())
@@ -820,7 +840,23 @@ def main() -> None:
 
     host = str(config.get("bridge_host", "127.0.0.1"))
     port = int(config.get("bridge_port", 8713))
-    server = ThreadingHTTPServer((host, port), NeuralLinkHandler)
+    # BIND RETRY (2026-07-02 crash post-mortem): on Windows a fast watcher kill→restart can hit the old
+    # process's port teardown (WinError 10048); a single failed bind used to exit the process and leave the
+    # bridge DOWN until the next file edit. Retry for up to ~15s instead. (Deliberately NOT SO_REUSEADDR —
+    # on Windows that permits a live double-bind, which is worse than waiting.)
+    import time as _t
+    server = None
+    last_err: Exception | None = None
+    for _attempt in range(10):
+        try:
+            server = ThreadingHTTPServer((host, port), NeuralLinkHandler)
+            break
+        except OSError as exc:
+            last_err = exc
+            print(f"[Neural Link] bind {host}:{port} busy (attempt {_attempt + 1}/10): {exc} — retrying...")
+            _t.sleep(1.5)
+    if server is None:
+        raise SystemExit(f"[Neural Link] could not bind {host}:{port} after retries: {last_err}")
     print(f"[Neural Link] listening on http://{host}:{port}")
     print(f"[Neural Link] Player2 base URL: {config.get('player2_base_url')}")
     try:

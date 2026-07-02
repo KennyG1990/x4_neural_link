@@ -1,5 +1,452 @@
 # X4 Neural Link + AI Influence Roadmap
 
+### #125 DEFECT (Ken, live board): "Patrol Contract" objective read "DELIVER supplies" — type/verb divergence killed at the source + live rows self-healed — ✅ 2026-07-02
+- **Mechanism:** the legacy `hire_contractors` route guessed job TYPE from task_type (default patrol), then
+  snapped the VERB to the assessment's legal set — for a supply_shortage op (legal = deliver, escort) that made
+  type=patrol + verb=deliver, and every layer split along the seam: title/objective-prefix followed the type,
+  SMESC statement/objective-text/MD-gate followed the verb. Violates the one-verb doctrine.
+- **Fixed (3 pieces):** (1) `_VERB_TO_JT` hoisted to a class invariant — the job type always FOLLOWS the final
+  verb in BOTH hire branches (also: convoy hires now prefer escort, not patrol); (2)
+  `reconcile_job_verb_types()` self-heal on every `advance_operations` tick — open rows re-typed to follow
+  their verb (job_key recomputed; a collision with an existing coherent row = duplicate → cancelled);
+  (3) oracle cases `job_type_follows_verb` (exact repro: supply_shortage + legacy hire) + `legacy_rows_self_heal`.
+- **VALIDATED (cited):** route_decision_selftest **12/12** live · regression sweep green (recognize 17/17,
+  verbs 12/12, offers 14/14, pricing 10/10, risk-watch 4/4) · **LIVE-SAVE proof:** /api/ops/advance on
+  game_631085856 healed all 4 divergent rows (alliance job_460d211218 = Ken's screenshot, holyorder, argon,
+  antigone) → jt=supply·verb=deliver confirmed via /api/jobs. In-game board text refreshes at the next
+  escalation withdraw+re-offer cycle (reward-keyed tracker) or reload.
+- En-route fix, courtesy of the #123 wrapper: first reconcile draft hit UNIQUE(save_id,job_key) — the 500
+  traceback named it in one fetch; duplicate-row semantics added same turn.
+
+### #124 A6 SEEK_CEASEFIRE — a broke faction TALKS instead of spending — ✅ bridge 2026-07-02
+- Ken doctrine ("politics to avoid war while they build their economy, not all their money to contractors"):
+  combat routing options now include `seek_ceasefire` when the faction is BROKE (contract unpriceable est<=0,
+  or est >= 50% of liquid treasury) AND the counterparty is war-ELIGIBLE (#65 — never xenon/khaak/criminal).
+  Choosing it stands the task down (order_id=ceasefire_sought, no job, world event) and opens a ceasefire
+  feeler through the EXISTING negotiation door (submit_negotiation_intent kind=ceasefire, op-linked).
+- **RECONCILE dividend:** zero new models — agreement_candidates/ceasefire, war_eligibility, the negotiation
+  door, and gates (seek_ceasefire=strategic) all existed; this unit is pure wiring (option + route branch + oracle).
+- **VALIDATED (cited):** route_decision_selftest live — `broke_faction_talks_first`,
+  `ceasefire_agreement_created`, `ceasefire_never_with_xenon` (plus the A4/A6 suite; 12/12 with #125's cases).
+  CI gate PASS on reload. In-game observation (a live broke faction actually choosing politics) rides the
+  normal decision cadence — ◐ until seen on the dashboard decision records.
+
+### #123 🏁 A4 slice-2 VERIFIED (Player2 picks the verb) + oracle-crash fix + GET 500-wrapper — ✅ 2026-07-02
+- **The RED gate did its job.** Post-restart, route_decision_selftest was crashing server-side; the GET
+  dispatcher had NO try/except, so the connection just closed → "unreachable" with zero diagnostics. Added a
+  permanent do_GET wrapper (server.py): any route exception now returns **500 + the traceback tail** and prints
+  to the bridge console. First use immediately pinpointed the bug: the new `player2_verb_choice_rides_job`
+  oracle case passed a 3rd detail-string arg to `chk(name, cond)` — TypeError. One-line fix.
+- **VALIDATED (cited):** CI GATE **PASS ×2** (ci_gate.log 14:21:26 + 14:21:34, all 5 suites) ·
+  route_decision_selftest **7/7** incl. player2_verb_choice_rides_job (Player2 replies "3." → hire:recon →
+  job evidence carries task_verb + verb_chosen_by="player2") · full regression sweep green: recognize **17/17**
+  · verbs **12/12** · offers **14/14** · pricing **10/10** · risk-watch **4/4**. Dashboard-tab fetches.
+- **This closes A4 slice-2:** combat routing decisions now offer per-verb costed options
+  (`hire:<verb>` from derive_legal_verbs(op)[:3]) and Player2's verb choice rides the job into MD gating.
+  #122's post-restart verification ladder is complete; the 3-layer restart hardening survived its first live
+  cycles (watcher relaunched 14:19, two clean reloads since).
+- **Restart-gap note (honest):** between 14:02 and Ken's 14:19 relaunch the watcher stopped reacting to file
+  changes entirely (host mtimes verified fresh via Glob; no ci_gate entries). Cause unproven — QuickEdit
+  select-mode pause or exited window are both consistent. If it recurs: click the console, press Enter/Esc.
+- **Tooling banked (BACKLOG):** the gate's catch block should read the 500 body and log failing check names +
+  first trace line — a RED line must be actionable without a browser fetch.
+
+### #122 BRIDGE CRASH POST-MORTEM + 3-layer restart hardening — ✅ verified live via #123, 2026-07-02
+- **Root cause (from the watcher's own source):** Stop-Bridge waited a fixed 500ms → the new `python -m
+  bridge.server` raced the old process's port teardown → bind raised WinError 10048 → `main()` exited → the
+  watcher's health loop gave up with NO retry → bridge dead until the next file edit. Agent-speed multi-file
+  edit bursts made overlapping reload cycles likely. (Both "syntax errors" the sandbox reported were mount
+  frankenfiles — host files verified healthy by direct read; canon rule held.)
+- **HARDENED, all three layers:** (1) server.py — bind retries 10×1.5s with loud logging, explicit SystemExit
+  only after exhaustion (deliberately NOT SO_REUSEADDR — Windows double-bind is worse than waiting);
+  (2) watcher Stop-Bridge — polls until the port is ACTUALLY free (≤8s), not a fixed sleep; (3) watcher
+  start — 2 attempts with health verification + a loud "BRIDGE DOWN — manual attention" if both fail;
+  (4) stable-signature debounce — reload fires only after the tree is quiet for 2 consecutive checks (was
+  400ms fixed, raced edit bursts).
+- Safety: the watcher py_compiles ALL bridge files before every start, so the restart itself is gated.
+- ON RESTART verify (also at BACKLOG top): route_decision 7/7 (new player2_verb_choice_rides_job) →
+  recognize 17/17 · verbs 12/12 · offers 14/14 · pricing 10/10.
+
+### #121 🏁 A5(b) ENGAGEMENT IDENTITY — the fleet-battle cluster is CLOSED, 5 of 5 — ✅ bridge 2026-07-02
+- Concurrent qualifying buckets in one sector-window are now ONE assessed battle: each victim's op still forms
+  (each staff responds — correct doctrine) but their assessments share an `engagement_id` and name their
+  `co_victims`. Downstream policy reads identity instead of re-deriving it (contract caps per engagement;
+  follow_support toward co-belligerents is now one derivation line away).
+- **VALIDATED (cited):** recognize_selftest **17/17** live (engagement_shared_id + co_victims_recorded on a
+  two-victim Xenon brawl) · verbs 12/12 · offers 14/14 unregressed.
+- **🏁 A5 COMPLETE — every edge case from Ken's fleet-battle walkthrough is closed:** (a) exclusivity #110 ·
+  (b) engagement identity #121 · (c) battle-resolution sensing #110 · (d) player-as-attacker guard #106 ·
+  (e) threat-aware routing #120. From walkthrough to closed cluster: same day.
+
+### #120 A5(e) — THREAT-AWARE ROUTING: "to safety" provably means SAFE — ◐ MD rides next reload 2026-07-02
+- `memory.safe_sector_for`: a refuge must be OWNED by the faction, uncontested, not the AO, and not the target
+  sector of ANY live operation (anyone's war zone is nobody's refuge). Bridge serves `safe_sector` on evacuate
+  offers → Lua forwards → MD `Evacuate_Gate` resolves it by name and docks the evacuees THERE; the old
+  nearest-outside-AO pick survives only as the documented fallback. Closes #116's AAR pick (evacuations could
+  route into another contested sector).
+- Scoping note (honest): escort/deliver already have their hold-until-secured proxy — the convoy departs only
+  when the PLAYER is on station (the proximity gate); the escort IS the securing. A5(e) is therefore complete
+  for the cases where routing safety is the system's job.
+- **VALIDATED (cited):** verb_engine_selftest **12/12** live (safe_sector_avoids_war_and_foreign +
+  safe_sector_excludes_ao) · offers 14/14 · Forge 0 structural (staged synced). **A5: 4 of 5 gates closed** —
+  only (b) engagement identity remains.
+
+### #119 Workflow self-audit closeout — oracle gaps + BACKLOG reconcile — ✅ 2026-07-02
+- Ken's "have you been following the workflow" audit found two R-sprint slips, both fixed same-turn:
+  (1) evacuate/recover derivation rules had NO oracle cases (the runbook's own layer 6, skipped in the sprint's
+  velocity) — added station_damage→evacuate, battle_wreckage→recover, single_loss→NO-recover, coverage span:
+  **verb_engine_selftest 10/10 live**; (2) BACKLOG G4 text was two eras stale vs the ROADMAP/scoreboard —
+  reconciled to the 🏁 build-complete state with the true remainder list.
+- Meta: sprint velocity eats the paperwork steps LAST (oracle case, BACKLOG strike) — the two cheapest steps
+  are the first skipped. Countermeasure already exists (the runbook's layer list); the miss was not consulting
+  it per-unit during the sprint. Sustain: end-of-sprint audit pass against the runbook checklist.
+
+### #118 ESCALATION LEAK CLOSED (Ken board audit: "they're increasing their defense budget") — ✅ bridge 2026-07-02
+- Ken read the live board and caught the leak: BOTH raise paths ignored the #104 posting ceiling — the
+  commander `raise_reward` (×1.5, capped only by op reserve) and the stale-job escalation (+25% each pass) —
+  so factions escalated ignored contracts right past their own spending discipline. Compounding raises =
+  runaway defense allocation.
+- FIX: `POLICY_ESCALATION_FRACTION = 0.10` — an escalated contract may reach 10% of available liquidity (a
+  BOUNDED premium for urgent unfilled need — double the posting ceiling, never runaway). Applied to both
+  paths: raise_reward mins against it; job_escalation_options simply STOPS OFFERING the raise beyond it
+  (Player2 can't pick what the engine doesn't offer — ADR-001 legality).
+- Board note: current high prices (290k/256k rows) are pre-ceiling stock — they churn out via claim/expiry/
+  withdraw; new posts ≤5%, escalations ≤10%.
+- **VALIDATED (cited):** job_pricing_selftest **10/10** live (new escalation_bounded +
+  escalation_still_offered_below_bound) · offers 14/14 unregressed.
+
+### #117 🏁 R8 DELIVER + R11 RECOVER — ALL ELEVEN TIER-1 MISSION TYPES EXIST — ◐ ride next reload 2026-07-02
+- **R8:** `Deliver_Gate` — a REAL missioncue-bound buy offer on a REAL receiving station
+  (`create_trade_offer` recipe from the shipping caller story_diplomacy_intro.xml:1355), amount derived from
+  the committed reward at avgprice (clamp 10..500 — money and cargo agree), ware forwarded through Lua,
+  engine `RML_Deliver_Wares.DeliverWares` (Station/Wares/Offers/PlayerOnly per the vanilla invocation).
+- **R11:** `Recover_Gate` — binds a REAL abandoned hull (`faction.ownerless`, vanilla's identity per
+  interrupt.foundabandonedship.xml); claiming is the NATIVE player action so no RML — end cues sense
+  ownership (player claims → success; hull destroyed → failure). Verb `recover` derives when battles leave
+  hulls (2+ ship_destroyed).
+- **VALIDATED (cited):** Forge 0 structural both passes (staged synced) · verbs 8/8 · offers 14/14 ·
+  recognize 15/15 unregressed.
+- **🏁 TIER-1 SCOREBOARD: 11 of 11 mission types EXIST — 2 PAID (R1 escort, R3 patrol), 9 WIRED awaiting the
+  #97 flown-and-paid standard.** The substantiation set (Ken's directive, wiki opord-mission-requirements) is
+  fully built; what remains is flying it.
+
+### #116 R10 EVACUATE + gate registry/runbook (refactor decision) — ◐ rides next reload 2026-07-02
+- **R10:** `Evacuate_Gate` — a REAL passenger (create_cue_actor, the offer-client pattern) on the threatened AO
+  station (cause-linked $bindname first — station_damaged also derives `evacuate` now), delivered to a SAFE
+  issuing-faction station OUTSIDE the AO (find_station excluding $PatrolSector, nearest); engine
+  `RML_Transport_Passengers_V2` (invocation shape per gmc_assisted_task.xml:991; TimeOut=$Window,
+  SkipConversation). Full 6-layer wire (verb table, derivation, templates, gate, registry line).
+- **Refactor decision (the #114/#115 AAR pick, spec pass REJECTED the mega-library):** MD actions-libraries
+  lack parameterized returns, finders genuinely differ, and RML invocations are vanilla-copies where copying IS
+  the practice. Drift control instead: the ⚠ VERB GATE REGISTRY comment atop Activate (all 8 gates, engines,
+  binds) + wiki [[adding-a-mission-verb]] (the 6-layer runbook). Documented rejection > forced abstraction.
+- **VALIDATED (cited):** Forge 0 structural (staged synced) · verbs 8/8 · offers 14/14 unregressed.
+- **Tier-1 scoreboard: 2 PAID · 7 WIRED · 2 remaining** (R8 deliver: Offers-construction read; R11 recover:
+  ownerless-hull probe).
+
+### #115 R2 FOLLOW AND SUPPORT — the #97 doctrine case, wired — ◐ rides next reload 2026-07-02
+- The verb Ken's fighter-squadron flight demanded: `Follow_Gate` binds a REAL tasked friendly combat element in
+  the AO, `objective.follow` guidance, hands off to `RML_Follow_Object.FollowObject` (500m–10km station-keeping
+  band; the library is deliberately open-ended — vanilla design: the CALLER ends it). MY end cues implement the
+  doctrine: **element survives the window → success; element destroyed → failure** (both signal the shared
+  MissionEnded with the gm feedback convention). `follow_support` now derives as legal on every contested
+  sector ("put weight behind local elements").
+- **VALIDATED (cited):** Forge 0 structural (staged synced) · verbs 8/8 · offers 14/14 · recognize 15/15
+  unregressed. ◐ in-game on the #97 standard.
+- **Tier-1 scoreboard: 2 PAID · 6 WIRED (R2, R4-R7, R9) · 3 remaining** (R8 deliver: Offers-construction read;
+  R10/R11: RML probes).
+
+### #114 R9 RECON + R7 INTERDICT — mission types five and six wired — ◐ ride next reload 2026-07-02
+- `Recon_Gate`: verb `recon` → scan a REAL enemy station in the AO (`RML_Scan.Scan` mode 2, TargetStation;
+  fallback any station — dispositions are dispositions). `Interdict_Gate`: verb `interdict` → bind up to 5
+  REAL enemy TRADE hulls present in the AO (logistics, not warships — primarypurpose.trade) → kill engine
+  (`RML_Destroy_Entities`). Both ride the shared MissionEnded → payout chain; both degrade honestly (nothing
+  bindable → AO objective stands, window recycles).
+- Derivation/composition/transport pre-existed for both verbs (#105/#106) — these were PURE MD templates,
+  ~40 lines each of copied vanilla invocations.
+- **VALIDATED (cited):** Forge 0 structural (staged synced); bridge oracles unregressed (verbs 8/8, offers
+  14/14 from #113's sweep). ◐ in-game on the #97 standard, riding the same reload as R5/R6.
+- **Tier-1 scoreboard: 2 PAID · 5 WIRED (R4-R7, R9) · 4 remaining** (R2 follow_support + R8 deliver need one
+  grounding read each; R10/R11 need RML probes).
+
+### #113 A2 GENERALIZED — verb-aware cause-linked binding for ALL gates — ◐ rides next reload 2026-07-02
+- The bind hint is now verb-aware bridge-side: escort → first SURVIVING attacked ship; **defend → the ASSESSED
+  damaged station** (station_damaged asset from the A1 record); destroy stays sector-scoped (the victim-side
+  ledger can't name enemy hulls — honest limit, documented). MD `Defend_Gate` binds the named station first
+  (find_station + knownname match), faction-station → any-station fallback chain preserved.
+- Closes the 3×-recurring AAR pick (accept-time improvisation in the binds) with ONE generalization: every
+  gate reads the assessment's answer before asking the galaxy.
+- **VALIDATED (cited):** Forge 0 structural (staged synced) · offers 14/14 · verbs 8/8 · recognize 15/15 —
+  all unregressed. ◐ in-game rides the next reload with #111/#112.
+
+### #112 R5 GUARD/DEFEND — fourth mission type wired through the full verb stack — ◐ rides next reload 2026-07-02
+- `defend` added to the whole substrate in one pass: TASK_VERBS row (requires threatened_fixed_asset,
+  RML_Protect_Object, "asset intact through the window") · derivation rule (assessment kind `station_damaged`
+  makes defend LEGAL) · statement + task templates ("defend friendly installations in…" / "DEFEND the
+  designated installation in…") · MD `Defend_Gate` (binds a REAL station of the issuing faction in the AO,
+  `objective.protect` guidance, hands off to vanilla's `RML_Protect_Object.ProtectObject` with
+  **EndTime=$Window + EndTimeIsSuccess** — the doctrinal success criterion IS the engine's completion mode).
+- **VALIDATED (cited):** verb_engine_selftest **8/8** (new station_damage_enables_defend; coverage check spans
+  all six derivation cases) · offers 14/14 · recognize 15/15 · Forge 0 structural (staged synced). ◐ IN-GAME:
+  needs a station-damage pattern → defend contract → asset survives window → paid (the #97 standard).
+- Substrate velocity check: R6 took one MD gate; R5 took one verb-table row + one derivation line + two
+  template strings + one MD gate. Remaining Tier-1 rows are confirmed template work.
+
+### #111 R6 DESTROY — third mission type wired (verb-gated, real hostiles, vanilla kill engine) — ◐ rides next reload 2026-07-02
+- New `Destroy_Gate` in the Activate subtree: fires on verb `destroy` (derived only from a real kill pattern,
+  #105), binds up to 5 REAL hostile ships of the target faction actually PRESENT in the AO (`find_ship` in
+  $PatrolSector — the bindable-cause rule; none present → AO objective stands, window recycles), sets
+  `objective.kill group=` for guidance, and hands the group to vanilla's kill engine
+  (`md.RML_Destroy_Entities.DestroyEntities`, invocation copied from gm_assassinate.xml:669). Completion rides
+  the shared MissionEnded → payout chain.
+- **VALIDATED (cited):** Forge 0 structural (staged synced). ◐ IN-GAME: needs a combat op whose assessment
+  crosses the kill-pattern rule → destroy contract on the board → fly it → observed kills → paid. R6 flips on
+  the #97 standard.
+
+### #110 A5(a)+(c) — exclusivity gate + battle-resolution sensing — ✅ bridge 2026-07-02
+- **(a) You don't work both sides of one battle:** the player's CLAIMED contracts define allegiances per AO —
+  an open job issued by the enemy of a claimed contract, aimed back at its issuer, in the same sector, is
+  withheld from the board (other AOs unaffected — a mercenary can serve different masters in different wars,
+  just not both sides of the same one).
+- **(c) No post-battle contracts:** a threat whose last event is older than OP_COOLDOWN_S (15 min) is COOLING —
+  recognize never spools a new op for it, and an existing WARNING op concludes "Threat subsided — no action
+  commissioned", which cancels its linked open jobs via the existing conclude cleanup. Active ops with
+  committed forces are exempt (they resolve through assess/FRAGO). `cooled` count surfaced in the recognize
+  return.
+- **VALIDATED (cited):** jobs_offers_selftest **14/14** (mirror_side_hidden_in_ao + other_ao_still_offered) ·
+  recognize_selftest **15/15** (cooled_threats_conclude + subsided_op_concluded + post_battle_job_cancelled) ·
+  risk_watch 4/4 unregressed. A5 remaining: (b) engagement identity · (e) convoy-vs-active-battle routing.
+
+### #109 A6 — RISK WATCH: "the world answers" is now mechanical — ✅ bridge 2026-07-02
+- Closes #108's AAR pick same-day: `sweep_risk_watches` (first stage of every advance_operations tick) scans
+  accept_risk tasks still issued; a trade loss (victim = owning faction, in the gambled AO, after the decision)
+  is ATTRIBUTED — task → `risk_realized` (terminal marker, fires once), an assessment report lands on the op
+  ("Accepted risk REALIZED: <ship> lost..."), and a `risk_realized` operation event surfaces it. The gamble's
+  failure is evidence the next commander review reads — no narrative, all ledger.
+- Debug find worth canon: **Windows time.time() granularity can stamp two fast-succession calls IDENTICALLY** —
+  the strict `ts > since` filter silently ate the oracle's same-instant loss; `>=` with the status/order-id
+  guards is correct (a loss can't precede the watch in the ledger). Sweep returns a `probe` block permanently
+  (watched count + first-event diagnostics) — that probe found the bug in one iteration.
+- **VALIDATED (cited):** new `/api/ops/risk_watch_selftest` **4/4** live (quiet_before_loss · loss_attributed ·
+  report_on_op · fires_once) · route 6/6 · recognize 12/12 unregressed.
+
+### #108 A6 DECISION HALF — contracts are now a CHOICE with costed options (make-vs-buy-vs-talk-vs-risk) — ✅ bridge 2026-07-02
+- **Ken's doctrine is in the prompt.** `route_pending_tasks_llm` briefs now carry the real numbers: treasury
+  available, contractor estimate with % of liquidity, own combat strength, and the doctrine line "money spent
+  on contractors is money not spent rebuilding; a poor faction talks before it spends." Options are COSTED:
+  commit fleet (no treasury, attrition risk) · hire (~N Cr, X% of liquidity) · ask ally (diplomatic capital) ·
+  **accept_risk** (new route: convoy runs uncovered, task issues WITHOUT a job, zero commitment, world event
+  logs the gamble — words≠resources holds; a lost convoy re-enters as a hostile event and teaches the lesson).
+- **The flat-70k escort flood's root is CUT:** `escort_supply_convoy` no longer mints contractor jobs
+  unconditionally — it routes through the decision like combat tasks (the #105 reconcile finding, extended not
+  rebuilt).
+- **VALIDATED (cited):** route_decision_selftest **6/6** live (new convoy_is_a_decision +
+  accept_risk_issues_without_job) · offers 12/12 · verbs 7/7 unregressed. Live proof surface: decision_records
+  show the costed options + Player2's pick per convoy (say/try/allowed/changed).
+- A6 remainder: threat-scaled treasury fraction (war footing raises the 5% ceiling) · seek_ceasefire as a
+  chooser option for LOSING factions (the politics-first endgame) — both ride the same brief.
+
+### #107 A4 — MD GATES BY VERB; the verb now runs bridge→Lua→MD end to end — ◐ rides next reload 2026-07-02
+- The last joint: offers serve `task_verb` (evidence-first, jt-map fallback bridge-side so MD stays simple) →
+  Lua forwards → MD `$verb` gates gameplay: Patrol_Gate takes `patrol|secure` (verb table: secure shares
+  RML_Patrol), Escort_Gate takes `escort`. job_type no longer decides gameplay anywhere in the contract path.
+  R4 (Secure/Clear) is now one derive-rule away from flyable — the gate already accepts it.
+- **VALIDATED (cited):** Forge MD+Lua 0 structural / 0 unexpected (staged synced) · live board: ALL 12 offers
+  carry verbs (escort/deliver/patrol) · jobs_offers_selftest 12/12. ◐ MD/Lua halves ride next
+  /refreshmd + /reloadui.
+
+### #106 A4 slice 2a (verb-conjugated SMESC) + A5(d) self-demand exploit guard — ✅ bridge-live 2026-07-02
+- **2a:** `compose_job_briefing` conjugates the JOB'S `task_verb` (#105) in both the MISSION statement and the
+  Groupings-and-Tasks objective — a patrol-typed job carrying verb `destroy` briefs "find and destroy…" /
+  "FIND and DESTROY…"; job_type remains only the pre-A4 fallback. All eight Tier-1 verbs have statement +
+  task templates.
+- **A5(d):** contracts whose `target_faction == player` never reach the player's board — closes the
+  self-demand exploit (attack a faction → its defensive op posts counter-contracts → farm your own damage).
+  Defensive ops still FORM against the player (correct doctrine); the player just can't be paid for them.
+- **VALIDATED (cited):** jobs_offers_selftest **12/12** live (new `verb_conjugated_composition` +
+  `counter_player_contract_hidden`) · verb_engine 7/7 unregressed.
+- A4 slice 2 remainder: Player2 in-set verb choice at routing · MD Activate gates by task_verb (Lua forward) ·
+  economy task types through the existing route_task chooser with A6 costed context.
+
+### #105 A4 SLICE 1 — THE VERB ENGINE: legal-verb derivation live, task_verb on every op-minted contract — ✅ bridge 2026-07-02
+- **RECONCILE FINDING FIRST:** the make-vs-buy-vs-talk chooser ALREADY EXISTS (`route_task`: commit_own_fleet /
+  hire_contractors / ask:ally, Player2-decided via D3/D4) for combat tasks — A6's decision half is an EXTENSION
+  (add costed context + diplomacy option + route economy task types through it), not a build. Economy types
+  (escort_supply_convoy, supply) currently BYPASS the decision → that's the flat-70k escort flood's origin.
+- **BUILT (A4 slice 1):** `TASK_VERBS` table (verb → binding precondition + RML + doctrinal success, per
+  ATP-112/wiki) + `derive_legal_verbs(op)` — deterministic from the A1 assessment record: surviving attacked
+  asset → escort LEGAL; all-destroyed → escort ILLEGAL (the #97 case); kill pattern → secure/destroy; cargo
+  loss → interdict; shortage → deliver+escort; conservative default patrol. Both job-creation sites now attach
+  `task_verb` (jt-mapped if legal, else first legal) + `legal_verbs` into job evidence.
+- **VALIDATED (cited):** new `/api/ops/verb_engine_selftest` **7/7** live (incl. no_survivor_makes_escort_illegal,
+  verb_table_covers_all_legal) · pricing 8/8 · recognize 12/12 unregressed.
+- SLICE 2 (next session): Player2 picks WITHIN legal_verbs at the routing decision · verb-conjugated SMESC
+  composition (mission statement/objective from TASK_VERBS templates) · MD Activate gates by task_verb (not
+  job_type) · economy task types routed through the existing chooser (A6 merge point).
+
+### #104 A6 SLICE — ContractPolicy block + treasury-fraction pricing ceiling — ✅ bridge-live 2026-07-02
+- Ken doctrine ("these factions are broke and they're issuing 250k"): **one contract never commits more than 5%
+  of a faction's available liquidity** — `price_job` now min(threat price, available, available×
+  POLICY_MAX_TREASURY_FRACTION). The audited irrationality (232k on 2.1M = 11%) prices at ≤105k; a rich faction
+  still pays full threat price. Constants consolidated into ONE ContractPolicy block (probation trust/cap +
+  treasury fraction — the #102 AAR pick; eligibility and pricing read the same source).
+- **VALIDATED (cited):** job_pricing_selftest **8/8** live (new `treasury_fraction_ceiling`: 2.1M available →
+  price ≤105k even at urgency 5 + intensity 1.0) · jobs_offers_selftest 10/10 (shared constants, no drift).
+  Existing open jobs keep their old prices (repricing happens via escalation/expiry churn).
+- A6 REMAINDER (the deep half, fresh session): the make-vs-buy-vs-TALK decision — engine derives costed options
+  (own fleet / contractor / diplomacy / accept risk) from fleet_strength + treasury + negotiation system;
+  Player2 chooses (ADR-001). Contracts become surge capacity, not reflex.
+
+### #103 D HOUSEKEEPING — temp diagnostics + test scaffolds stripped, evidence layer kept — ✅ 2026-07-02
+- STRIPPED: bridge #70 poll-logger (opord_orders_pending file-append) · Lua opord-poll info logs ("POST sent",
+  "pending=N" — ERROR logs kept, the silent-early-return lesson stands) · MD pre-offer + attrs diags (root
+  cause fixed #93) · On_Assign ENTER diag (replaced with a REJECTED-only guard log) · `aic_navtest.xml` → stub
+  (guidance proven #92) · `/api/ops/test_frago` route+method (FRAGO proven in-game #86).
+- KEPT deliberately: contract lifecycle debug lines (offered/ACCEPTED/ACTIVATED/CAUSE-LINKED
+  bind/BOUND/ABORTED/COMPLETED/FRAGO) — the permanent in-game evidence layer every gate this session ran on;
+  LUAV marker (resident-Lua fingerprint, reload doctrine).
+- **VALIDATED (cited):** Forge 4-file validate 0 structural / 0 unexpected (staged synced) · live post-strip:
+  test_frago 404s · jobs_offers 10/10 · recognize 12/12 · contract_frago 5/5. MD/Lua strips ride the next
+  /refreshmd + /reloadui.
+
+### #102 Patrol window from assessment + A3 PROBATION TIER — ✅ bridge-live / ◐ MD rides next refresh 2026-07-02
+- **Patrol window (the 232k-per-minute fix, #100):** Destinations mintime = 3min × urgency (u3=9min, u5=15min),
+  maxtime double — the presence requirement now derives from the ASSESSED threat. Forge 0 structural; staged
+  synced; ◐ needs one more /refreshmd (landed after Ken's refresh).
+- **A3 probation tier (Ken: "5 aborts should be FELT"):** `player_eligible_jobs` — trust ≤ -10 with the issuing
+  faction hides contracts > 100k (the trust ledger IS the behavioral record: +3 completion / -2 abort); ≤ -50
+  full cutoff unchanged; recovery restores the board. **VALIDATED LIVE: jobs_offers_selftest 10/10** incl. new
+  `probation_hides_high_value` + `restored_trust_restores_board`. A3 remainder: in-game rep weighting
+  (relations_sync) + advances/exclusives for preferred tier.
+
+### #101 A2 — CAUSE-LINKED ESCORT BINDING wired end-to-end — ◐ awaiting a combat-escort to prove in-game 2026-07-02
+- The convoy is now THE assessed asset: threatened_assets carry per-event magnitude and cap top-8 BY MAGNITUDE
+  (closes the #99 AAR pick); the offers route serves `bind_name` (first surviving non-destroyed named asset from
+  the op's assessment) on escort jobs; Lua forwards it; MD `Escort_Gate` binds the assessed ship BY NAME first
+  (galaxy find_ship + knownname match), falling back to #95's nearest-real-freighter (documented deviation from
+  strict no-candidate-no-contract until A4's bridge-side verb preconditions).
+- **VALIDATED (cited):** Forge MD+Lua 0 structural / 0 unexpected (staged synced) · live `/api/ops/recognize`
+  runs the new path (below_floor surfaced; 2 created / 9 updated) · `recognize_selftest` 12/12 live · offers
+  route serves bind_name (empty for the CURRENT board — all live escorts are economy-op convoys with no
+  attacked hulls, which is the CORRECT reading, not a failure). Sandbox unit blocked by mount inconsistency
+  (known gotcha; live-process verification substituted per canon).
+- ◐ IN-GAME: proves the first time a sector_pressure op commissions an escort — debuglog "AIC escort
+  CAUSE-LINKED bind: <name>" + the briefed convoy IS the ship from the triggering events.
+
+### #100 R3 PATROL PAID IN-GAME + two doctrine defects from Ken's live review — ✅/defects-spec'd 2026-07-02
+- **R3 ✅ (Ken: "the patrol mission worked, I got paid out")** — second mission type through the complete loop
+  (offer → SMESC → accept → RML_Patrol → completion → payout; dashboard: antigone spent 70,000 + argon 232,000).
+  Requirements scoreboard updated.
+- **DEFECT (trivial duration):** patrol completed in ~1 MINUTE — my Destinations entry hardcodes
+  mintime=1min/maxtime=10min and RML_Patrol concludes after mintime when no enemies are present. 232k for 60
+  quiet seconds. FIX SPEC: patrol window derives from the ASSESSMENT (urgency/magnitude → mintime, e.g.
+  10-30min) and a quiet AO should tend to conclude the OP (battle-resolution sensing, A5c) rather than pay full
+  price for loitering — completion quality should scale payout (full = contact handled; partial = presence).
+- **DEFECT (economic doctrine — Ken):** "these factions are broke and they're issuing 250k for a patrol...
+  they have hundreds of ships at their own disposal. They should be using politics to avoid war while they
+  build their economy." Board shows 232k patrols from a faction with 283 own combat ships and 2.1M available.
+  → A6 spec'd: the FORCE-ECONOMICS GATE (make-vs-buy-vs-talk).
+- Board evidence also logged: duplicate same-name patrol offers (announce/re-list seam) + the flat-70k
+  zero-intensity escorts persisting from pre-A1 ops (they conclude/expire out; new ops are floored).
+
+### #99 A1 — ASSESSMENT PROPORTIONALITY FLOOR + ASSESSMENT RECORD at op formation — ✅ 2026-07-02
+- **AUDIT (the finding):** `recognize_threats` had NO floor — EVERY (victim, aggressor, sector) bucket became a
+  warning op, even one magnitude-1 event; Ken's board of trivial escorts confirmed it live. Evidence kept
+  counts but not the WHAT (no event kinds, no threatened assets). Economy feed already had a floor (sev>=0.34);
+  agreements are inherently significant. The combat feed was the hole.
+- **BUILT:** (1) `OP_MIN_EVENTS=2 / OP_MIN_MAGNITUDE=6.0` — a NEW op needs an assessed pattern (2+ events) or
+  one event big enough to matter (capital kill spools alone); below the floor the pressure stays in the ledger
+  and re-aggregates each tick; EXISTING ops keep receiving evidence updates regardless. (2) **Assessment
+  record** written into op evidence at formation: event_count, magnitude, kinds histogram,
+  `threatened_assets` (object id/name/kind/ts, ≤8), window — **the source of record A2 binds from and A4
+  classifies from.** `below_floor` surfaced in the recognize return.
+- **VALIDATED (cited):** oracle updated to encode the doctrine and run LIVE:
+  `/api/ops/recognize_selftest` **12/12** — floor_blocks_single_small · pattern_crosses_floor ·
+  assessment_record_with_assets (Heron/Egret named) · big_single_event_spools · all legacy dedupe/raid checks.
+- Downstream next: **A2** binds escorts from `assessment.threatened_assets` (the cause-linked convoy); A3
+  eligibility tiers; A4 verb engine reads the assessment kinds/pattern for legal-verb derivation.
+
+### #98 SMESC hygiene (Ken briefing review ×2) — faction IDs never reach prose + Friendly Forces is MISSION-scoped — ✅ live 2026-07-02
+- Ken's Zyarth screenshot: raw faction id `split` in a Zyarth Patriarchy order (the id IS Zyarth — reads as the
+  WRONG faction) + galaxy-wide fleet totals in b. Friendly Forces ("friendly situation IN THIS MISSION").
+- BUILT: `router._deid_prose` — whole-word faction-id→display-name over ALL LLM-sourced prose (scheme, main
+  effort, phases, intent, endstate, o_sit enemy/friendly, constraints, repair policy), factions-table first +
+  canon-name fallback (**gotcha: _fac_name ECHOES THE ID back when the row is missing** — truthiness test
+  masked the fallback). b. Friendly Forces rebuilt: theatre-total sentences STRIPPED from the LLM block +
+  "Committed to this operation: N element(s) including <element>" from operation_detail tasks + honest
+  "contractor is the primary friendly presence" when nothing is committed (#91's census fallback REMOVED —
+  doctrinally wrong). Bonus kill: `str.capitalize()` was LOWERCASING the whole repair sentence (Python
+  lowercases everything after char 0) — first-letter-only now.
+- **VALIDATED LIVE:** all 12 open briefings — 0 raw-id leaks, 0 theatre-census lines, "Return damaged ships to
+  nearest Ministry of Finance station" renders correctly, mission-scoped friendly paragraph confirmed.
+
+### #97 🏁 G6 CORE GATE PASSED — FIRST FULL PAID CONTRACT LOOP, IN-GAME — ✅ 2026-07-02
+- **Ken: "I just got paid out."** Bridge: job_8dcf98ca2f `status=completed`. The COMPLETE chain, every link
+  verified live: Player2/OPORD commissions → threat-priced offer on the Mission Offers board → SMESC briefing →
+  accept (actor-signal) → create_mission → RML escort (real Antigone squadron, commandeered convoy) → dock →
+  MissionEnded → `reward_player` 70,000 Cr in Ken's account + logbook "Contract fulfilled" → Lua POST
+  /v1/job/complete → bridge completion + treasury spend. **#75 mission-offers arc: core DELIVERED.**
+- Notes, honest: (a) the convoy was the pre-#95 FIGHTER SQUADRON (4 ships — commandeer moves the whole
+  squadron; noted for A2) and completion happened despite the #96 sector-destination bug (squadron docked
+  in-sector anyway) — fresh escorts use the station-destination + freighter filter; (b) antigone trust reads -2
+  where completion +3 over abort -2 should net +1 — VERIFY complete_job's trust bump fired (BACKLOG small);
+  (c) faction budget_spent not confirmed in this check (route shape) — confirm on the dashboard.
+- **KEN DOCTRINE BANKED (→ A2 spec): the escort target must have a GOAL derived from the mission statement** —
+  "escort the convoy TO SAFETY/its destination", stated in the briefing, the objective text, and enacted by the
+  ship's actual behavior. No escorting things in circles. #96's dock-destination is the mechanical half; A2
+  adds the causal half (the goal comes from the ASSESSED operation, and the order SAYS it).
+
+### #96 Escort could NEVER COMPLETE — destination must be a DOCKABLE OBJECT, not a sector — ◐ fixed 2026-07-02
+- Ken escorted 20 min open-ended. Debuglog: `BOUND from=Second Contact XI to=Second Contact XI` (pre-#95
+  fighter, already in the AO) AND `RML_Escort.SearchReinforcements: 'null' is not of type component` every 10s
+  — root cause: I passed a raw SECTOR as TargetLocation; the RML calls `$TargetLocation.sector` (null on a
+  sector) and completion = the convoy DOCKING at the destination — impossible at "a sector".
+- FIX: `$TargetLocation` = find_station(issuing faction, AO) → fallback any AO station → offer station.
+  Docking completes the run even when departure == destination sector. Bound debug line now prints the dock.
+- Ken's stuck escort: unrecoverable instance — abort (or let the 5h window fail it); contracts accepted after
+  next /refreshmd run convoy→dock→payout. VALIDATED: Forge 0 structural, staged synced. ◐ in-game on the next
+  fresh escort. (A2 cause-linked binding remains the real shape; this makes the interim mechanically sound.)
+
+### #95 Escort binding filter DEFECT (Ken in-game find: a FIGHTER got bound) — ◐ fixed, rides next reload 2026-07-02
+- Ken accepted an escort and the bound "convoy" was ANT Fighter Squadron Eclipse Vanguard. Root cause: my
+  invented `purpose=` attribute on find_ship was SILENTLY IGNORED by the engine (no error, no filter) — the
+  real attribute is `primarypurpose`. Fixed with vanilla's exact find-a-real-freighter form (gm_trackship:853):
+  `class="[class.ship_l, class.ship_m]" primarypurpose="purpose.trade" commandeerable="true" docked="false"`.
+- LESSON (canon-worthy, third instance today): the engine ignores unknown ATTRIBUTES silently (purpose=) but
+  hard-rejects missing REQUIRED ones (faction) — both invisible to Forge validation. Copy vanilla invocations
+  VERBATIM, never compose attribute names from memory.
+- Positive side-findings from the same screenshot: urgency-derived window LIVE (Time left 1:44:59 = 5h-window
+  escort mid-flight), escort objective + guidance chain rendering correctly.
+- VALIDATED: Forge 0 structural; staged synced. ◐ takes effect on contracts accepted after next /refreshmd.
+
+### #94 G4 tuning — urgency-derived mission window + nearest-to-AO escort hull — ◐ rides next reload 2026-07-02
+- Both 2026-07-02 AAR picks closed same-day: (1) ONE `$Window = 2h + 1h×urgency` (Lua now forwards job urgency;
+  urgency 3→5h, 5→7h) feeds BOTH `update_mission endtime` and `MissionTimeout` — the dual 4h literals are gone;
+  (2) escort `find_ship` now `sortbydistanceto=$PatrolSector` (kuertee find_station shape) — binds the hull
+  nearest the AO instead of first-match-anywhere.
+- VALIDATED: Forge MD+Lua 0 structural (staged synced). ◐ effects visible on contracts accepted after the next
+  /refreshmd + /reloadui (Ken just reloaded the PREVIOUS batch — these two ride the following one; no rush,
+  they change tuning, not mechanism).
+
+### #93 G4a ESCORT BINDING — real freighters under real escort, losses feed the war — ◐ in-game pending 2026-07-02
+- Ken's rule ("no contract without a bindable real object"): escort contracts now `find_ship` a REAL trade
+  freighter of the issuing faction at activation; leg-1 objective = `objective.escort object=$TargetShip`
+  (X4 renders "target is in <sector>" then refines in-sector — Ken's described vanilla UX); proximity gate
+  (player within 15km, gm_escort's ReachedDepartureLocation shape) then hands off to `md.RML_Escort.Escort`
+  (TargetLocation = the AO — **RML COMMANDEERS the hull: deliberate doctrine, High Command requisitions a real
+  freighter to run supplies into the contested zone**; rml_escort.xml:92). Ship survival→MissionEnded success→
+  payout chain (#88); **ship LOST → hostile_event raised into the threat pipeline** (operations respond to the
+  loss) + failed + release.
+- Cosmetic root cause KILLED: `objective.custom` without customaction was the long-standing create_offer
+  `'null' is not a string` (Ken's board correlation proved it; enums verified in md.xsd) — Lua otypes now use
+  real verbs (patrol/escort/deliver/destroy/find).
+- No bindable freighter → AO objective stands, timeout recycles (spec said "post as patrol" — documented
+  deviation, simpler and equivalent in effect).
+- **VALIDATED (cited):** Forge validate MD+Lua 0 structural / 0 unexpected ×2 passes (staged synced);
+  second-layer pass caught + covered the missing loss→hostile-event spec clause. ◐ IN-GAME: /refreshmd +
+  /reloadui → accept an ESCORT contract → guidance to the real freighter → convoy runs to the AO → paid; or
+  let it die → hostile event on the dashboard.
+
 ### #88 addendum — LIVE IN-GAME EVIDENCE (Ken flying, 2026-07-02) — accept/abort/activate/penalty ALL PROVEN; one open diagnostic
 - **PROVEN IN-GAME (debuglog + bridge + Ken's screen):** accept → `AIC contract ACCEPTED` → `ACTIVATED
   jtype=patrol patrolsector=Second Contact II Flashpoint` (sector-by-name resolution WORKS) · abort →
@@ -15,6 +462,29 @@
   the fresh instance threw no errors. Awaiting Ken's popup screenshot to discriminate: (a) empty objectives =
   attach failure; (b) "Undock" line = WORKING (rml_patrol.xml:301 gives docked players an undock objective
   first); (c) flyto line = working, earlier look was the pre-fix instance.
+
+### #92 NAV DIAGNOSTIC (Ken order): guidance mechanism PROVEN in-game; missing-bar root causes settled — ✅ 2026-07-02
+- Disposable `/navtest` chat command (aic_navtest.xml; kuertee Chat_Window_API text_entered shape — hotkeys
+  weren't firing for Ken) creates a mission to a REAL ship in the player's current sector. **DRIVEN BY AGENT
+  via computer-use: typed navtest in F11 chat → notification + auto-activated mission + THE YELLOW "Fly to:"
+  BAR rendering with full guidance** (screenshot evidence, ANT Energy Trader Mercury Sentinel, Black Hole
+  Sun IV).
+- Verdict on the missing bar: (1) pre-fix contract objectives were TEXT-ONLY (no object target) — never draw
+  guidance anywhere (fixed by the universal AO flyto objective at activation); (2) unexplored target sectors
+  render the hex-trail instead of a hard marker — fog-of-war, vanilla-identical.
+- Route to working: TWO game-parser rejections the Forge missed — create_mission REQUIRES faction (not even
+  LISTED in the doc XSD; engine contract stricter than schema — Forge finding #10: validation needs
+  engine-behavior knowledge, not just XSD) — each rejection silently killed the whole FILE (no listener, "it
+  didn't do anything"). Direct debuglog grep found both instantly.
+- Cleanup: NavTest completes within 5km ("NAV TEST PASSED") or on abort; file is stripped like proving.xml
+  once G4a lands.
+
+### #91 SMESC: b. Friendly Forces always states FORCES (Ken briefing review) — ✅ live 2026-07-02
+- Ken's screenshot: an OPORD-less job's Friendly Forces contained only the Higher's-intent boilerplate. Fix:
+  when o_sit.friendly is absent, compose from the live fleet census (`list_fleet_strength`): "<Fac> fields N
+  combat ships including M capital-class across the theatre." VALIDATED live on all 9 open offers: 7
+  OPORD-sourced + 2 census-fallback (the exact Antigone patrols Ken flagged). Also re-spotted: one no-location
+  supply job still says "the operational area" in Higher's intent — the known economy-job tail, lands with G4a.
 
 ### #90 G5 repricing — FRAGO raises now reach the mission board (withdraw + re-offer) — ◐ in-game pending 2026-07-02
 - The Lua contract tracker stores the REWARD per job (was a bare `true`): a bridge-side FRAGO escalation raise
@@ -69,7 +539,12 @@
 - VALIDATED: skeleton/params read from Ken's own unpacked game files (gm_escort, gm_patrol, rml_patrol,
   rml_escort); type="aborted" change Forge validate 0 structural; staged synced.
 
-### #86 FRAGO push MD half — situation changes now amend the player's LIVE contract — ◐ in-game pending 2026-07-02
+### #86 FRAGO push MD half — situation changes now amend the player's LIVE contract — ✅ IN-GAME 2026-07-02
+- **IN-GAME PROOF (Ken's logbook screenshot):** "FRAGO: Antigone Escort Contract — Antigone Republic High
+  Command amends your contract: [TEST] Hostile reinforcements inbound to the AO." Toast + mission-description
+  amendment + logbook entry all landed on the live claimed contract (test frago injected via the diagnostic
+  `/api/ops/test_frago` route — organic FRAGOs come from Player2 op amendments: escalations, reward raises).
+  The "element under command" moment works.
 - Ken's priority-one task, unblocked by #84. EXTENDS the existing drain (no parallel channel): bridge
   `contract_frago` actions (from #83) ride the influence-drain → Lua action rebuild now forwards
   `job_id`/`summary` → new top-level MD `Frago_dispatch` cue matches the live mission cue via `Registry.$ByJob`
